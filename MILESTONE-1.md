@@ -187,21 +187,37 @@ Certificate  prod/payments-cert         0.86
 
 ## Implementation Order (Checklist)
 
-- [ ] Add `crates/schema` crate with `CrdSchema`, `PrinterCol`, `PathSpec`, `SchemaFlags`.
-- [ ] Load CRDs and normalize `openAPIV3Schema`; extract `additionalPrinterColumns`.
-- [ ] Implement projection selection and renderers; cache per GVK.
+- [x] Add `crates/schema` crate with `CrdSchema`, `PrinterCol`, `PathSpec`, `SchemaFlags`.
+- [x] Load CRDs and parse versions; extract `additionalPrinterColumns` (JSON traversal; basic normalization).
+- [x] Implement projection selection and renderers; derive from `openAPIV3Schema` when columns absent.
 - [ ] Add YAML→JSON→JSON Schema validation (feature `jsonschema-validate`).
-- [ ] Extend `LiteObj` to carry `projected` values using schema renderers.
-- [ ] Add `crates/search` crate: postings + text store; update on deltas.
-- [ ] Implement typed filter parser (`k:`, `g:`, `ns:`, `label:`, `anno:`, `field:`) + free text.
-- [ ] Integrate `fuzzy-matcher` for ranking; limit and tiebreakers.
-- [ ] Expose a search API returning `(doc, score)` and mapped `LiteObj`.
-- [ ] CLI: `schema gvk [-o json]` with human/json output.
-- [ ] CLI: `search "query" [--limit N] [-o json]`.
-- [ ] Unit tests: schema normalization, projection, parser, scoring.
-- [ ] Replay test: synthetic deltas → deterministic search results.
+- [x] Extend `LiteObj` to carry `projected` values (plus labels/annotations) using schema renderers.
+- [x] Add `crates/search` crate: postings + text store (built from snapshot); label/anno postings.
+- [~] Implement typed filter parser: `ns:`, `label:`, `anno:`, `field:` (+ free text) — `k:`/`g:` pending.
+- [~] Integrate `fuzzy-matcher` for ranking; `limit` done; stable name/uid tiebreaker pending.
+- [x] Expose a search API returning `(doc, score)` and mapped `LiteObj` (+ debug counters).
+- [x] CLI: `schema gvk [-o json]` with human/json output.
+- [x] CLI: `search "query" [--limit N] [--explain] [-o json]`; watcher scopes from `--ns` or `ns:` token; primed List for fast first snapshot.
+- [ ] Unit tests: schema normalization, projection picker, filter parser, scoring/ranking.
+- [ ] Replay test: synthetic deltas → deterministic candidates and ordering.
 - [ ] Bench: 100k docs; record p50/p99; track memory.
 - [ ] Docs: grammar and examples in `crates/cli/README.md`.
 
 > If it adds latency or complexity without clear payoff, skip it. The point of M1 is fast insight, not perfect semantics.
 
+---
+
+## Status & Next Steps (M1)
+
+Done
+- Schema discovery (served/storage version), printer-cols extraction, and projection derivation from OpenAPI.
+- Projector wired into ingest; `LiteObj` now includes projected fields, labels, and annotations.
+- Search index with typed filters (`ns:`, `label:` key/value and existence, `anno:` key/value and existence, `field:`), fuzzy ranking, and debug/explain.
+- CLI: `schema` and `search` implemented; watcher scopes from namespace; initial List primes snapshot.
+
+Next Steps
+- Unit tests: schema normalization and projection picker; projector path extraction; search parser; scoring/ranking.
+- Stable tie-breakers by name/uid; optional `--min-score` and `--max-candidates` flags.
+- `k:`/`g:` filters (and simple kind/group wildcards) — optional if time permits.
+- Replay fixtures and deterministic search tests; baseline bench at 100k docs.
+- Optional: JSON Schema validation behind `jsonschema-validate` feature.
