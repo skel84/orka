@@ -15,10 +15,10 @@ Imperative Ops integration (logs, exec, scale, etc).
 - `orka_api` façade (snapshot, search, apply, stats).  
 - `orka_ops` crate + CLI (Imperative Ops: logs, exec, pf, scale, rollout, delete, cordon, drain).  
 
-## Lbraries to consider
+## Libraries to consider
 
 Core UI: egui + eframe + wgpu
-Tables/Virtualization: egui_extras::TableBuilder (stable, simple)
+Tables/Virtualization: egui_table (simpler API, sorting-ready)
 Docking/Layout: egui_dock
 Code editor: egui_code_editor (+ ropey buffer)
 Syntax highlight: syntect (viewport-only)
@@ -38,7 +38,7 @@ Graphs (owner graph): egui_graphs (optional) or simple list/tree
    - use `egui_dock`
    - **Top bar:** search input with grammar + autocomplete (`egui_autocomplete`), watch toggle, ns/kind dropdown.
    - **Results panel (left):**
-     - Virtualized table of results (`egui_virtual_list`, fallback `egui_extras::TableBuilder`).
+     - Virtualized table of results (`egui_virtual_list`, fallback `egui_table`).
      - Sortable columns, filter box.
    - **Detail panel (right, tabs):**
      - **Details:** YAML view (`egui_code_editor`) + labels/annotations.
@@ -93,6 +93,57 @@ Graphs (owner graph): egui_graphs (optional) or simple list/tree
 
 ---
 
+## Progress (2025-09-07)
+
+- App skeleton: `crates/gui` added; `orkactl gui` launches native egui window.
+- Discovery: Kind/Namespace selector backed by `orka_api::discover()`.
+- Data flow: snapshot + watch_lite wired; watch starts first, snapshot merges later; clean cancellation on selection change.
+- Results: left panel uses `egui_table` with Namespace • Name • Age columns; row selection supported.
+- Details: right panel fetches live object via `orka_api::get_raw` and renders YAML (JSON→YAML fallback to UTF‑8). Stable scroll + buffer.
+- Status: bottom bar shows item count and last error; unique widget IDs to avoid egui ID clashes.
+
+Notes on perf: perceived first‑paint latency reduced by starting `watch_lite` immediately and merging the snapshot when it arrives. All heavy work runs on background tasks; UI thread only paints.
+
+---
+
+## Next Steps (short‑term)
+
+1. Results table polish
+   - Sort by columns; basic filter box; age text refresh timer.
+   - Row display cache (Uid→rendered strings) to reduce per‑frame work.
+   - Guard huge result sets with a soft cap + “refine filters” banner; explore virtualization later.
+2. Search integration
+   - Wire top‑bar search to `api.search(selector, query, limit)`; overlay hits in Results and add an Explain tab with stage counts.
+3. Logs tab (Pods)
+   - Integrate `orka_ops::logs` with bounded backlog, follow toggle, regex filter; show drop counters in bottom bar.
+4. Edit tab
+   - YAML editor with Validate (feature‑gated), Dry‑run (summary), Apply (SSA) using `api.{dry_run,apply}`; minimal diff summary view.
+5. Actions bar + row context menu
+   - Ops: logs, exec, port‑forward, scale, rollout restart, delete pod, cordon/drain; gate via `ops.caps()`.
+6. Stats modal
+   - Surface `api.stats()` plus runtime metrics; show relist/backoff/shards/memory caps and posting/drop counters.
+7. Keyboard + palette
+   - Cmd‑K palette; shortcuts (F focus search, Enter open, L logs, E exec, Cmd‑S apply, Esc cancel fetch).
+
+---
+
+## Implementation Decisions (current)
+
+- Runtime: single tokio runtime (from CLI) with background tasks; UI communicates via bounded `std::sync::mpsc` channels.
+- Backpressure: bounded channels with `try_send` drop‑on‑full; counters surfaced in bottom bar (to be added).
+- Load strategy: start `watch_lite` first for fast paint; fetch snapshot in parallel and merge; cancel both on selection change.
+- UI primitives: `egui_table` for results; stable `TextEdit` for YAML details; unique `id_source` on scroll areas.
+
+---
+
+## Acceptance for MVP slice
+
+- Launches with `orkactl gui` across macOS/Linux/Windows.
+- Kind/Namespace selector wired; snapshot+watch fills Results table quickly.
+- Selecting a row shows YAML details.
+- Basic status bar with item count and error notice.
+- No panics or egui ID clashes; UI remains responsive while streaming.
+
 ## Notes
 
 - Latency budget: all heavy ops async; UI thread paints only.  
@@ -100,4 +151,3 @@ Graphs (owner graph): egui_graphs (optional) or simple list/tree
 - Imperative ops bypass Apply, execute immediately, and stream results.  
 - Show pressure/drops explicitly in bottom bar and Stats page.  
 - Feature flags: `gui`, `ops`, `persist`, `validate`.
-

@@ -111,6 +111,8 @@ enum Commands {
     },
     /// Show runtime configuration and metrics endpoint
     Stats {},
+    /// Launch the Orka GUI (eframe/egui)
+    Gui {},
     /// Imperative operations against Kubernetes resources
     Ops {
         #[command(subcommand)]
@@ -264,6 +266,11 @@ async fn main() -> Result<()> {
     let api = if use_api { Some(InProcApi::new()) } else { None };
 
     match cli.command {
+        Commands::Gui {} => {
+            let api = Arc::new(InProcApi::new());
+            // Run native GUI on the main thread (required on macOS).
+            if let Err(e) = orka_gui::run_native(api) { eprintln!("GUI error: {}", e); }
+        }
         Commands::Discover { prefer_crd } => {
             info!(prefer_crd, "discover invoked");
             if let Some(api) = &api {

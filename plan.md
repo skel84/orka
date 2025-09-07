@@ -301,7 +301,7 @@ Use this to validate backend behavior and performance in CI and locally.
 
 ## 16) UI (Later) – Leverage Existing Crates
 
-* `egui`, `eframe`, `egui_extras::TableBuilder`, `egui_dock`, `egui_code_editor`, `syntect`, `egui-toast`, `egui-modal`.
+* `egui`, `eframe`, `egui_table`, `egui_dock`, `egui_code_editor`, `syntect`, `egui-toast`, `egui-modal`.
 * UI acts as a **client** of Orka RPC: subscribe to `Watch`, render `Lite` tables, open YAML with `GetRaw`, call `DryRunApply`/`ServerApply`.
 
 ---

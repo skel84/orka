@@ -1,0 +1,31 @@
+[package]
+name = "orka_gui"
+version = "0.0.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+description = "Orka GUI (eframe/egui)"
+
+[lib]
+name = "orka_gui"
+path = "src/lib.rs"
+
+[dependencies]
+orka_api = { path = "../api" }
+orka-core = { path = "../core" }
+tracing = { workspace = true }
+tokio = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+serde_yaml = "0.9"
+egui_table = "0.3"
+egui = "0.31"
+eframe = { version = "0.31", default-features = true, features = ["wgpu"] }
+egui_dock = { version = "0.12", optional = true }
+egui_virtual_list = { version = "0.3", optional = true }
+
+[features]
+default = []
+dock = ["dep:egui_dock"]
+virtual_list = ["dep:egui_virtual_list"]
+
+# GUI stack deps are now in [dependencies]

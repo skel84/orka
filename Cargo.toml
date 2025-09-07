@@ -10,6 +10,7 @@ members = [
     "crates/persist",
     "crates/apply",
     "crates/ops",
+    "crates/gui",
 ]
 resolver = "2"
 
