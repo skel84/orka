@@ -8,6 +8,9 @@ from internal crates.
 This milestone delivers an **in-process façade only**. Remote RPC transport is
 out of scope and will be addressed later (M4).
 
+See also: docs/orka_api.md for the current trait surface and guidance for
+UI/CLI consumers.
+
 ---
 
 ## Scope

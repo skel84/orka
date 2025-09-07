@@ -60,6 +60,9 @@ pub trait OrkaOps: Send + Sync {
     async fn delete_pod(&self, namespace: &str, pod: &str, grace_seconds: Option<i64>) -> Result<()>;
     async fn cordon(&self, node: &str, on: bool) -> Result<()>;
     async fn drain(&self, node: &str) -> Result<()>;
+
+    /// Discover capabilities (RBAC + subresources) for current user/context.
+    async fn caps(&self, namespace: Option<&str>, scale_gvk: Option<&str>) -> Result<OpsCaps>;
 }
 
 /// Default implementation using kube-rs client APIs.
@@ -146,6 +149,12 @@ impl KubeOps {
             pods_eviction_create,
             scale: scale_caps,
         })
+    }
+
+    /// Instance wrapper for capability discovery.
+    pub async fn caps(&self, namespace: Option<&str>, scale_gvk: Option<&str>) -> Result<OpsCaps> {
+        // Reuse the static helper to avoid duplicating logic
+        Self::discover_caps(namespace, scale_gvk).await
     }
 }
 
@@ -431,6 +440,10 @@ impl OrkaOps for KubeOps {
             tokio::time::sleep(std::time::Duration::from_secs(poll_secs)).await;
         }
         Ok(())
+    }
+
+    async fn caps(&self, namespace: Option<&str>, scale_gvk: Option<&str>) -> Result<OpsCaps> {
+        KubeOps::discover_caps(namespace, scale_gvk).await
     }
 }
 

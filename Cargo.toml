@@ -1,6 +1,7 @@
 [workspace]
 members = [
     "crates/core",
+    "crates/api",
     "crates/kubehub",
     "crates/store",
     "crates/cli",

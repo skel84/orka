@@ -4,6 +4,7 @@ use anyhow::Result;
 use clap::{ArgAction, Parser, Subcommand, ValueEnum};
 use tracing::{error, info, warn};
 use orka_store::spawn_ingest_with_planner;
+use orka_api::{OrkaApi, InProcApi};
 use std::sync::Arc;
 use orka_core::ModuloNsPlanner;
 use tokio::sync::mpsc;
@@ -54,6 +55,13 @@ enum Commands {
     Schema {
         /// GVK key, e.g. "cert-manager.io/v1/Certificate"
         gvk: String,
+    },
+    /// Get a single live object and print raw payload
+    Get {
+        /// GVK key, e.g. "v1/ConfigMap" or "group/v1/Foo"
+        gvk: String,
+        /// Resource name
+        name: String,
     },
     /// Search current snapshot (simple RAM index)
     Search {
@@ -248,206 +256,297 @@ async fn main() -> Result<()> {
     init_tracing();
     init_metrics();
     let cli = Cli::parse();
+    // Default to using the Orka API façade unless explicitly disabled.
+    // Set ORKA_USE_API=0 or 'false' to fall back to legacy internal path.
+    let use_api = std::env::var("ORKA_USE_API")
+        .map(|v| v != "0" && !v.eq_ignore_ascii_case("false"))
+        .unwrap_or(true);
+    let api = if use_api { Some(InProcApi::new()) } else { None };
 
     match cli.command {
         Commands::Discover { prefer_crd } => {
             info!(prefer_crd, "discover invoked");
-            match orka_kubehub::discover(prefer_crd).await {
-                Ok(resources) => match cli.output {
-                    Output::Human => {
-                        for r in resources {
-                            let scope = if r.namespaced { "namespaced" } else { "cluster" };
-                            let gv = if r.group.is_empty() { r.version.clone() } else { format!("{}/{}", r.group, r.version) };
-                            println!("{} • {} • {}", gv, r.kind, scope);
+            if let Some(api) = &api {
+                match api.discover().await {
+                    Ok(resources) => match cli.output {
+                        Output::Human => {
+                            for r in resources {
+                                let scope = if r.namespaced { "namespaced" } else { "cluster" };
+                                let gv = if r.group.is_empty() { r.version.clone() } else { format!("{}/{}", r.group, r.version) };
+                                println!("{} • {} • {}", gv, r.kind, scope);
+                            }
                         }
+                        Output::Json => println!("{}", serde_json::to_string_pretty(&resources)?),
+                    },
+                    Err(e) => {
+                        error!(error = %e, "discover(api) failed");
+                        eprintln!("discover error: {}", e);
                     }
-                    Output::Json => println!("{}", serde_json::to_string_pretty(&resources)?),
-                },
-                Err(e) => {
-                    error!(error = ?e, "discover failed");
-                    eprintln!("discover error: {}", e);
+                }
+            } else {
+                match orka_kubehub::discover(prefer_crd).await {
+                    Ok(resources) => match cli.output {
+                        Output::Human => {
+                            for r in resources {
+                                let scope = if r.namespaced { "namespaced" } else { "cluster" };
+                                let gv = if r.group.is_empty() { r.version.clone() } else { format!("{}/{}", r.group, r.version) };
+                                println!("{} • {} • {}", gv, r.kind, scope);
+                            }
+                        }
+                        Output::Json => println!("{}", serde_json::to_string_pretty(&resources)?),
+                    },
+                    Err(e) => {
+                        error!(error = ?e, "discover failed");
+                        eprintln!("discover error: {}", e);
+                    }
                 }
             }
         }
         Commands::Ls { gvk } => {
             let ns = cli.namespace.as_deref();
             info!(gvk = %gvk, ns = ?ns, "ls invoked");
-            let cap = std::env::var("ORKA_QUEUE_CAP").ok().and_then(|s| s.parse::<usize>().ok()).unwrap_or(2048);
-            let projector = match orka_schema::fetch_crd_schema(&gvk).await {
-                Ok(Some(schema)) => Some(std::sync::Arc::new(schema.projector()) as std::sync::Arc<dyn orka_core::Projector + Send + Sync>),
-                _ => None,
-            };
-            let shards = std::env::var("ORKA_SHARDS").ok().and_then(|s| s.parse().ok()).unwrap_or(1);
-            let planner = Arc::new(ModuloNsPlanner::new(shards));
-            let (ingest_tx, backend) = spawn_ingest_with_planner(cap, projector, Some(planner));
-            // Start watcher
-            let watcher_handle = tokio::spawn({
-                let gvk = gvk.clone();
-                let ns = ns.map(|s| s.to_string());
-                let tx = ingest_tx.clone();
-                async move {
-                    if let Err(e) = orka_kubehub::start_watcher(&gvk, ns.as_deref(), tx).await {
-                        error!(error = ?e, "watcher failed");
+            if let Some(api) = &api {
+                // Use API snapshot for single-GVK listing
+                let (group_str, version_str, kind_str) = parse_gvk(&gvk).unwrap_or((String::new(), String::new(), String::new()));
+                let sel = orka_api::Selector { gvk: orka_api::ResourceKind { group: group_str, version: version_str, kind: kind_str, namespaced: ns.is_some() }, namespace: ns.map(|s| s.to_string()) };
+                let snap = api.snapshot(sel).await?;
+                match cli.output {
+                    Output::Human => {
+                        println!("NAMESPACE   NAME                 AGE");
+                        for item in snap.items.iter().filter(|o| ns.map(|n| o.namespace.as_deref() == Some(n)).unwrap_or(true)) {
+                            let ns_col = item.namespace.clone().unwrap_or_else(|| "-".to_string());
+                            let age = render_age(item.creation_ts);
+                            println!("{:<11} {:<20} {}", ns_col, item.name, age);
+                        }
+                    }
+                    Output::Json => {
+                        // Filter by namespace if provided
+                        let items: Vec<_> = snap.items
+                            .iter()
+                            .filter(|o| ns.map(|n| o.namespace.as_deref() == Some(n)).unwrap_or(true))
+                            .cloned()
+                            .collect();
+                        println!("{}", serde_json::to_string_pretty(&items)?);
                     }
                 }
-            });
-            // Prime initial list for faster first snapshot
-            let _ = orka_kubehub::prime_list(&gvk, ns, &ingest_tx).await;
+            } else {
+                let cap = std::env::var("ORKA_QUEUE_CAP").ok().and_then(|s| s.parse::<usize>().ok()).unwrap_or(2048);
+                let projector = match orka_schema::fetch_crd_schema(&gvk).await {
+                    Ok(Some(schema)) => Some(std::sync::Arc::new(schema.projector()) as std::sync::Arc<dyn orka_core::Projector + Send + Sync>),
+                    _ => None,
+                };
+                let shards = std::env::var("ORKA_SHARDS").ok().and_then(|s| s.parse().ok()).unwrap_or(1);
+                let planner = Arc::new(ModuloNsPlanner::new(shards));
+                let (ingest_tx, backend) = spawn_ingest_with_planner(cap, projector, Some(planner));
+                // Start watcher
+                let watcher_handle = tokio::spawn({
+                    let gvk = gvk.clone();
+                    let ns = ns.map(|s| s.to_string());
+                    let tx = ingest_tx.clone();
+                    async move {
+                        if let Err(e) = orka_kubehub::start_watcher(&gvk, ns.as_deref(), tx).await {
+                            error!(error = ?e, "watcher failed");
+                        }
+                    }
+                });
+                // Prime initial list for faster first snapshot
+                let _ = orka_kubehub::prime_list(&gvk, ns, &ingest_tx).await;
 
-            // Wait for first epoch (configurable)
-            let wait_secs = std::env::var("ORKA_WAIT_SECS").ok().and_then(|s| s.parse::<u64>().ok()).unwrap_or(8);
-            let mut rx = backend.subscribe_epoch();
-            let deadline = Instant::now() + Duration::from_secs(wait_secs);
-            while *rx.borrow() == 0 {
-                let now = Instant::now();
-                if now >= deadline { break; }
-                let rem = deadline.duration_since(now).min(Duration::from_secs(2));
-                if tokio::time::timeout(rem, rx.changed()).await.is_err() { break; }
-            }
-            let snap = backend.current();
+                // Wait for first epoch (configurable)
+                let wait_secs = std::env::var("ORKA_WAIT_SECS").ok().and_then(|s| s.parse::<u64>().ok()).unwrap_or(8);
+                let mut rx = backend.subscribe_epoch();
+                let deadline = Instant::now() + Duration::from_secs(wait_secs);
+                while *rx.borrow() == 0 {
+                    let now = Instant::now();
+                    if now >= deadline { break; }
+                    let rem = deadline.duration_since(now).min(Duration::from_secs(2));
+                    if tokio::time::timeout(rem, rx.changed()).await.is_err() { break; }
+                }
+                let snap = backend.current();
 
-            match cli.output {
-                Output::Human => {
-                    println!("NAMESPACE   NAME                 AGE");
-                    for item in snap.items.iter().filter(|o| ns.map(|n| o.namespace.as_deref() == Some(n)).unwrap_or(true)) {
-                        let ns_col = item.namespace.clone().unwrap_or_else(|| "-".to_string());
-                        let age = render_age(item.creation_ts);
-                        println!("{:<11} {:<20} {}", ns_col, item.name, age);
+                match cli.output {
+                    Output::Human => {
+                        println!("NAMESPACE   NAME                 AGE");
+                        for item in snap.items.iter().filter(|o| ns.map(|n| o.namespace.as_deref() == Some(n)).unwrap_or(true)) {
+                            let ns_col = item.namespace.clone().unwrap_or_else(|| "-".to_string());
+                            let age = render_age(item.creation_ts);
+                            println!("{:<11} {:<20} {}", ns_col, item.name, age);
+                        }
+                    }
+                    Output::Json => {
+                        // Filter by namespace if provided
+                        let items: Vec<_> = snap.items
+                            .iter()
+                            .filter(|o| ns.map(|n| o.namespace.as_deref() == Some(n)).unwrap_or(true))
+                            .cloned()
+                            .collect();
+                        println!("{}", serde_json::to_string_pretty(&items)?);
                     }
                 }
-                Output::Json => {
-                    // Filter by namespace if provided
-                    let items: Vec<_> = snap.items
-                        .iter()
-                        .filter(|o| ns.map(|n| o.namespace.as_deref() == Some(n)).unwrap_or(true))
-                        .cloned()
-                        .collect();
-                    println!("{}", serde_json::to_string_pretty(&items)?);
-                }
+                // Graceful shutdown: drop last sender and abort watcher to close ingest and flush
+                drop(ingest_tx);
+                watcher_handle.abort();
             }
-            // Graceful shutdown: drop last sender and abort watcher to close ingest and flush
-            drop(ingest_tx);
-            watcher_handle.abort();
         }
         Commands::Watch { gvk } => {
             let ns = cli.namespace.as_deref();
             info!(gvk = %gvk, ns = ?ns, "watch invoked");
-            let cap = std::env::var("ORKA_QUEUE_CAP").ok().and_then(|s| s.parse::<usize>().ok()).unwrap_or(2048);
-            let projector = match orka_schema::fetch_crd_schema(&gvk).await {
-                Ok(Some(schema)) => Some(std::sync::Arc::new(schema.projector()) as std::sync::Arc<dyn orka_core::Projector + Send + Sync>),
-                _ => None,
-            };
-            let shards = std::env::var("ORKA_SHARDS").ok().and_then(|s| s.parse().ok()).unwrap_or(1);
-            let planner = Arc::new(ModuloNsPlanner::new(shards));
-            let (ingest_tx, _backend) = spawn_ingest_with_planner(cap, projector, Some(planner));
-            let (tap_tx, mut tap_rx) = mpsc::channel::<orka_core::Delta>(cap);
-
-            // Start watcher writing into our tap
-            let watcher_handle = tokio::spawn({
-                let gvk = gvk.clone();
-                let ns = ns.map(|s| s.to_string());
-                let tap_tx = tap_tx.clone();
-                async move {
-                    if let Err(e) = orka_kubehub::start_watcher(&gvk, ns.as_deref(), tap_tx).await {
-                        error!(error = ?e, "watcher failed");
-                    }
-                }
-            });
-
-            // Pump deltas into ingest and print lines directly
-            let mut seen_rv: HashMap<orka_core::Uid, String> = HashMap::new();
-            loop {
-                tokio::select! {
-                    maybe = tap_rx.recv() => {
-                        match maybe {
-                            Some(d) => {
-                                // forward to ingest (best-effort)
-                                let _ = ingest_tx.send(d.clone()).await;
-
-                                // filter by ns if provided
-                                if let Some(ns_filter) = ns {
-                                    if let Some(mns) = d.raw.get("metadata").and_then(|m| m.get("namespace")).and_then(|v| v.as_str()) {
-                                        if mns != ns_filter { continue; }
-                                    } else {
-                                        // cluster-scoped won't match a namespaced filter
-                                        continue;
-                                    }
-                                }
-                                let key = json_key(&d.raw);
-                                let rv = d
-                                    .raw
-                                    .get("metadata")
-                                    .and_then(|m| m.get("resourceVersion"))
-                                    .and_then(|v| v.as_str())
-                                    .unwrap_or("")
-                                    .to_string();
-                                match d.kind {
-                                    orka_core::DeltaKind::Applied => {
-                                        match seen_rv.get_mut(&d.uid) {
-                                            None => {
-                                                seen_rv.insert(d.uid, rv);
-                                                println!("+ {}", key);
-                                            }
-                                            Some(prev_rv) => {
-                                                if *prev_rv != rv {
-                                                    *prev_rv = rv;
-                                                    println!("+ {}", key);
-                                                } // else duplicate; ignore
-                                            }
+            if let Some(api) = &api {
+                // API streaming path
+                let (group_str, version_str, kind_str) = parse_gvk(&gvk).unwrap_or((String::new(), String::new(), String::new()));
+                let sel = orka_api::Selector { gvk: orka_api::ResourceKind { group: group_str, version: version_str, kind: kind_str, namespaced: ns.is_some() }, namespace: ns.map(|s| s.to_string()) };
+                let mut handle = api.watch_lite(sel).await?;
+                loop {
+                    tokio::select! {
+                        maybe = handle.rx.recv() => {
+                            match maybe {
+                                Some(ev) => {
+                                    match ev {
+                                        orka_api::LiteEvent::Applied(lo) => {
+                                            let key = if let Some(ns) = &lo.namespace { format!("{}/{}", ns, lo.name) } else { lo.name.clone() };
+                                            println!("+ {}", key);
+                                        }
+                                        orka_api::LiteEvent::Deleted(lo) => {
+                                            let key = if let Some(ns) = &lo.namespace { format!("{}/{}", ns, lo.name) } else { lo.name.clone() };
+                                            println!("- {}", key);
                                         }
                                     }
-                                    orka_core::DeltaKind::Deleted => {
-                                        let _ = seen_rv.remove(&d.uid);
-                                        println!("- {}", key);
-                                    }
                                 }
-                            }
-                            None => {
-                                warn!("tap channel closed; exiting watch loop");
-                                break;
+                                None => { warn!("watch(api) channel closed"); break; }
                             }
                         }
-                    }
-                    _ = signal::ctrl_c() => {
-                        info!("Ctrl-C received; shutting down watch loop");
-                        break;
+                        _ = signal::ctrl_c() => { handle.cancel.cancel(); break; }
                     }
                 }
+                warn!("watch(api) ended");
+            } else {
+                // existing path
+                let cap = std::env::var("ORKA_QUEUE_CAP").ok().and_then(|s| s.parse::<usize>().ok()).unwrap_or(2048);
+                let projector = match orka_schema::fetch_crd_schema(&gvk).await {
+                    Ok(Some(schema)) => Some(std::sync::Arc::new(schema.projector()) as std::sync::Arc<dyn orka_core::Projector + Send + Sync>),
+                    _ => None,
+                };
+                let shards = std::env::var("ORKA_SHARDS").ok().and_then(|s| s.parse().ok()).unwrap_or(1);
+                let planner = Arc::new(ModuloNsPlanner::new(shards));
+                let (ingest_tx, _backend) = spawn_ingest_with_planner(cap, projector, Some(planner));
+                let (tap_tx, mut tap_rx) = mpsc::channel::<orka_core::Delta>(cap);
+                let watcher_handle = tokio::spawn({
+                    let gvk = gvk.clone();
+                    let ns = ns.map(|s| s.to_string());
+                    let tap_tx = tap_tx.clone();
+                    async move {
+                        if let Err(e) = orka_kubehub::start_watcher(&gvk, ns.as_deref(), tap_tx).await {
+                            error!(error = ?e, "watcher failed");
+                        }
+                    }
+                });
+                let mut seen_rv: HashMap<orka_core::Uid, String> = HashMap::new();
+                loop {
+                    tokio::select! {
+                        maybe = tap_rx.recv() => {
+                            match maybe {
+                                Some(d) => {
+                                    let key = json_key(&d.raw);
+                                    match d.kind {
+                                        orka_core::DeltaKind::Applied => {
+                                            let rv = d.raw.get("metadata").and_then(|m| m.get("resourceVersion")).and_then(|v| v.as_str()).unwrap_or("").to_string();
+                                            match seen_rv.get_mut(&d.uid) {
+                                                None => { seen_rv.insert(d.uid, rv); println!("+ {}", key); }
+                                                Some(prev_rv) => { if *prev_rv != rv { *prev_rv = rv; println!("+ {}", key); } }
+                                            }
+                                        }
+                                        orka_core::DeltaKind::Deleted => { let _ = seen_rv.remove(&d.uid); println!("- {}", key); }
+                                    }
+                                }
+                                None => { warn!("tap channel closed; exiting watch loop"); break; }
+                            }
+                        }
+                        _ = signal::ctrl_c() => { info!("Ctrl-C received; shutting down watch loop"); break; }
+                    }
+                }
+                drop(ingest_tx);
+                watcher_handle.abort();
+                warn!("watch loop ended (graceful shutdown)");
             }
-
-            // Graceful shutdown: close ingest and abort watcher to stop kube stream, allowing final snapshot flush
-            drop(ingest_tx);
-            watcher_handle.abort();
-            warn!("watch loop ended (graceful shutdown)");
         }
         Commands::Schema { gvk } => {
             info!(gvk = %gvk, "schema invoked");
-            match orka_schema::fetch_crd_schema(&gvk).await {
-                Ok(Some(schema)) => match cli.output {
-                    Output::Human => {
-                        println!("served: {}", schema.served_version);
-                        if schema.printer_cols.is_empty() {
-                            println!("printer-cols: (none)");
-                        } else {
-                            let cols: Vec<_> = schema.printer_cols.iter().map(|c| c.name.as_str()).collect();
-                            println!("printer-cols: {}", cols.join(", "));
+            if let Some(api) = &api {
+                match api.schema(&gvk).await {
+                    Ok(Some(schema)) => match cli.output {
+                        Output::Human => {
+                            println!("served: {}", schema.served_version);
+                            if schema.printer_cols.is_empty() {
+                                println!("printer-cols: (none)");
+                            } else {
+                                let cols: Vec<_> = schema.printer_cols.iter().map(|c| c.name.as_str()).collect();
+                                println!("printer-cols: {}", cols.join(", "));
+                            }
+                            if schema.projected_paths.is_empty() {
+                                println!("projected: (heuristic defaults)");
+                            } else {
+                                let proj: Vec<_> = schema.projected_paths.iter().map(|p| p.json_path.as_str()).collect();
+                                println!("projected: {}", proj.join(", "));
+                            }
                         }
-                        if schema.projected_paths.is_empty() {
-                            println!("projected: (heuristic defaults)");
-                        } else {
-                            let proj: Vec<_> = schema.projected_paths.iter().map(|p| p.json_path.as_str()).collect();
-                            println!("projected: {}", proj.join(", "));
+                        Output::Json => {
+                            println!("{}", serde_json::to_string_pretty(&schema)?);
                         }
-                    }
-                    Output::Json => {
-                        println!("{}", serde_json::to_string_pretty(&schema)?);
-                    }
-                },
-                Ok(None) => {
-                    eprintln!("no CRD schema for builtin kind (or not found)");
+                    },
+                    Ok(None) => { eprintln!("no CRD schema for builtin kind (or not found)"); }
+                    Err(e) => { eprintln!("schema(api) error: {}", e); }
                 }
-                Err(e) => {
-                    eprintln!("schema error: {}", e);
+            } else {
+                match orka_schema::fetch_crd_schema(&gvk).await {
+                    Ok(Some(schema)) => match cli.output {
+                        Output::Human => {
+                            println!("served: {}", schema.served_version);
+                            if schema.printer_cols.is_empty() {
+                                println!("printer-cols: (none)");
+                            } else {
+                                let cols: Vec<_> = schema.printer_cols.iter().map(|c| c.name.as_str()).collect();
+                                println!("printer-cols: {}", cols.join(", "));
+                            }
+                            if schema.projected_paths.is_empty() {
+                                println!("projected: (heuristic defaults)");
+                            } else {
+                                let proj: Vec<_> = schema.projected_paths.iter().map(|p| p.json_path.as_str()).collect();
+                                println!("projected: {}", proj.join(", "));
+                            }
+                        }
+                        Output::Json => { println!("{}", serde_json::to_string_pretty(&schema)?); }
+                    },
+                    Ok(None) => { eprintln!("no CRD schema for builtin kind (or not found)"); }
+                    Err(e) => { eprintln!("schema error: {}", e); }
+                }
+            }
+        }
+        Commands::Get { gvk, name } => {
+            let ns = cli.namespace.as_deref();
+            if let Some(api) = &api {
+                let (group, version, kind) = parse_gvk(&gvk).ok_or_else(|| anyhow::anyhow!("invalid gvk: {}", gvk))?;
+                let rk = orka_api::ResourceKind { group, version, kind, namespaced: ns.is_some() };
+                let rr = orka_api::ResourceRef { cluster: None, gvk: rk, namespace: ns.map(|s| s.to_string()), name: name.clone() };
+                match api.get_raw(rr).await {
+                    Ok(bytes) => {
+                        let v: serde_json::Value = serde_json::from_slice(&bytes)?;
+                        match cli.output {
+                            Output::Human => {
+                                let yaml = serde_yaml::to_string(&v).unwrap_or_else(|_| "{}".to_string());
+                                println!("{}", yaml);
+                            }
+                            Output::Json => println!("{}", serde_json::to_string_pretty(&v)?),
+                        }
+                    }
+                    Err(e) => eprintln!("get(api) error: {}", e),
+                }
+            } else {
+                match fetch_object_json(&gvk, &name, ns).await {
+                    Ok(v) => match cli.output {
+                        Output::Human => println!("{}", serde_yaml::to_string(&v).unwrap_or_else(|_| "{}".into())),
+                        Output::Json => println!("{}", serde_json::to_string_pretty(&v)?),
+                    },
+                    Err(e) => eprintln!("get error: {}", e),
                 }
             }
         }
@@ -457,6 +556,46 @@ async fn main() -> Result<()> {
             let effective_ns = cli.namespace.clone().or(ns_from_query);
             let ns = effective_ns.as_deref();
             info!(gvk = %gvk, ns = ?ns, query = %query, limit, "search invoked");
+            if let Some(api) = &api {
+                let (group_str, version_str, kind_str) = parse_gvk(&gvk).unwrap_or((String::new(), String::new(), String::new()));
+                let sel = orka_api::Selector { gvk: orka_api::ResourceKind { group: group_str.clone(), version: version_str, kind: kind_str.clone(), namespaced: ns.is_some() }, namespace: ns.map(|s| s.to_string()) };
+                let snap = api.snapshot(sel.clone()).await?;
+                let (hits, dbg) = api.search(sel, &query, limit).await?;
+
+                match cli.output {
+                    Output::Human => {
+                        println!("KIND   NAMESPACE/NAME                SCORE");
+                        for h in hits {
+                            if let Some(obj) = snap.items.get(h.doc as usize) {
+                                let ns_col = obj.namespace.clone().unwrap_or_else(|| "-".to_string());
+                                println!("{:<6} {:<22} {:<20} {:.2}", kind_str, format!("{}/{}", ns_col, obj.name), "", h.score);
+                            }
+                        }
+                    }
+                    Output::Json => {
+                        #[derive(serde::Serialize)]
+                        struct Row<'a> { ns: &'a str, name: &'a str, score: f32 }
+                        let rows: Vec<_> = hits
+                            .into_iter()
+                            .filter_map(|h| {
+                                snap.items.get(h.doc as usize).map(|o| Row { ns: o.namespace.as_deref().unwrap_or("") , name: &o.name, score: h.score })
+                            })
+                            .collect();
+                        if explain {
+                            #[derive(serde::Serialize)]
+                            struct Explain<'a, T> { hits: T, debug: &'a orka_search::SearchDebugInfo }
+                            println!("{}", serde_json::to_string_pretty(&Explain { hits: rows, debug: &dbg })?);
+                        } else {
+                            println!("{}", serde_json::to_string_pretty(&rows)?);
+                        }
+                    }
+                }
+                if explain && matches!(cli.output, Output::Human) {
+                    eprintln!("debug: total={} after_ns={} after_label_keys={} after_labels={} after_anno_keys={} after_annos={} after_fields={}", dbg.total, dbg.after_ns, dbg.after_label_keys, dbg.after_labels, dbg.after_anno_keys, dbg.after_annos, dbg.after_fields);
+                }
+                // done via API path
+                return Ok(());
+            }
             let cap = std::env::var("ORKA_QUEUE_CAP").ok().and_then(|s| s.parse::<usize>().ok()).unwrap_or(2048);
             let projector = match orka_schema::fetch_crd_schema(&gvk).await {
                 Ok(Some(schema)) => Some(std::sync::Arc::new(schema.projector()) as std::sync::Arc<dyn orka_core::Projector + Send + Sync>),
@@ -562,68 +701,124 @@ async fn main() -> Result<()> {
                 }
             }
             let do_apply = if apply { true } else { !dry_run };
-            match orka_apply::edit_from_yaml(&yaml, ns, validate, do_apply).await {
-                Ok(res) => match cli.output {
-                    Output::Human => {
-                        if res.dry_run {
-                            println!("dry-run: +{} ~{} -{}", res.summary.adds, res.summary.updates, res.summary.removes);
-                        } else if res.applied {
-                            println!("applied rv={}", res.new_rv.unwrap_or_default());
-                        } else {
-                            println!("no-op");
+            if let Some(api) = &api {
+                let res = if do_apply {
+                    api.apply(&yaml).await
+                } else {
+                    api.dry_run(&yaml).await.map(|d| orka_apply::ApplyResult { dry_run: true, applied: false, new_rv: None, warnings: vec![], summary: d })
+                };
+                match res {
+                    Ok(res) => match cli.output {
+                        Output::Human => {
+                            if res.dry_run {
+                                println!("dry-run: +{} ~{} -{}", res.summary.adds, res.summary.updates, res.summary.removes);
+                            } else if res.applied {
+                                println!("applied rv={}", res.new_rv.unwrap_or_default());
+                            } else {
+                                println!("no-op");
+                            }
                         }
-                    }
-                    Output::Json => println!("{}", serde_json::to_string_pretty(&res)?),
-                },
-                Err(e) => { eprintln!("edit error: {}", e); }
+                        Output::Json => println!("{}", serde_json::to_string_pretty(&res)?),
+                    },
+                    Err(e) => eprintln!("edit error: {}", e),
+                }
+            } else {
+                match orka_apply::edit_from_yaml(&yaml, ns, validate, do_apply).await {
+                    Ok(res) => match cli.output {
+                        Output::Human => {
+                            if res.dry_run {
+                                println!("dry-run: +{} ~{} -{}", res.summary.adds, res.summary.updates, res.summary.removes);
+                            } else if res.applied {
+                                println!("applied rv={}", res.new_rv.unwrap_or_default());
+                            } else {
+                                println!("no-op");
+                            }
+                        }
+                        Output::Json => println!("{}", serde_json::to_string_pretty(&res)?),
+                    },
+                    Err(e) => { eprintln!("edit error: {}", e); }
+                }
             }
         }
         Commands::Diff { file } => {
             let ns = cli.namespace.as_deref();
             let yaml = read_input(&file)?;
-            match orka_apply::diff_from_yaml(&yaml, ns).await {
-                Ok((live, last)) => match cli.output {
-                    Output::Human => {
-                        println!("vs live: +{} ~{} -{}", live.adds, live.updates, live.removes);
-                        if let Some(ls) = last { println!("vs last: +{} ~{} -{}", ls.adds, ls.updates, ls.removes); }
-                    }
-                    Output::Json => {
-                        #[derive(serde::Serialize)]
-                        struct D { live: orka_apply::DiffSummary, last: Option<orka_apply::DiffSummary> }
-                        println!("{}", serde_json::to_string_pretty(&D { live, last })?);
-                    }
-                },
-                Err(e) => eprintln!("diff error: {}", e),
+            if let Some(api) = &api {
+                match api.diff(&yaml, ns).await {
+                    Ok((live, last)) => match cli.output {
+                        Output::Human => {
+                            println!("vs live: +{} ~{} -{}", live.adds, live.updates, live.removes);
+                            if let Some(ls) = last { println!("vs last: +{} ~{} -{}", ls.adds, ls.updates, ls.removes); }
+                        }
+                        Output::Json => {
+                            #[derive(serde::Serialize)]
+                            struct D { live: orka_apply::DiffSummary, last: Option<orka_apply::DiffSummary> }
+                            println!("{}", serde_json::to_string_pretty(&D { live, last })?);
+                        }
+                    },
+                    Err(e) => eprintln!("diff(api) error: {}", e),
+                }
+            } else {
+                match orka_apply::diff_from_yaml(&yaml, ns).await {
+                    Ok((live, last)) => match cli.output {
+                        Output::Human => {
+                            println!("vs live: +{} ~{} -{}", live.adds, live.updates, live.removes);
+                            if let Some(ls) = last { println!("vs last: +{} ~{} -{}", ls.adds, ls.updates, ls.removes); }
+                        }
+                        Output::Json => {
+                            #[derive(serde::Serialize)]
+                            struct D { live: orka_apply::DiffSummary, last: Option<orka_apply::DiffSummary> }
+                            println!("{}", serde_json::to_string_pretty(&D { live, last })?);
+                        }
+                    },
+                    Err(e) => eprintln!("diff error: {}", e),
+                }
             }
         }
         Commands::LastApplied { sub } => {
             match sub {
                 LastAppliedCmd::Get { gvk, name, limit, output } => {
-                    // Resolve UID by fetching live object
                     let ns = cli.namespace.as_deref();
-                    let uid_hex = fetch_uid_for(&gvk, &name, ns).await?;
-                    let uid = parse_uid(&uid_hex)?;
-                    let store = match orka_persist::SqliteStore::open_default() { Ok(s) => s, Err(e) => { eprintln!("open db error: {}", e); return Ok(()); } };
-                    let rows = store.get_last(uid, Some(limit)).unwrap_or_default();
-                    match output.unwrap_or(cli.output) {
-                        Output::Human => {
-                            for r in rows.iter() {
-                                let ts = r.ts;
-                                println!("ts={} rv={}", ts, r.rv);
-                            }
+                    if let Some(api) = &api {
+                        match api.last_applied(&gvk, &name, ns, Some(limit)).await {
+                            Ok(rows) => match output.unwrap_or(cli.output) {
+                                Output::Human => {
+                                    for r in rows.iter() {
+                                        println!("ts={} rv={}", r.ts, r.rv);
+                                    }
+                                }
+                                Output::Json => {
+                                    #[derive(serde::Serialize)]
+                                    struct Row { ts: i64, rv: String, yaml: String }
+                                    let out: Vec<Row> = rows.into_iter().map(|r| Row { ts: r.ts, rv: r.rv, yaml: orka_persist::maybe_decompress(&r.yaml_zstd) }).collect();
+                                    println!("{}", serde_json::to_string_pretty(&out)?);
+                                }
+                            },
+                            Err(e) => eprintln!("last-applied(api) error: {}", e),
                         }
-                        Output::Json => {
-                            #[derive(serde::Serialize)]
-                            struct Row { ts: i64, rv: String, yaml: String }
-                            let out: Vec<Row> = rows.into_iter().map(|r| Row { ts: r.ts, rv: r.rv, yaml: orka_persist::maybe_decompress(&r.yaml_zstd) }).collect();
-                            println!("{}", serde_json::to_string_pretty(&out)?);
+                    } else {
+                        // Resolve UID by fetching live object
+                        let uid_hex = fetch_uid_for(&gvk, &name, ns).await?;
+                        let uid = parse_uid(&uid_hex)?;
+                        let store = match orka_persist::SqliteStore::open_default() { Ok(s) => s, Err(e) => { eprintln!("open db error: {}", e); return Ok(()); } };
+                        let rows = store.get_last(uid, Some(limit)).unwrap_or_default();
+                        match output.unwrap_or(cli.output) {
+                            Output::Human => {
+                                for r in rows.iter() { println!("ts={} rv={}", r.ts, r.rv); }
+                            }
+                            Output::Json => {
+                                #[derive(serde::Serialize)]
+                                struct Row { ts: i64, rv: String, yaml: String }
+                                let out: Vec<Row> = rows.into_iter().map(|r| Row { ts: r.ts, rv: r.rv, yaml: orka_persist::maybe_decompress(&r.yaml_zstd) }).collect();
+                                println!("{}", serde_json::to_string_pretty(&out)?);
+                            }
                         }
                     }
                 }
             }
         }
         Commands::Stats {} => {
-            // Gather config from env
+            // Gather via API when enabled, else from env directly
             #[derive(serde::Serialize)]
             struct StatsOut {
                 shards: usize,
@@ -636,17 +831,22 @@ async fn main() -> Result<()> {
                 max_index_bytes: Option<usize>,
                 metrics_addr: Option<String>,
             }
-            let shards = std::env::var("ORKA_SHARDS").ok().and_then(|s| s.parse().ok()).unwrap_or(1);
-            let relist_secs = std::env::var("ORKA_RELIST_SECS").ok().and_then(|s| s.parse().ok()).unwrap_or(300);
-            let watch_backoff_max_secs = std::env::var("ORKA_WATCH_BACKOFF_MAX_SECS").ok().and_then(|s| s.parse().ok()).unwrap_or(30);
-            let max_labels_per_obj = std::env::var("ORKA_MAX_LABELS_PER_OBJ").ok().and_then(|s| s.parse().ok());
-            let max_annos_per_obj = std::env::var("ORKA_MAX_ANNOS_PER_OBJ").ok().and_then(|s| s.parse().ok());
-            let max_postings_per_key = std::env::var("ORKA_MAX_POSTINGS_PER_KEY").ok().and_then(|s| s.parse().ok());
-            let max_rss_mb = std::env::var("ORKA_MAX_RSS_MB").ok().and_then(|s| s.parse().ok());
-            let max_index_bytes = std::env::var("ORKA_MAX_INDEX_BYTES").ok().and_then(|s| s.parse().ok());
-            let metrics_addr = std::env::var("ORKA_METRICS_ADDR").ok();
+            let out = if let Some(api) = &api {
+                let s = api.stats().await?;
+                StatsOut { shards: s.shards, relist_secs: s.relist_secs, watch_backoff_max_secs: s.watch_backoff_max_secs, max_labels_per_obj: s.max_labels_per_obj, max_annos_per_obj: s.max_annos_per_obj, max_postings_per_key: s.max_postings_per_key, max_rss_mb: s.max_rss_mb, max_index_bytes: s.max_index_bytes, metrics_addr: s.metrics_addr }
+            } else {
+                let shards = std::env::var("ORKA_SHARDS").ok().and_then(|s| s.parse().ok()).unwrap_or(1);
+                let relist_secs = std::env::var("ORKA_RELIST_SECS").ok().and_then(|s| s.parse().ok()).unwrap_or(300);
+                let watch_backoff_max_secs = std::env::var("ORKA_WATCH_BACKOFF_MAX_SECS").ok().and_then(|s| s.parse().ok()).unwrap_or(30);
+                let max_labels_per_obj = std::env::var("ORKA_MAX_LABELS_PER_OBJ").ok().and_then(|s| s.parse().ok());
+                let max_annos_per_obj = std::env::var("ORKA_MAX_ANNOS_PER_OBJ").ok().and_then(|s| s.parse().ok());
+                let max_postings_per_key = std::env::var("ORKA_MAX_POSTINGS_PER_KEY").ok().and_then(|s| s.parse().ok());
+                let max_rss_mb = std::env::var("ORKA_MAX_RSS_MB").ok().and_then(|s| s.parse().ok());
+                let max_index_bytes = std::env::var("ORKA_MAX_INDEX_BYTES").ok().and_then(|s| s.parse().ok());
+                let metrics_addr = std::env::var("ORKA_METRICS_ADDR").ok();
+                StatsOut { shards, relist_secs, watch_backoff_max_secs, max_labels_per_obj, max_annos_per_obj, max_postings_per_key, max_rss_mb, max_index_bytes, metrics_addr }
+            };
 
-            let out = StatsOut { shards, relist_secs, watch_backoff_max_secs, max_labels_per_obj, max_annos_per_obj, max_postings_per_key, max_rss_mb, max_index_bytes, metrics_addr };
             match cli.output {
                 Output::Human => {
                     println!("shards: {}", out.shards);
@@ -667,7 +867,7 @@ async fn main() -> Result<()> {
                 OpsCmd::Logs { pod, container, follow, tail_lines, since_seconds, grep } => {
                     let ns = cli.namespace.as_deref();
                     if ns.is_none() { eprintln!("--ns is required for pod logs"); return Ok(()); }
-                    let ops = KubeOps::new();
+                    let ops: Arc<dyn OrkaOps> = if let Some(api) = &api { api.ops() } else { Arc::new(KubeOps::new()) };
                     let opts = LogOptions { follow, tail_lines, since_seconds };
                     let re = match grep { Some(pat) => match Regex::new(&pat) { Ok(r) => Some(r), Err(e) => { eprintln!("invalid regex: {}", e); return Ok(()); } }, None => None };
                     if container.len() <= 1 {
@@ -707,7 +907,7 @@ async fn main() -> Result<()> {
                         for c in container.iter().cloned() {
                             let pod = pod.clone();
                             let opts = LogOptions { follow, tail_lines, since_seconds };
-                            let ops = KubeOps::new();
+                            let ops: Arc<dyn OrkaOps> = if let Some(api) = &api { api.ops() } else { Arc::new(KubeOps::new()) };
                             let txc = tx.clone();
                             let re = re.as_ref().map(|r| r.as_str().to_string());
                             let ns_owned = ns_owned.clone();
@@ -745,7 +945,7 @@ async fn main() -> Result<()> {
                 OpsCmd::Exec { pod, cmd, container, tty } => {
                     let ns = cli.namespace.as_deref();
                     if ns.is_none() { eprintln!("--ns is required for exec"); return Ok(()); }
-                    let ops = KubeOps::new();
+                    let ops: Arc<dyn OrkaOps> = if let Some(api) = &api { api.ops() } else { Arc::new(KubeOps::new()) };
                     if let Err(e) = ops.exec(ns, &pod, container.as_deref(), &cmd, tty).await {
                         if let Some(ae) = e.downcast_ref::<kube::Error>() { if let kube::Error::Api(api_err) = ae { if api_err.code == 403 { eprintln!("forbidden: missing create on pods/exec in ns"); } else { eprintln!("exec error: {}", e); } } else { eprintln!("exec error: {}", e); } } else { eprintln!("exec error: {}", e); }
                     }
@@ -754,7 +954,7 @@ async fn main() -> Result<()> {
                     let ns = cli.namespace.as_deref();
                     if ns.is_none() { eprintln!("--ns is required for pf"); return Ok(()); }
                     let (local, remote) = parse_port_mapping(&mapping)?;
-                    let ops = KubeOps::new();
+                    let ops: Arc<dyn OrkaOps> = if let Some(api) = &api { api.ops() } else { Arc::new(KubeOps::new()) };
                     match ops.port_forward(ns, &pod, local, remote).await {
                         Ok(mut handle) => {
                             // Wait for events; exit on Ctrl-C
@@ -780,7 +980,7 @@ async fn main() -> Result<()> {
                 }
                 OpsCmd::Scale { gvk, name, replicas, subresource } => {
                     let ns = cli.namespace.as_deref();
-                    let ops = KubeOps::new();
+                    let ops: Arc<dyn OrkaOps> = if let Some(api) = &api { api.ops() } else { Arc::new(KubeOps::new()) };
                     match ops.scale(&gvk, ns, &name, replicas, subresource).await {
                         Ok(_) => match cli.output {
                             Output::Human => println!("scaled {} to {}", name, replicas),
@@ -797,7 +997,7 @@ async fn main() -> Result<()> {
                 }
                 OpsCmd::RolloutRestart { gvk, name } => {
                     let ns = cli.namespace.as_deref();
-                    let ops = KubeOps::new();
+                    let ops: Arc<dyn OrkaOps> = if let Some(api) = &api { api.ops() } else { Arc::new(KubeOps::new()) };
                     match ops.rollout_restart(&gvk, ns, &name).await {
                         Ok(_) => match cli.output {
                             Output::Human => println!("restarted {}", name),
@@ -814,7 +1014,7 @@ async fn main() -> Result<()> {
                 }
                 OpsCmd::Delete { pod, grace } => {
                     let ns = cli.namespace.as_deref().ok_or_else(|| anyhow::anyhow!("--ns required for delete"))?;
-                    let ops = KubeOps::new();
+                    let ops: Arc<dyn OrkaOps> = if let Some(api) = &api { api.ops() } else { Arc::new(KubeOps::new()) };
                     match ops.delete_pod(ns, &pod, grace).await {
                         Ok(_) => match cli.output {
                             Output::Human => println!("deleted {}", pod),
@@ -830,7 +1030,7 @@ async fn main() -> Result<()> {
                     }
                 }
                 OpsCmd::Cordon { node, off } => {
-                    let ops = KubeOps::new();
+                    let ops: Arc<dyn OrkaOps> = if let Some(api) = &api { api.ops() } else { Arc::new(KubeOps::new()) };
                     match ops.cordon(&node, !off).await {
                         Ok(_) => match cli.output {
                             Output::Human => println!("{} {}", if off {"uncordoned"} else {"cordoned"}, node),
@@ -863,7 +1063,8 @@ async fn main() -> Result<()> {
                 }
                 OpsCmd::Caps { gvk } => {
                     let ns = cli.namespace.as_deref();
-                    match KubeOps::discover_caps(ns, gvk.as_deref()).await {
+                    let ops: Arc<dyn OrkaOps> = if let Some(api) = &api { api.ops() } else { Arc::new(KubeOps::new()) };
+                    match ops.caps(ns, gvk.as_deref()).await {
                         Ok(caps) => match cli.output {
                             Output::Human => {
                                 println!("namespace: {}", caps.namespace.as_deref().unwrap_or("(none)"));
@@ -956,6 +1157,34 @@ async fn fetch_uid_for(gvk_key: &str, name: &str, namespace: Option<&str>) -> Re
 fn parse_uid(uid_str: &str) -> Result<orka_core::Uid> {
     let u = uuid::Uuid::parse_str(uid_str).map_err(|e| anyhow::anyhow!("invalid uid: {}", e))?;
     Ok(*u.as_bytes())
+}
+
+async fn fetch_object_json(gvk_key: &str, name: &str, namespace: Option<&str>) -> Result<serde_json::Value> {
+    use kube::{discovery::{Discovery, Scope}, api::Api, core::{DynamicObject, GroupVersionKind}};
+    let client = kube::Client::try_default().await?;
+    // Parse key
+    let (group, version, kind) = parse_gvk(gvk_key).ok_or_else(|| anyhow::anyhow!("invalid gvk: {}", gvk_key))?;
+    let gvk = GroupVersionKind { group, version, kind };
+    // Find ApiResource
+    let discovery = Discovery::new(client.clone()).run().await?;
+    let mut ar_opt: Option<(kube::core::ApiResource, bool)> = None;
+    for group in discovery.groups() {
+        for (ar, caps) in group.recommended_resources() {
+            if ar.group == gvk.group && ar.version == gvk.version && ar.kind == gvk.kind {
+                ar_opt = Some((ar.clone(), matches!(caps.scope, Scope::Namespaced)));
+                break;
+            }
+        }
+    }
+    let (ar, namespaced) = ar_opt.ok_or_else(|| anyhow::anyhow!("GVK not found: {}/{}/{}", gvk.group, gvk.version, gvk.kind))?;
+    let api: Api<DynamicObject> = if namespaced {
+        match namespace {
+            Some(ns) => Api::namespaced_with(client.clone(), ns, &ar),
+            None => return Err(anyhow::anyhow!("namespace required for namespaced kind")),
+        }
+    } else { Api::all_with(client.clone(), &ar) };
+    let obj = api.get(name).await?;
+    Ok(serde_json::to_value(&obj)?)
 }
 
 fn parse_port_mapping(s: &str) -> Result<(u16, u16)> {

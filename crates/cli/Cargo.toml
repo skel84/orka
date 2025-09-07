@@ -14,6 +14,7 @@ orka-search = { path = "../search" }
 orka-apply = { path = "../apply" }
 orka-persist = { path = "../persist" }
 orka_ops = { path = "../ops" }
+orka_api = { path = "../api" }
 anyhow = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }

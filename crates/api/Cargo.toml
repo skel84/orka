@@ -1,0 +1,25 @@
+[package]
+name = "orka_api"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+anyhow = { workspace = true }
+thiserror = { workspace = true }
+serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true }
+async-trait = "0.1"
+orka-core = { path = "../core" }
+orka-apply = { path = "../apply" }
+orka-search = { path = "../search" }
+orka_ops = { path = "../ops" }
+orka-kubehub = { path = "../kubehub" }
+orka-schema = { path = "../schema" }
+kube = { workspace = true }
+k8s-openapi = { workspace = true }
+tokio = { workspace = true }
+orka-store = { path = "../store" }
+chrono = { workspace = true }
+smallvec = { workspace = true }
+orka-persist = { path = "../persist" }
+uuid = { workspace = true }

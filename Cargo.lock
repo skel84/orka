@@ -1905,6 +1905,31 @@ dependencies = [
 ]
 
 [[package]]
+name = "orka_api"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "chrono",
+ "k8s-openapi",
+ "kube",
+ "orka-apply",
+ "orka-core",
+ "orka-kubehub",
+ "orka-persist",
+ "orka-schema",
+ "orka-search",
+ "orka-store",
+ "orka_ops",
+ "serde",
+ "serde_json",
+ "smallvec",
+ "thiserror 1.0.69",
+ "tokio",
+ "uuid",
+]
+
+[[package]]
 name = "orka_ops"
 version = "0.0.0"
 dependencies = [
@@ -1940,6 +1965,7 @@ dependencies = [
  "orka-schema",
  "orka-search",
  "orka-store",
+ "orka_api",
  "orka_ops",
  "regex",
  "serde",
