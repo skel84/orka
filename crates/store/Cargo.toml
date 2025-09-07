@@ -1,0 +1,17 @@
+[package]
+name = "orka-store"
+version = "0.0.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+description = "Orka in-RAM store (Milestone 0)"
+
+[dependencies]
+orka-core = { path = "../core" }
+arc-swap = { workspace = true }
+rustc-hash = { workspace = true }
+anyhow = { workspace = true }
+tracing = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tokio = { workspace = true }
+chrono = { workspace = true }
