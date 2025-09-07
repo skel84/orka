@@ -3,6 +3,7 @@
 #![forbid(unsafe_code)]
 
 use serde::{Deserialize, Serialize};
+use smallvec::SmallVec;
 
 pub type Uid = [u8; 16];
 
@@ -26,6 +27,12 @@ pub struct LiteObj {
     pub namespace: Option<String>,
     pub name: String,
     pub creation_ts: i64,
+    /// Projected fields for search/listing (M1). For M0, this may be empty.
+    pub projected: SmallVec<[(u32, String); 8]>,
+    /// Kubernetes labels as key/value pairs.
+    pub labels: SmallVec<[(String, String); 8]>,
+    /// Kubernetes annotations as key/value pairs.
+    pub annotations: SmallVec<[(String, String); 4]>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -36,6 +43,13 @@ pub struct WorldSnapshot {
 }
 
 pub mod prelude {
-    pub use super::{Delta, DeltaKind, LiteObj, Uid, WorldSnapshot};
+    pub use super::{Delta, DeltaKind, LiteObj, Uid, WorldSnapshot, Projector, ProjectedEntry};
 }
 
+/// Entry representing a projected field: `(PathId, RenderedValue)`
+pub type ProjectedEntry = (u32, String);
+
+/// Projector takes a raw JSON object and yields rendered projected scalars.
+pub trait Projector: Send + Sync {
+    fn project(&self, raw: &serde_json::Value) -> SmallVec<[(u32, String); 8]>;
+}

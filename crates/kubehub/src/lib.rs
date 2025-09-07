@@ -183,3 +183,28 @@ pub async fn start_watcher(gvk_key: &str, namespace: Option<&str>, delta_tx: mps
     }
     Ok(())
 }
+
+/// Perform an initial list for the given GVK and namespace and push Applied deltas.
+/// Useful to prime the ingest snapshot before starting a long-running watch.
+pub async fn prime_list(gvk_key: &str, namespace: Option<&str>, delta_tx: &mpsc::Sender<Delta>) -> Result<usize> {
+    let client = Client::try_default().await?;
+    let gvk = parse_gvk_key(gvk_key)?;
+    let (ar, namespaced) = find_api_resource(client.clone(), &gvk).await?;
+
+    let api: Api<DynamicObject> = if namespaced {
+        match namespace {
+            Some(ns) => Api::namespaced_with(client.clone(), ns, &ar),
+            None => Api::all_with(client.clone(), &ar),
+        }
+    } else {
+        Api::all_with(client.clone(), &ar)
+    };
+
+    let mut sent = 0usize;
+    let list = api.list(&Default::default()).await?;
+    for o in list {
+        let d = delta_from(&o, DeltaKind::Applied)?;
+        if delta_tx.send(d).await.is_ok() { sent += 1; }
+    }
+    Ok(sent)
+}

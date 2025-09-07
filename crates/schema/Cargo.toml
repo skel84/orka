@@ -1,0 +1,18 @@
+[package]
+name = "orka-schema"
+version = "0.0.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+description = "Orka CRD schema engine (Milestone 1 stub)"
+
+[dependencies]
+orka-core = { path = "../core" }
+anyhow = { workspace = true }
+thiserror = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tracing = { workspace = true }
+smallvec = { workspace = true }
+kube = { workspace = true }
+k8s-openapi = { workspace = true }
+

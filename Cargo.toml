@@ -4,6 +4,8 @@ members = [
     "crates/kubehub",
     "crates/store",
     "crates/cli",
+    "crates/schema",
+    "crates/search",
 ]
 resolver = "2"
 
@@ -21,6 +23,8 @@ clap = { version = "4", features = ["derive"] }
 futures = "0.3"
 uuid = { version = "1", features = ["v4"] }
 chrono = { version = "0.4", default-features = false, features = ["std", "clock"] }
+smallvec = { version = "1", features = ["serde"] }
+fuzzy-matcher = "0.3"
 
 # Kube stack (exact version can be adjusted later)
 kube = { version = "0.90", features = ["runtime", "client", "derive"] }

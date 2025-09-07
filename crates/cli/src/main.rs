@@ -3,10 +3,11 @@ use std::str::FromStr;
 use anyhow::Result;
 use clap::{ArgAction, Parser, Subcommand, ValueEnum};
 use tracing::{error, info, warn};
-use orka_store::spawn_ingest;
+use orka_store::spawn_ingest_with_projector;
 use tokio::sync::mpsc;
 use std::collections::HashMap;
 use tokio::signal;
+use std::time::{Duration, Instant};
 
 #[derive(Parser, Debug)]
 #[command(name = "orkactl", version, about = "Orka CLI (M0)")]
@@ -43,6 +44,24 @@ enum Commands {
     Watch {
         /// GVK key, e.g. "v1/ConfigMap" or "cert-manager.io/v1/Certificate"
         gvk: String,
+    },
+    /// Inspect schema details for a GVK (CRDs only)
+    Schema {
+        /// GVK key, e.g. "cert-manager.io/v1/Certificate"
+        gvk: String,
+    },
+    /// Search current snapshot (simple RAM index)
+    Search {
+        /// GVK key to watch while indexing
+        gvk: String,
+        /// Query string (supports free text; typed filters TODO)
+        query: String,
+        /// Limit results
+        #[arg(long = "limit", default_value_t = 20)]
+        limit: usize,
+        /// Explain filter stages and counts
+        #[arg(long = "explain", action = ArgAction::SetTrue)]
+        explain: bool,
     },
 }
 
@@ -96,7 +115,11 @@ async fn main() -> Result<()> {
             let ns = cli.namespace.as_deref();
             info!(gvk = %gvk, ns = ?ns, "ls invoked");
             let cap = std::env::var("ORKA_QUEUE_CAP").ok().and_then(|s| s.parse::<usize>().ok()).unwrap_or(2048);
-            let (ingest_tx, backend) = spawn_ingest(cap);
+            let projector = match orka_schema::fetch_crd_schema(&gvk).await {
+                Ok(Some(schema)) => Some(std::sync::Arc::new(schema.projector()) as std::sync::Arc<dyn orka_core::Projector + Send + Sync>),
+                _ => None,
+            };
+            let (ingest_tx, backend) = spawn_ingest_with_projector(cap, projector);
             // Start watcher
             let watcher_handle = tokio::spawn({
                 let gvk = gvk.clone();
@@ -108,15 +131,18 @@ async fn main() -> Result<()> {
                     }
                 }
             });
+            // Prime initial list for faster first snapshot
+            let _ = orka_kubehub::prime_list(&gvk, ns, &ingest_tx).await;
 
-            // Wait briefly for first snapshot; fallback to empty
+            // Wait for first epoch (configurable)
+            let wait_secs = std::env::var("ORKA_WAIT_SECS").ok().and_then(|s| s.parse::<u64>().ok()).unwrap_or(8);
             let mut rx = backend.subscribe_epoch();
-            let mut timeout = tokio::time::sleep(std::time::Duration::from_secs(2));
-            tokio::pin!(timeout);
-            tokio::select! {
-                _ = rx.changed() => {}
-                _ = &mut timeout => {}
-                _ = signal::ctrl_c() => { info!("Ctrl-C received during ls; finishing up"); }
+            let deadline = Instant::now() + Duration::from_secs(wait_secs);
+            while *rx.borrow() == 0 {
+                let now = Instant::now();
+                if now >= deadline { break; }
+                let rem = deadline.duration_since(now).min(Duration::from_secs(2));
+                if tokio::time::timeout(rem, rx.changed()).await.is_err() { break; }
             }
             let snap = backend.current();
 
@@ -147,7 +173,11 @@ async fn main() -> Result<()> {
             let ns = cli.namespace.as_deref();
             info!(gvk = %gvk, ns = ?ns, "watch invoked");
             let cap = std::env::var("ORKA_QUEUE_CAP").ok().and_then(|s| s.parse::<usize>().ok()).unwrap_or(2048);
-            let (ingest_tx, _backend) = spawn_ingest(cap);
+            let projector = match orka_schema::fetch_crd_schema(&gvk).await {
+                Ok(Some(schema)) => Some(std::sync::Arc::new(schema.projector()) as std::sync::Arc<dyn orka_core::Projector + Send + Sync>),
+                _ => None,
+            };
+            let (ingest_tx, _backend) = spawn_ingest_with_projector(cap, projector);
             let (tap_tx, mut tap_rx) = mpsc::channel::<orka_core::Delta>(cap);
 
             // Start watcher writing into our tap
@@ -227,6 +257,121 @@ async fn main() -> Result<()> {
             drop(ingest_tx);
             watcher_handle.abort();
             warn!("watch loop ended (graceful shutdown)");
+        }
+        Commands::Schema { gvk } => {
+            info!(gvk = %gvk, "schema invoked");
+            match orka_schema::fetch_crd_schema(&gvk).await {
+                Ok(Some(schema)) => match cli.output {
+                    Output::Human => {
+                        println!("served: {}", schema.served_version);
+                        if schema.printer_cols.is_empty() {
+                            println!("printer-cols: (none)");
+                        } else {
+                            let cols: Vec<_> = schema.printer_cols.iter().map(|c| c.name.as_str()).collect();
+                            println!("printer-cols: {}", cols.join(", "));
+                        }
+                        if schema.projected_paths.is_empty() {
+                            println!("projected: (heuristic defaults)");
+                        } else {
+                            let proj: Vec<_> = schema.projected_paths.iter().map(|p| p.json_path.as_str()).collect();
+                            println!("projected: {}", proj.join(", "));
+                        }
+                    }
+                    Output::Json => {
+                        println!("{}", serde_json::to_string_pretty(&schema)?);
+                    }
+                },
+                Ok(None) => {
+                    eprintln!("no CRD schema for builtin kind (or not found)");
+                }
+                Err(e) => {
+                    eprintln!("schema error: {}", e);
+                }
+            }
+        }
+        Commands::Search { gvk, query, limit, explain } => {
+            // Choose watcher namespace: CLI --ns overrides, else extract from query ns:token
+            let ns_from_query = query.split_whitespace().find_map(|t| t.strip_prefix("ns:")).map(|s| s.to_string());
+            let effective_ns = cli.namespace.clone().or(ns_from_query);
+            let ns = effective_ns.as_deref();
+            info!(gvk = %gvk, ns = ?ns, query = %query, limit, "search invoked");
+            let cap = std::env::var("ORKA_QUEUE_CAP").ok().and_then(|s| s.parse::<usize>().ok()).unwrap_or(2048);
+            let projector = match orka_schema::fetch_crd_schema(&gvk).await {
+                Ok(Some(schema)) => Some(std::sync::Arc::new(schema.projector()) as std::sync::Arc<dyn orka_core::Projector + Send + Sync>),
+                _ => None,
+            };
+            let (ingest_tx, backend) = spawn_ingest_with_projector(cap, projector);
+            // Start watcher
+            let watcher_handle = tokio::spawn({
+                let gvk = gvk.clone();
+                let ns = ns.map(|s| s.to_string());
+                let tx = ingest_tx.clone();
+                async move {
+                    if let Err(e) = orka_kubehub::start_watcher(&gvk, ns.as_deref(), tx).await {
+                        error!(error = ?e, "watcher failed");
+                    }
+                }
+            });
+            // Prime initial list so snapshot has data before waiting
+            let _ = orka_kubehub::prime_list(&gvk, ns, &ingest_tx).await;
+
+            // Wait for first epoch (configurable)
+            let wait_secs = std::env::var("ORKA_WAIT_SECS").ok().and_then(|s| s.parse::<u64>().ok()).unwrap_or(8);
+            let mut rx = backend.subscribe_epoch();
+            let deadline = Instant::now() + Duration::from_secs(wait_secs);
+            while *rx.borrow() == 0 {
+                let now = Instant::now();
+                if now >= deadline { break; }
+                let rem = deadline.duration_since(now).min(Duration::from_secs(2));
+                if tokio::time::timeout(rem, rx.changed()).await.is_err() { break; }
+            }
+            let snap = backend.current();
+            // Build index with field mapping (if schema known)
+            let field_pairs: Option<Vec<(String, u32)>> = match orka_schema::fetch_crd_schema(&gvk).await {
+                Ok(Some(schema)) => Some(schema.projected_paths.iter().map(|p| (p.json_path.clone(), p.id)).collect()),
+                _ => None,
+            };
+            let index = match field_pairs {
+                Some(pairs) => orka_search::Index::build_from_snapshot_with_fields(&snap, Some(&pairs)),
+                None => orka_search::Index::build_from_snapshot(&snap),
+            };
+            let (hits, dbg) = index.search_with_debug(&query, limit);
+
+            match cli.output {
+                Output::Human => {
+                    println!("KIND   NAMESPACE/NAME                SCORE");
+                    for h in hits {
+                        if let Some(obj) = snap.items.get(h.doc as usize) {
+                            let ns_col = obj.namespace.clone().unwrap_or_else(|| "-".to_string());
+                            println!("-     {:<22} {:<20} {:.2}", format!("{}/{}", ns_col, obj.name), "", h.score);
+                        }
+                    }
+                }
+                Output::Json => {
+                    #[derive(serde::Serialize)]
+                    struct Row<'a> { ns: &'a str, name: &'a str, score: f32 }
+                    let rows: Vec<_> = hits
+                        .into_iter()
+                        .filter_map(|h| {
+                            snap.items.get(h.doc as usize).map(|o| Row { ns: o.namespace.as_deref().unwrap_or("") , name: &o.name, score: h.score })
+                        })
+                        .collect();
+                    if explain {
+                        #[derive(serde::Serialize)]
+                        struct Explain<'a, T> { hits: T, debug: &'a orka_search::SearchDebugInfo }
+                        println!("{}", serde_json::to_string_pretty(&Explain { hits: rows, debug: &dbg })?);
+                    } else {
+                        println!("{}", serde_json::to_string_pretty(&rows)?);
+                    }
+                }
+            }
+            if explain && matches!(cli.output, Output::Human) {
+                eprintln!("debug: total={} after_ns={} after_label_keys={} after_labels={} after_anno_keys={} after_annos={} after_fields={}", dbg.total, dbg.after_ns, dbg.after_label_keys, dbg.after_labels, dbg.after_anno_keys, dbg.after_annos, dbg.after_fields);
+            }
+
+            // Shutdown
+            drop(ingest_tx);
+            watcher_handle.abort();
         }
     }
 

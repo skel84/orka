@@ -9,6 +9,8 @@ description = "Orka CLI (Milestone 0)"
 orka-core = { path = "../core" }
 orka-store = { path = "../store" }
 orka-kubehub = { path = "../kubehub" }
+orka-schema = { path = "../schema" }
+orka-search = { path = "../search" }
 anyhow = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }

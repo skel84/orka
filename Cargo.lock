@@ -561,6 +561,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "fuzzy-matcher"
+version = "0.3.7"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "54614a3312934d066701a80f20f15fa3b56d67ac7722b39eea5b4c9dd1d66c94"
+dependencies = [
+ "thread_local",
+]
+
+[[package]]
 name = "generic-array"
 version = "0.14.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1294,6 +1303,7 @@ dependencies = [
  "anyhow",
  "serde",
  "serde_json",
+ "smallvec",
  "thiserror 1.0.69",
 ]
 
@@ -1315,6 +1325,34 @@ dependencies = [
 ]
 
 [[package]]
+name = "orka-schema"
+version = "0.0.0"
+dependencies = [
+ "anyhow",
+ "k8s-openapi",
+ "kube",
+ "orka-core",
+ "serde",
+ "serde_json",
+ "smallvec",
+ "thiserror 1.0.69",
+ "tracing",
+]
+
+[[package]]
+name = "orka-search"
+version = "0.0.0"
+dependencies = [
+ "anyhow",
+ "fuzzy-matcher",
+ "orka-core",
+ "rustc-hash",
+ "serde",
+ "serde_json",
+ "smallvec",
+]
+
+[[package]]
 name = "orka-store"
 version = "0.0.0"
 dependencies = [
@@ -1326,6 +1364,7 @@ dependencies = [
  "rustc-hash",
  "serde",
  "serde_json",
+ "smallvec",
  "tokio",
  "tracing",
 ]
@@ -1340,6 +1379,8 @@ dependencies = [
  "metrics-exporter-prometheus",
  "orka-core",
  "orka-kubehub",
+ "orka-schema",
+ "orka-search",
  "orka-store",
  "serde",
  "serde_json",
@@ -1910,6 +1951,9 @@ name = "smallvec"
 version = "1.15.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "67b1b7a3b5fe4f1376887184045fcf45c69e92af734b7aaddc05fb777b6fbd03"
+dependencies = [
+ "serde",
+]
 
 [[package]]
 name = "socket2"

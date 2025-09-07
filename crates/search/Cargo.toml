@@ -1,0 +1,16 @@
+[package]
+name = "orka-search"
+version = "0.0.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+description = "Orka RAM search index (Milestone 1 stub)"
+
+[dependencies]
+orka-core = { path = "../core" }
+anyhow = { workspace = true }
+rustc-hash = { workspace = true }
+fuzzy-matcher = { workspace = true }
+smallvec = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+

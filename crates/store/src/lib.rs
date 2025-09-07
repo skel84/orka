@@ -4,7 +4,7 @@
 
 use std::collections::VecDeque;
 
-use orka_core::{Delta, LiteObj, WorldSnapshot};
+use orka_core::{Delta, LiteObj, WorldSnapshot, Projector};
 use rustc_hash::FxHashMap;
 use tokio::sync::{mpsc, watch};
 use tracing::{debug, info};
@@ -61,10 +61,15 @@ impl Coalescer {
 pub struct WorldBuilder {
     epoch: u64,
     items: Vec<LiteObj>,
+    projector: Option<std::sync::Arc<dyn Projector + Send + Sync>>, 
 }
 
 impl WorldBuilder {
-    pub fn new() -> Self { Self { epoch: 0, items: Vec::new() } }
+    pub fn new() -> Self { Self { epoch: 0, items: Vec::new(), projector: None } }
+
+    pub fn with_projector(projector: Option<std::sync::Arc<dyn Projector + Send + Sync>>) -> Self {
+        Self { epoch: 0, items: Vec::new(), projector }
+    }
 
     /// Apply a batch of deltas and update in-memory items.
     /// M0: naive implementation; to be replaced with UID-indexed map.
@@ -82,7 +87,24 @@ impl WorldBuilder {
                             .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
                             .map(|dt| dt.timestamp())
                             .unwrap_or(0);
-                        let lo = LiteObj { uid: d.uid, namespace, name, creation_ts };
+                        let projected = if let Some(p) = &self.projector { p.project(&d.raw) } else { smallvec::SmallVec::<[(u32, String); 8]>::new() };
+                        // Extract labels and annotations from metadata
+                        let mut labels = smallvec::SmallVec::<[(String, String); 8]>::new();
+                        let mut annotations = smallvec::SmallVec::<[(String, String); 4]>::new();
+                        if let Some(meta_obj) = d.raw.get("metadata").and_then(|m| m.as_object()) {
+                            if let Some(lbls) = meta_obj.get("labels").and_then(|m| m.as_object()) {
+                                for (k, v) in lbls.iter() {
+                                    if let Some(val) = v.as_str() { labels.push((k.clone(), val.to_string())); }
+                                }
+                            }
+                            if let Some(ann) = meta_obj.get("annotations").and_then(|m| m.as_object()) {
+                                for (k, v) in ann.iter() {
+                                    if let Some(val) = v.as_str() { annotations.push((k.clone(), val.to_string())); }
+                                }
+                            }
+                        }
+
+                        let lo = LiteObj { uid: d.uid, namespace, name, creation_ts, projected, labels, annotations };
                         // Replace existing by uid (linear scan for M0 stub)
                         if let Some(idx) = self.items.iter().position(|x| x.uid == d.uid) {
                             self.items[idx] = lo;
@@ -117,6 +139,14 @@ impl BackendHandle {
 
 /// Spawn an ingest loop consuming deltas and swapping snapshots. Returns a sender for deltas and a handle for reads.
 pub fn spawn_ingest(cap: usize) -> (mpsc::Sender<Delta>, BackendHandle) {
+    spawn_ingest_with_projector(cap, None)
+}
+
+/// Variant that accepts an optional projector used during LiteObj shaping.
+pub fn spawn_ingest_with_projector(
+    cap: usize,
+    projector: Option<std::sync::Arc<dyn Projector + Send + Sync>>,
+) -> (mpsc::Sender<Delta>, BackendHandle) {
     let (tx, mut rx) = mpsc::channel::<Delta>(cap);
     let snap = Arc::new(ArcSwap::from_pointee(WorldSnapshot::default()));
     let (epoch_tx, epoch_rx) = watch::channel(0u64);
@@ -124,7 +154,7 @@ pub fn spawn_ingest(cap: usize) -> (mpsc::Sender<Delta>, BackendHandle) {
 
     tokio::spawn(async move {
         let mut coalescer = Coalescer::with_capacity(cap);
-        let mut builder = WorldBuilder::new();
+        let mut builder = WorldBuilder::with_projector(projector);
         let mut ticker = tokio::time::interval(std::time::Duration::from_millis(8));
         loop {
             tokio::select! {
