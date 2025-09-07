@@ -39,6 +39,12 @@ pub struct Index {
     group: Option<String>, // lowercased group (empty for core)
 }
 
+#[derive(Debug, Clone, Copy, Default)]
+pub struct SearchOpts {
+    pub max_candidates: Option<usize>,
+    pub min_score: Option<f32>,
+}
+
 impl Index {
     pub fn build_from_snapshot(snap: &WorldSnapshot) -> Self {
         Self::build_from_snapshot_with_meta(snap, None, None, None)
@@ -116,7 +122,8 @@ impl Index {
             }
         }
         // postings are naturally sorted by increasing i
-        Self {
+        metrics::gauge!("index_docs", snap.items.len() as f64);
+        let me = Self {
             texts,
             namespaces,
             names,
@@ -129,14 +136,32 @@ impl Index {
             anno_key_post,
             kind: kind.map(|s| s.to_ascii_lowercase()),
             group: group.map(|s| s.to_ascii_lowercase()),
-        }
+        };
+        // Approximate index bytes: sum string lengths and posting sizes
+        let mut bytes: usize = 0;
+        bytes += me.texts.iter().map(|s| s.len()).sum::<usize>();
+        bytes += me.namespaces.iter().map(|s| s.len()).sum::<usize>();
+        bytes += me.names.iter().map(|s| s.len()).sum::<usize>();
+        bytes += me.projected.iter().map(|v| v.iter().map(|(_id, s)| s.len()).sum::<usize>()).sum::<usize>();
+        bytes += me.field_ids.iter().map(|(k, _)| k.len() + std::mem::size_of::<u32>()).sum::<usize>();
+        bytes += me.label_post.iter().map(|(k, v)| k.len() + v.len() * std::mem::size_of::<usize>()).sum::<usize>();
+        bytes += me.anno_post.iter().map(|(k, v)| k.len() + v.len() * std::mem::size_of::<usize>()).sum::<usize>();
+        bytes += me.label_key_post.iter().map(|(k, v)| k.len() + v.len() * std::mem::size_of::<usize>()).sum::<usize>();
+        bytes += me.anno_key_post.iter().map(|(k, v)| k.len() + v.len() * std::mem::size_of::<usize>()).sum::<usize>();
+        metrics::gauge!("index_bytes", bytes as f64);
+        me
     }
 
     pub fn search(&self, q: &str, limit: usize) -> Vec<Hit> {
-        self.search_with_debug(q, limit).0
+        self.search_with_debug_opts(q, limit, SearchOpts::default()).0
     }
 
     pub fn search_with_debug(&self, q: &str, limit: usize) -> (Vec<Hit>, SearchDebugInfo) {
+        self.search_with_debug_opts(q, limit, SearchOpts::default())
+    }
+
+    pub fn search_with_debug_opts(&self, q: &str, limit: usize, opts: SearchOpts) -> (Vec<Hit>, SearchDebugInfo) {
+        let started = std::time::Instant::now();
         let matcher = SkimMatcherV2::default();
         let mut hits: Vec<Hit> = Vec::new();
         // Simple typed filters: ns:NAME, field:json.path=value, label:key=value, anno:key=value
@@ -194,6 +219,7 @@ impl Index {
         };
         let total = self.texts.len();
         let after_ns = candidates.len();
+        metrics::histogram!("search_candidates_seed", after_ns as f64);
 
         // Intersect label key existence filters
         for key in label_key_filters {
@@ -239,6 +265,12 @@ impl Index {
         }
         let after_annos = candidates.len();
 
+        // Cap candidate set size if configured
+        if let Some(maxc) = opts.max_candidates {
+            if candidates.len() > maxc { candidates.truncate(maxc); }
+        }
+        metrics::histogram!("search_candidates", candidates.len() as f64);
+
         // Apply field filters and optional fuzzy
         let mut passed_fields: usize = 0;
         'doc: for i in candidates.into_iter() {
@@ -248,9 +280,15 @@ impl Index {
             }
             passed_fields += 1;
             if free_q.is_empty() {
-                hits.push(Hit { doc: i as u32, score: 0.0 });
-            } else if let Some(score) = matcher.fuzzy_match(&self.texts[i], &free_q) {
-                hits.push(Hit { doc: i as u32, score: score as f32 });
+                let score = 0.0f32;
+                if opts.min_score.map(|m| score >= m).unwrap_or(true) {
+                    hits.push(Hit { doc: i as u32, score });
+                }
+            } else if let Some(score_i) = matcher.fuzzy_match(&self.texts[i], &free_q) {
+                let score = score_i as f32;
+                if opts.min_score.map(|m| score >= m).unwrap_or(true) {
+                    hits.push(Hit { doc: i as u32, score });
+                }
             }
         }
         hits.sort_by(|a, b| {
@@ -269,6 +307,8 @@ impl Index {
         });
         hits.truncate(limit);
         let dbg = SearchDebugInfo { total, after_ns, after_label_keys, after_labels, after_anno_keys, after_annos, after_fields: passed_fields };
+        let elapsed = started.elapsed();
+        metrics::histogram!("search_eval_ms", elapsed.as_secs_f64() * 1_000.0);
         (hits, dbg)
     }
 }
@@ -389,5 +429,47 @@ mod tests {
         assert_eq!(idx.search("k:ConfigMap", 10).len(), 2);
         assert_eq!(idx.search("k:Pod", 10).len(), 0);
         assert_eq!(idx.search("g:apps", 10).len(), 0);
+    }
+}
+
+#[cfg(test)]
+mod opts_tests {
+    use super::*;
+    use orka_core::{LiteObj, WorldSnapshot, Uid};
+
+    fn uid(n: u8) -> Uid { let mut u = [0u8; 16]; u[0] = n; u }
+    fn obj(name: &str, ns: Option<&str>, projected: &[(u32, &str)]) -> LiteObj {
+        LiteObj {
+            uid: uid(1),
+            namespace: ns.map(|s| s.to_string()),
+            name: name.to_string(),
+            creation_ts: 0,
+            projected: projected.iter().map(|(k, v)| (*k, (*v).to_string())).collect(),
+            labels: smallvec::SmallVec::new(),
+            annotations: smallvec::SmallVec::new(),
+        }
+    }
+    fn snap(items: Vec<LiteObj>) -> WorldSnapshot { WorldSnapshot { epoch: 1, items } }
+
+    #[test]
+    fn max_candidates_caps_evaluation() {
+        let s = snap(vec![
+            obj("alpha", Some("ns"), &[]),
+            obj("beta", Some("ns"), &[]),
+            obj("gamma", Some("ns"), &[]),
+        ]);
+        let idx = Index::build_from_snapshot(&s);
+        let (hits, _dbg) = idx.search_with_debug_opts("ns:ns", 10, SearchOpts { max_candidates: Some(2), min_score: None });
+        // with no free text and no field filters, all pass, but candidate cap truncates prior to ranking
+        assert_eq!(hits.len(), 2);
+    }
+
+    #[test]
+    fn min_score_filters_low_scores() {
+        let s = snap(vec![obj("alpha", Some("default"), &[])]);
+        let idx = Index::build_from_snapshot(&s);
+        // Free text "zzz" should not match; with min_score = 1.0, no hits
+        let (hits, _dbg) = idx.search_with_debug_opts("zzz", 10, SearchOpts { max_candidates: None, min_score: Some(1.0) });
+        assert_eq!(hits.len(), 0);
     }
 }

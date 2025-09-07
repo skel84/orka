@@ -54,11 +54,17 @@ enum Commands {
     Search {
         /// GVK key to watch while indexing
         gvk: String,
-        /// Query string (supports free text; typed filters TODO)
+        /// Query string (supports free text + typed filters)
         query: String,
         /// Limit results
-        #[arg(long = "limit", default_value_t = 20)]
+        #[arg(long = "limit", default_value_t = 20, env = "ORKA_SEARCH_LIMIT")]
         limit: usize,
+        /// Maximum candidates after typed filters
+        #[arg(long = "max-candidates", env = "ORKA_SEARCH_MAX_CANDIDATES")]
+        max_candidates: Option<usize>,
+        /// Minimum fuzzy score to include hit
+        #[arg(long = "min-score", env = "ORKA_SEARCH_MIN_SCORE")]
+        min_score: Option<f32>,
         /// Explain filter stages and counts
         #[arg(long = "explain", action = ArgAction::SetTrue)]
         explain: bool,
@@ -298,7 +304,7 @@ async fn main() -> Result<()> {
                 }
             }
         }
-        Commands::Search { gvk, query, limit, explain } => {
+        Commands::Search { gvk, query, limit, max_candidates, min_score, explain } => {
             // Choose watcher namespace: CLI --ns overrides, else extract from query ns:token
             let ns_from_query = query.split_whitespace().find_map(|t| t.strip_prefix("ns:")).map(|s| s.to_string());
             let effective_ns = cli.namespace.clone().or(ns_from_query);
@@ -345,7 +351,8 @@ async fn main() -> Result<()> {
                 Some(pairs) => orka_search::Index::build_from_snapshot_with_meta(&snap, Some(&pairs), Some(&kind_str), Some(&group_str)),
                 None => orka_search::Index::build_from_snapshot_with_meta(&snap, None, Some(&kind_str), Some(&group_str)),
             };
-            let (hits, dbg) = index.search_with_debug(&query, limit);
+            let opts = orka_search::SearchOpts { max_candidates, min_score };
+            let (hits, dbg) = index.search_with_debug_opts(&query, limit, opts);
 
             match cli.output {
                 Output::Human => {

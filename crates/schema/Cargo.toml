@@ -15,4 +15,8 @@ tracing = { workspace = true }
 smallvec = { workspace = true }
 kube = { workspace = true }
 k8s-openapi = { workspace = true }
+serde_yaml = { version = "0.9", optional = true }
+jsonschema = { version = "0.17", optional = true }
 
+[features]
+jsonschema-validate = ["serde_yaml", "jsonschema"]

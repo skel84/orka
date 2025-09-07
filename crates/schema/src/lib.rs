@@ -39,6 +39,45 @@ fn normalize_json_path(jp: &str) -> Option<String> {
     if jp.contains('?') || jp.contains('*') { return None; }
     let s = if let Some(stripped) = jp.strip_prefix('.') { stripped } else { jp };
     if s.is_empty() { return None; }
+    // Validate segments: allow alnum/underscore/hyphen keys; optional single [index] at end
+    for seg in s.split('.') {
+        if seg.is_empty() { return None; }
+        let bytes = seg.as_bytes();
+        // count '[' occurrences
+        let mut open_idx: Option<usize> = None;
+        for (i, ch) in bytes.iter().enumerate() {
+            match *ch as char {
+                '[' => {
+                    if open_idx.is_some() { return None; } // multiple [
+                    open_idx = Some(i);
+                }
+                ']' => {
+                    // ']' only allowed if we saw '[' and it must be the last char
+                    match open_idx {
+                        Some(start) => {
+                            if i != bytes.len() - 1 { return None; }
+                            // ensure digits between [ and ]
+                            if start + 1 >= i { return None; }
+                            if !seg[start+1..i].chars().all(|c| c.is_ascii_digit()) { return None; }
+                        }
+                        None => return None,
+                    }
+                }
+                c => {
+                    // before '[' ensure key chars are safe
+                    if open_idx.is_none() {
+                        if !(c.is_ascii_alphanumeric() || c == '_' || c == '-') { return None; }
+                    } else {
+                        // inside index; digits validated on closing
+                    }
+                }
+            }
+        }
+        // if '[' opened, we must have seen a closing ']' (enforced above by requiring it as last char)
+        if let Some(start) = open_idx {
+            if !seg.ends_with(']') || start >= seg.len()-1 { return None; }
+        }
+    }
     Some(s.to_string())
 }
 
@@ -217,6 +256,137 @@ impl Projector for SchemaProjector {
 impl CrdSchema {
     pub fn projector(&self) -> SchemaProjector {
         SchemaProjector::new(self.projected_paths.clone())
+    }
+}
+
+// Feature-gated JSON Schema validation utilities
+#[cfg(feature = "jsonschema-validate")]
+pub mod validate {
+    use super::*;
+    use anyhow::{Context, Result};
+    use jsonschema::{Draft, JSONSchema};
+
+    #[derive(Debug, Clone, Serialize, Deserialize)]
+    pub struct ValidationIssue {
+        pub path: String,
+        pub error: String,
+        pub hint: Option<String>,
+    }
+
+    async fn fetch_openapi_schema(gvk_key: &str) -> Result<Option<serde_json::Value>> {
+        use kube::Client;
+        use k8s_openapi::apiextensions_apiserver::pkg::apis::apiextensions::v1 as apiextv1;
+        use kube::{Api, api::ListParams};
+
+        let client = Client::try_default().await?;
+        let parts: Vec<_> = gvk_key.split('/').collect();
+        let (group, version, kind) = match parts.as_slice() {
+            [version, kind] => ("", *version, *kind),
+            [group, version, kind] => (*group, *version, *kind),
+            _ => return Err(anyhow::anyhow!("invalid gvk key: {}", gvk_key)),
+        };
+        if group.is_empty() { return Ok(None); }
+
+        let api: Api<apiextv1::CustomResourceDefinition> = Api::all(client.clone());
+        let crds = api.list(&ListParams::default()).await.context("listing CustomResourceDefinitions")?;
+        let mut v_opt: Option<serde_json::Value> = None;
+        for crd in crds {
+            let v = serde_json::to_value(&crd)?;
+            let spec = match v.get("spec") { Some(s) => s, None => continue };
+            let g = spec.get("group").and_then(|s| s.as_str()).unwrap_or("");
+            let k = spec.get("names").and_then(|n| n.get("kind")).and_then(|s| s.as_str()).unwrap_or("");
+            if g == group && k == kind { v_opt = Some(v); break; }
+        }
+        let v = match v_opt { Some(v) => v, None => return Err(anyhow::anyhow!("CRD not found for {}", gvk_key)) };
+        let versions = v.get("spec").and_then(|s| s.get("versions")).and_then(|vv| vv.as_array()).cloned().unwrap_or_default();
+        let mut served_version = version.to_string();
+        if !versions.is_empty() {
+            if let Some(storage_v) = versions.iter().find(|ver| ver.get("storage").and_then(|b| b.as_bool()).unwrap_or(false)) {
+                if let Some(name) = storage_v.get("name").and_then(|s| s.as_str()) { served_version = name.to_string(); }
+            } else if let Some(served_v) = versions.iter().find(|ver| ver.get("served").and_then(|b| b.as_bool()).unwrap_or(false)) {
+                if let Some(name) = served_v.get("name").and_then(|s| s.as_str()) { served_version = name.to_string(); }
+            }
+        }
+        // Find openAPIV3Schema in chosen version or legacy location
+        let mut schema_opt: Option<serde_json::Value> = None;
+        if let Some(ver) = versions.iter().find(|ver| ver.get("name").and_then(|s| s.as_str()) == Some(served_version.as_str())) {
+            if let Some(s) = ver.get("schema").and_then(|s| s.get("openAPIV3Schema")).cloned() { schema_opt = Some(s); }
+        }
+        if schema_opt.is_none() {
+            schema_opt = v.get("spec").and_then(|s| s.get("validation")).and_then(|s| s.get("openAPIV3Schema")).cloned();
+        }
+        Ok(schema_opt)
+    }
+
+    /// Validate a YAML document against the CRD's `openAPIV3Schema` for the given GVK.
+    /// Returns a list of human-friendly issues; empty on success.
+    pub async fn validate_yaml_for_gvk(gvk_key: &str, yaml: &str) -> Result<Vec<ValidationIssue>> {
+        let schema = match fetch_openapi_schema(gvk_key).await? {
+            Some(s) => s,
+            None => return Ok(vec![ValidationIssue { path: "".into(), error: "no CRD schema available for builtin kind".into(), hint: None }]),
+        };
+        let json: serde_json::Value = match serde_yaml::from_str::<serde_yaml::Value>(yaml) {
+            Ok(v) => serde_json::to_value(v).context("converting YAML to JSON")?,
+            Err(e) => return Ok(vec![ValidationIssue { path: "".into(), error: format!("YAML parse error: {}", e), hint: Some("check indentation and syntax".into()) }]),
+        };
+        // JSONSchema 0.17 requires a 'static schema reference; leak for now (acceptable for CLI usage).
+        let schema_static: &'static serde_json::Value = Box::leak(Box::new(schema));
+        let compiled = JSONSchema::options().with_draft(Draft::Draft7).compile(schema_static).context("compiling CRD JSON Schema")?;
+        let mut issues: Vec<ValidationIssue> = Vec::new();
+        let result = compiled.validate(&json);
+        if let Err(errors) = result {
+            for err in errors {
+                let path = err.instance_path.to_string();
+                let error = err.to_string();
+                // Keep hints minimal to avoid depending on specific jsonschema internals
+                let hint = if error.contains("required property") {
+                    Some("missing required field".into())
+                } else if error.contains("type:") || error.contains("expected type") {
+                    Some("mismatched type".into())
+                } else if error.contains("enum") {
+                    Some("value not in allowed set".into())
+                } else {
+                    None
+                };
+                issues.push(ValidationIssue { path, error, hint });
+            }
+        }
+        Ok(issues)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn normalize_json_path_accepts_simple_paths() {
+        assert_eq!(normalize_json_path(".spec.foo"), Some("spec.foo".to_string()));
+        assert_eq!(normalize_json_path("spec.dnsNames[0]"), Some("spec.dnsNames[0]".to_string()));
+        assert_eq!(normalize_json_path("").is_none(), true);
+        assert_eq!(normalize_json_path("spec.*").is_none(), true);
+        assert_eq!(normalize_json_path("spec.foo[0][1]").is_some(), false);
+    }
+
+    #[test]
+    fn projector_extracts_scalars() {
+        let json = serde_json::json!({
+            "spec": {
+                "dnsNames": ["a.example.com", "b.example.com"],
+                "replicas": 3,
+                "paused": false
+            }
+        });
+        let specs = vec![
+            PathSpec { id: 1, json_path: "spec.dnsNames[0]".to_string() },
+            PathSpec { id: 2, json_path: "spec.replicas".to_string() },
+            PathSpec { id: 3, json_path: "spec.paused".to_string() },
+        ];
+        let pj = SchemaProjector::new(specs);
+        let out = pj.project(&json);
+        assert!(out.contains(&(1, "a.example.com".to_string())));
+        assert!(out.contains(&(2, "3".to_string())));
+        assert!(out.contains(&(3, "false".to_string())));
     }
 }
 

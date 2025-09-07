@@ -1,0 +1,21 @@
+[package]
+name = "orka-persist"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+anyhow = { workspace = true }
+serde = { workspace = true, features = ["derive"] }
+tracing = { workspace = true }
+metrics = { workspace = true }
+rusqlite = { version = "0.31", features = ["bundled"] }
+time = "0.3"
+
+[features]
+default = []
+zstd = ["dep:zstd"]
+
+[dependencies.zstd]
+version = "0.13"
+optional = true
+
