@@ -193,12 +193,12 @@ Certificate  prod/payments-cert         0.86
 - [ ] Add YAML→JSON→JSON Schema validation (feature `jsonschema-validate`).
 - [x] Extend `LiteObj` to carry `projected` values (plus labels/annotations) using schema renderers.
 - [x] Add `crates/search` crate: postings + text store (built from snapshot); label/anno postings.
-- [~] Implement typed filter parser: `ns:`, `label:`, `anno:`, `field:` (+ free text) — `k:`/`g:` pending.
-- [~] Integrate `fuzzy-matcher` for ranking; `limit` done; stable name/uid tiebreaker pending.
+- [x] Implement typed filter parser: `ns:`, `label:`, `anno:`, `field:` (+ free text), plus `k:`/`g:` (exact match; wildcards optional).
+- [x] Integrate `fuzzy-matcher` for ranking; `limit` and stable name/uid tiebreaker done.
 - [x] Expose a search API returning `(doc, score)` and mapped `LiteObj` (+ debug counters).
 - [x] CLI: `schema gvk [-o json]` with human/json output.
 - [x] CLI: `search "query" [--limit N] [--explain] [-o json]`; watcher scopes from `--ns` or `ns:` token; primed List for fast first snapshot.
-- [ ] Unit tests: schema normalization, projection picker, filter parser, scoring/ranking.
+- [~] Unit tests: filter parser + scoring/ranking added; schema normalization and projection picker still pending.
 - [ ] Replay test: synthetic deltas → deterministic candidates and ordering.
 - [ ] Bench: 100k docs; record p50/p99; track memory.
 - [ ] Docs: grammar and examples in `crates/cli/README.md`.
@@ -212,12 +212,13 @@ Certificate  prod/payments-cert         0.86
 Done
 - Schema discovery (served/storage version), printer-cols extraction, and projection derivation from OpenAPI.
 - Projector wired into ingest; `LiteObj` now includes projected fields, labels, and annotations.
-- Search index with typed filters (`ns:`, `label:` key/value and existence, `anno:` key/value and existence, `field:`), fuzzy ranking, and debug/explain.
-- CLI: `schema` and `search` implemented; watcher scopes from namespace; initial List primes snapshot.
+- Search index with typed filters (`ns:`, `label:` key/value and existence, `anno:` key/value and existence, `field:`, `k:`, `g:`), fuzzy ranking, stable name/uid tiebreaker, and debug/explain.
+- CLI: `schema` and `search` implemented; watcher scopes from namespace; initial List primes snapshot. Search table prints KIND.
 
 Next Steps
-- Unit tests: schema normalization and projection picker; projector path extraction; search parser; scoring/ranking.
-- Stable tie-breakers by name/uid; optional `--min-score` and `--max-candidates` flags.
-- `k:`/`g:` filters (and simple kind/group wildcards) — optional if time permits.
+- Unit tests: schema normalization and projection picker; projector path extraction.
+- Search knobs: optional `--min-score` and `--max-candidates` (with env fallbacks).
+- Observability: add search metrics (`search_candidates`, `search_eval_ms`, p50/p99 summaries); ensure exposed by Prometheus exporter.
 - Replay fixtures and deterministic search tests; baseline bench at 100k docs.
-- Optional: JSON Schema validation behind `jsonschema-validate` feature.
+- Docs: CLI grammar and examples for `schema`/`search` in README.
+- Optional: JSON Schema validation behind `jsonschema-validate`; simple wildcards for `k:`/`g:`.

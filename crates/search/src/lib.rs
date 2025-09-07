@@ -26,17 +26,22 @@ pub struct SearchDebugInfo {
 pub struct Index {
     texts: Vec<String>,      // by DocId
     namespaces: Vec<String>, // empty string for cluster-scoped
+    names: Vec<String>,      // object names by DocId
+    uids: Vec<[u8; 16]>,     // object UIDs by DocId
     projected: Vec<Vec<(u32, String)>>,
     field_ids: HashMap<String, u32>, // json_path -> id
     label_post: HashMap<String, Vec<usize>>, // "key=value" -> doc ids (sorted)
     anno_post: HashMap<String, Vec<usize>>,  // "key=value" -> doc ids (sorted)
     label_key_post: HashMap<String, Vec<usize>>, // key -> doc ids
     anno_key_post: HashMap<String, Vec<usize>>,  // key -> doc ids
+    // Single-GVK metadata useful for typed filters (k:, g:) in M1
+    kind: Option<String>,  // lowercased kind
+    group: Option<String>, // lowercased group (empty for core)
 }
 
 impl Index {
     pub fn build_from_snapshot(snap: &WorldSnapshot) -> Self {
-        Self::build_from_snapshot_with_fields(snap, None)
+        Self::build_from_snapshot_with_meta(snap, None, None, None)
     }
     fn intersect_sorted(a: &Vec<usize>, b: &Vec<usize>) -> Vec<usize> {
         let mut i = 0usize;
@@ -56,8 +61,20 @@ impl Index {
         snap: &WorldSnapshot,
         fields: Option<&[(String, u32)]>,
     ) -> Self {
+        Self::build_from_snapshot_with_meta(snap, fields, None, None)
+    }
+
+    /// Build index, optionally providing field path ids and single-GVK metadata (kind, group).
+    pub fn build_from_snapshot_with_meta(
+        snap: &WorldSnapshot,
+        fields: Option<&[(String, u32)]>,
+        kind: Option<&str>,
+        group: Option<&str>,
+    ) -> Self {
         let mut texts = Vec::with_capacity(snap.items.len());
         let mut namespaces = Vec::with_capacity(snap.items.len());
+        let mut names = Vec::with_capacity(snap.items.len());
+        let mut uids = Vec::with_capacity(snap.items.len());
         let mut projected = Vec::with_capacity(snap.items.len());
         let mut field_ids: HashMap<String, u32> = HashMap::new();
         let mut label_post: HashMap<String, Vec<usize>> = HashMap::new();
@@ -82,6 +99,8 @@ impl Index {
             }
             texts.push(display);
             namespaces.push(ns.to_string());
+            names.push(o.name.clone());
+            uids.push(o.uid);
             projected.push(o.projected.iter().map(|(id, val)| (*id, val.clone())).collect());
 
             // labels/annotations postings
@@ -97,7 +116,20 @@ impl Index {
             }
         }
         // postings are naturally sorted by increasing i
-        Self { texts, namespaces, projected, field_ids, label_post, anno_post, label_key_post, anno_key_post }
+        Self {
+            texts,
+            namespaces,
+            names,
+            uids,
+            projected,
+            field_ids,
+            label_post,
+            anno_post,
+            label_key_post,
+            anno_key_post,
+            kind: kind.map(|s| s.to_ascii_lowercase()),
+            group: group.map(|s| s.to_ascii_lowercase()),
+        }
     }
 
     pub fn search(&self, q: &str, limit: usize) -> Vec<Hit> {
@@ -109,6 +141,8 @@ impl Index {
         let mut hits: Vec<Hit> = Vec::new();
         // Simple typed filters: ns:NAME, field:json.path=value, label:key=value, anno:key=value
         let mut ns_filter: Option<&str> = None;
+        let mut kind_filters: Vec<String> = Vec::new();
+        let mut group_filters: Vec<String> = Vec::new();
         let mut field_filters: Vec<(u32, String)> = Vec::new();
         let mut label_filters: Vec<String> = Vec::new();
         let mut anno_filters: Vec<String> = Vec::new();
@@ -117,6 +151,8 @@ impl Index {
         let mut free_terms: Vec<&str> = Vec::new();
         for tok in q.split_whitespace() {
             if let Some(rest) = tok.strip_prefix("ns:") { ns_filter = Some(rest); continue; }
+            if let Some(rest) = tok.strip_prefix("k:") { if !rest.is_empty() { kind_filters.push(rest.to_string()); continue; } }
+            if let Some(rest) = tok.strip_prefix("g:") { if !rest.is_empty() { group_filters.push(rest.to_string()); continue; } }
             if let Some(rest) = tok.strip_prefix("field:") {
                 if let Some(eq) = rest.find('=') {
                     let path = &rest[..eq];
@@ -138,6 +174,18 @@ impl Index {
             free_terms.push(tok);
         }
         let free_q = free_terms.join(" ");
+
+        // Apply single-GVK kind/group filters early. Mismatch => no hits.
+        if !kind_filters.is_empty() {
+            let cur = self.kind.as_deref().unwrap_or("");
+            let ok = kind_filters.iter().any(|k| k.eq_ignore_ascii_case(cur));
+            if !ok { return (Vec::new(), SearchDebugInfo { total: self.texts.len(), after_ns: 0, after_label_keys: 0, after_labels: 0, after_anno_keys: 0, after_annos: 0, after_fields: 0 }); }
+        }
+        if !group_filters.is_empty() {
+            let cur = self.group.as_deref().unwrap_or("");
+            let ok = group_filters.iter().any(|g| g.eq_ignore_ascii_case(cur));
+            if !ok { return (Vec::new(), SearchDebugInfo { total: self.texts.len(), after_ns: 0, after_label_keys: 0, after_labels: 0, after_anno_keys: 0, after_annos: 0, after_fields: 0 }); }
+        }
         // Seed candidates
         let mut candidates: Vec<usize> = if let Some(ns) = ns_filter {
             (0..self.texts.len()).filter(|i| self.namespaces.get(*i).map(|s| s == ns).unwrap_or(false)).collect()
@@ -205,9 +253,141 @@ impl Index {
                 hits.push(Hit { doc: i as u32, score: score as f32 });
             }
         }
-        hits.sort_by(|a, b| b.score.total_cmp(&a.score).then_with(|| a.doc.cmp(&b.doc)));
+        hits.sort_by(|a, b| {
+            b.score
+                .total_cmp(&a.score)
+                .then_with(|| {
+                    let an = &self.names[a.doc as usize];
+                    let bn = &self.names[b.doc as usize];
+                    an.cmp(bn)
+                })
+                .then_with(|| {
+                    let au = &self.uids[a.doc as usize];
+                    let bu = &self.uids[b.doc as usize];
+                    au.cmp(bu)
+                })
+        });
         hits.truncate(limit);
         let dbg = SearchDebugInfo { total, after_ns, after_label_keys, after_labels, after_anno_keys, after_annos, after_fields: passed_fields };
         (hits, dbg)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use orka_core::{LiteObj, WorldSnapshot, Uid};
+    
+
+    fn uid(n: u8) -> Uid { let mut u = [0u8; 16]; u[0] = n; u }
+
+    fn obj(
+        id: u8,
+        name: &str,
+        ns: Option<&str>,
+        labels: &[(&str, &str)],
+        annos: &[(&str, &str)],
+        projected: &[(u32, &str)],
+        ts: i64,
+    ) -> LiteObj {
+        LiteObj {
+            uid: uid(id),
+            namespace: ns.map(|s| s.to_string()),
+            name: name.to_string(),
+            creation_ts: ts,
+            projected: projected
+                .iter()
+                .map(|(k, v)| (*k, (*v).to_string()))
+                .collect(),
+            labels: labels.iter().map(|(k, v)| ((*k).to_string(), (*v).to_string())).collect(),
+            annotations: annos.iter().map(|(k, v)| ((*k).to_string(), (*v).to_string())).collect(),
+        }
+    }
+
+    fn snap(items: Vec<LiteObj>) -> WorldSnapshot { WorldSnapshot { epoch: 1, items } }
+
+    #[test]
+    fn ns_filter_works() {
+        let s = snap(vec![
+            obj(1, "a", Some("default"), &[], &[], &[], 0),
+            obj(2, "b", Some("prod"), &[], &[], &[], 0),
+        ]);
+        let idx = Index::build_from_snapshot_with_meta(&s, None, Some("ConfigMap"), Some(""));
+        let (hits, _dbg) = idx.search_with_debug("ns:default", 10);
+        assert_eq!(hits.len(), 1);
+        assert_eq!(s.items[hits[0].doc as usize].name, "a");
+    }
+
+    #[test]
+    fn label_and_anno_filters() {
+        let s = snap(vec![
+            obj(1, "a", Some("default"), &[("app","web"), ("tier","frontend")], &[("team","core")], &[], 0),
+            obj(2, "b", Some("default"), &[("app","api")], &[("team","platform")], &[], 0),
+        ]);
+        let idx = Index::build_from_snapshot(&s);
+        let (hits, _dbg) = idx.search_with_debug("label:app=web", 10);
+        assert_eq!(hits.len(), 1);
+        assert_eq!(s.items[hits[0].doc as usize].name, "a");
+
+        let (hits2, _dbg2) = idx.search_with_debug("label:app", 10);
+        assert_eq!(hits2.len(), 2, "label key existence should match both items");
+
+        let (hits3, _dbg3) = idx.search_with_debug("anno:team=platform", 10);
+        assert_eq!(hits3.len(), 1);
+        assert_eq!(s.items[hits3[0].doc as usize].name, "b");
+    }
+
+    #[test]
+    fn field_filter_matches_projected() {
+        let s = snap(vec![
+            obj(1, "a", Some("default"), &[], &[], &[(1, "x"), (2, "y")], 0),
+            obj(2, "b", Some("default"), &[], &[], &[(1, "z")], 0),
+        ]);
+        let pairs = vec![("spec.foo".to_string(), 1u32), ("spec.bar".to_string(), 2u32)];
+        let idx = Index::build_from_snapshot_with_meta(&s, Some(&pairs), Some("ConfigMap"), Some(""));
+        let (hits, _dbg) = idx.search_with_debug("field:spec.foo=x", 10);
+        assert_eq!(hits.len(), 1);
+        assert_eq!(s.items[hits[0].doc as usize].name, "a");
+
+        let (hits2, _dbg2) = idx.search_with_debug("field:spec.bar=y", 10);
+        assert_eq!(hits2.len(), 1);
+        assert_eq!(s.items[hits2[0].doc as usize].name, "a");
+
+        let (hits3, _dbg3) = idx.search_with_debug("field:spec.foo=notfound", 10);
+        assert_eq!(hits3.len(), 0);
+    }
+
+    #[test]
+    fn tie_break_by_name_then_uid() {
+        let s = snap(vec![
+            obj(2, "alpha", Some("b"), &[], &[], &[], 0),
+            obj(1, "alpha", Some("a"), &[], &[], &[], 0),
+            obj(3, "beta", Some("a"), &[], &[], &[], 0),
+        ]);
+        // No free text or filters -> all items, score 0.0 -> sort by name asc then uid asc
+        let idx = Index::build_from_snapshot(&s);
+        let (hits, _dbg) = idx.search_with_debug("", 10);
+        let ordered: Vec<(String, [u8; 16])> = hits
+            .iter()
+            .map(|h| (s.items[h.doc as usize].name.clone(), s.items[h.doc as usize].uid))
+            .collect();
+        assert_eq!(ordered[0].0, "alpha");
+        assert_eq!(ordered[1].0, "alpha");
+        // uid with first byte 1 should come before 2 for same name
+        assert_eq!(ordered[0].1[0], 1);
+        assert_eq!(ordered[1].1[0], 2);
+        assert_eq!(ordered[2].0, "beta");
+    }
+
+    #[test]
+    fn kind_and_group_filters_gate_results() {
+        let s = snap(vec![
+            obj(1, "a", Some("default"), &[], &[], &[], 0),
+            obj(2, "b", Some("default"), &[], &[], &[], 0),
+        ]);
+        let idx = Index::build_from_snapshot_with_meta(&s, None, Some("ConfigMap"), Some(""));
+        assert_eq!(idx.search("k:ConfigMap", 10).len(), 2);
+        assert_eq!(idx.search("k:Pod", 10).len(), 0);
+        assert_eq!(idx.search("g:apps", 10).len(), 0);
     }
 }

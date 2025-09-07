@@ -85,6 +85,15 @@ fn init_metrics() {
     }
 }
 
+fn parse_gvk(key: &str) -> Option<(String, String, String)> {
+    let parts: Vec<&str> = key.split('/').collect();
+    match parts.as_slice() {
+        [version, kind] => Some((String::new(), (*version).to_string(), (*kind).to_string())),
+        [group, version, kind] => Some(((*group).to_string(), (*version).to_string(), (*kind).to_string())),
+        _ => None,
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     init_tracing();
@@ -331,9 +340,10 @@ async fn main() -> Result<()> {
                 Ok(Some(schema)) => Some(schema.projected_paths.iter().map(|p| (p.json_path.clone(), p.id)).collect()),
                 _ => None,
             };
+            let (group_str, _version_str, kind_str) = parse_gvk(&gvk).unwrap_or((String::new(), String::new(), String::new()));
             let index = match field_pairs {
-                Some(pairs) => orka_search::Index::build_from_snapshot_with_fields(&snap, Some(&pairs)),
-                None => orka_search::Index::build_from_snapshot(&snap),
+                Some(pairs) => orka_search::Index::build_from_snapshot_with_meta(&snap, Some(&pairs), Some(&kind_str), Some(&group_str)),
+                None => orka_search::Index::build_from_snapshot_with_meta(&snap, None, Some(&kind_str), Some(&group_str)),
             };
             let (hits, dbg) = index.search_with_debug(&query, limit);
 
@@ -343,7 +353,7 @@ async fn main() -> Result<()> {
                     for h in hits {
                         if let Some(obj) = snap.items.get(h.doc as usize) {
                             let ns_col = obj.namespace.clone().unwrap_or_else(|| "-".to_string());
-                            println!("-     {:<22} {:<20} {:.2}", format!("{}/{}", ns_col, obj.name), "", h.score);
+                            println!("{:<6} {:<22} {:<20} {:.2}", kind_str, format!("{}/{}", ns_col, obj.name), "", h.score);
                         }
                     }
                 }
