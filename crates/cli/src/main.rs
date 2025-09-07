@@ -8,9 +8,10 @@ use tokio::sync::mpsc;
 use std::collections::HashMap;
 use tokio::signal;
 use std::time::{Duration, Instant};
+use orka_persist::Store;
 
 #[derive(Parser, Debug)]
-#[command(name = "orkactl", version, about = "Orka CLI (M0)")]
+#[command(name = "orkactl", version, about = "Orka CLI (M2)")]
 struct Cli {
     /// Output format
     #[arg(short = 'o', long = "output", value_enum, global = true, default_value_t = Output::Human)]
@@ -68,6 +69,50 @@ enum Commands {
         /// Explain filter stages and counts
         #[arg(long = "explain", action = ArgAction::SetTrue)]
         explain: bool,
+    },
+    /// Edit a resource from a YAML file (dry-run or apply)
+    Edit {
+        /// YAML path or '-' for stdin
+        #[arg(short = 'f', long = "file")]
+        file: String,
+        /// Validate against CRD JSONSchema (feature-gated)
+        #[arg(long = "validate", action = ArgAction::SetTrue)]
+        validate: bool,
+        /// Perform a server-side dry-run
+        #[arg(long = "dry-run", action = ArgAction::SetTrue)]
+        dry_run: bool,
+        /// Apply with SSA (fieldManager=orka)
+        #[arg(long = "apply", action = ArgAction::SetTrue)]
+        apply: bool,
+    },
+    /// Show minimal diffs vs live and last-applied
+    Diff {
+        /// YAML path or '-' for stdin
+        #[arg(short = 'f', long = "file")]
+        file: String,
+    },
+    /// Inspect last-applied snapshots for a resource
+    #[command(name = "last-applied")]
+    LastApplied {
+        #[command(subcommand)]
+        sub: LastAppliedCmd,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+enum LastAppliedCmd {
+    /// Get last-applied snapshots for a resource
+    Get {
+        /// GVK key, e.g. "v1/ConfigMap" or "group/v1/Foo"
+        gvk: String,
+        /// Resource name
+        name: String,
+        /// Limit number of entries
+        #[arg(long = "limit", default_value_t = 3)]
+        limit: usize,
+        /// Output YAML payloads as JSON array
+        #[arg(short = 'o', long = "output", value_enum)]
+        output: Option<Output>,
     },
 }
 
@@ -390,6 +435,89 @@ async fn main() -> Result<()> {
             drop(ingest_tx);
             watcher_handle.abort();
         }
+        Commands::Edit { file, validate, dry_run, apply } => {
+            let ns = cli.namespace.as_deref();
+            let yaml = read_input(&file)?;
+            if validate {
+                #[cfg(feature = "validate")]
+                {
+                    // Detect GVK from YAML for schema lookup
+                    let j: serde_yaml::Value = serde_yaml::from_str(&yaml)?;
+                    let api_ver = j.get("apiVersion").and_then(|v| v.as_str()).unwrap_or("");
+                    let kind = j.get("kind").and_then(|v| v.as_str()).unwrap_or("");
+                    let gvk_key = if api_ver.contains('/') { format!("{}/{}", api_ver, kind) } else { format!("{}/{}", api_ver, kind) };
+                    let issues = orka_schema::validate::validate_yaml_for_gvk(&gvk_key, &yaml).await?;
+                    if !issues.is_empty() {
+                        eprintln!("validation issues ({}):", issues.len());
+                        for it in issues { eprintln!("- {}: {}{}", it.path, it.error, it.hint.as_deref().map(|h| format!(" ({})", h)).unwrap_or_default()); }
+                    }
+                }
+                #[cfg(not(feature = "validate"))]
+                {
+                    warn!("validate flag set but CLI built without 'validate' feature");
+                }
+            }
+            let do_apply = if apply { true } else { !dry_run };
+            match orka_apply::edit_from_yaml(&yaml, ns, validate, do_apply).await {
+                Ok(res) => match cli.output {
+                    Output::Human => {
+                        if res.dry_run {
+                            println!("dry-run: +{} ~{} -{}", res.summary.adds, res.summary.updates, res.summary.removes);
+                        } else if res.applied {
+                            println!("applied rv={}", res.new_rv.unwrap_or_default());
+                        } else {
+                            println!("no-op");
+                        }
+                    }
+                    Output::Json => println!("{}", serde_json::to_string_pretty(&res)?),
+                },
+                Err(e) => { eprintln!("edit error: {}", e); }
+            }
+        }
+        Commands::Diff { file } => {
+            let ns = cli.namespace.as_deref();
+            let yaml = read_input(&file)?;
+            match orka_apply::diff_from_yaml(&yaml, ns).await {
+                Ok((live, last)) => match cli.output {
+                    Output::Human => {
+                        println!("vs live: +{} ~{} -{}", live.adds, live.updates, live.removes);
+                        if let Some(ls) = last { println!("vs last: +{} ~{} -{}", ls.adds, ls.updates, ls.removes); }
+                    }
+                    Output::Json => {
+                        #[derive(serde::Serialize)]
+                        struct D { live: orka_apply::DiffSummary, last: Option<orka_apply::DiffSummary> }
+                        println!("{}", serde_json::to_string_pretty(&D { live, last })?);
+                    }
+                },
+                Err(e) => eprintln!("diff error: {}", e),
+            }
+        }
+        Commands::LastApplied { sub } => {
+            match sub {
+                LastAppliedCmd::Get { gvk, name, limit, output } => {
+                    // Resolve UID by fetching live object
+                    let ns = cli.namespace.as_deref();
+                    let uid_hex = fetch_uid_for(&gvk, &name, ns).await?;
+                    let uid = parse_uid(&uid_hex)?;
+                    let store = match orka_persist::SqliteStore::open_default() { Ok(s) => s, Err(e) => { eprintln!("open db error: {}", e); return Ok(()); } };
+                    let rows = store.get_last(uid, Some(limit)).unwrap_or_default();
+                    match output.unwrap_or(cli.output) {
+                        Output::Human => {
+                            for r in rows.iter() {
+                                let ts = r.ts;
+                                println!("ts={} rv={}", ts, r.rv);
+                            }
+                        }
+                        Output::Json => {
+                            #[derive(serde::Serialize)]
+                            struct Row { ts: i64, rv: String, yaml: String }
+                            let out: Vec<Row> = rows.into_iter().map(|r| Row { ts: r.ts, rv: r.rv, yaml: orka_persist::maybe_decompress(&r.yaml_zstd) }).collect();
+                            println!("{}", serde_json::to_string_pretty(&out)?);
+                        }
+                    }
+                }
+            }
+        }
     }
 
     Ok(())
@@ -416,4 +544,49 @@ fn json_key(v: &serde_json::Value) -> String {
     } else {
         name.to_string()
     }
+}
+
+fn read_input(path: &str) -> Result<String> {
+    if path == "-" {
+        use std::io::Read;
+        let mut s = String::new();
+        std::io::stdin().read_to_string(&mut s)?;
+        Ok(s)
+    } else {
+        Ok(std::fs::read_to_string(path)?)
+    }
+}
+
+async fn fetch_uid_for(gvk_key: &str, name: &str, namespace: Option<&str>) -> Result<String> {
+    use kube::{discovery::{Discovery, Scope}, api::Api, core::{DynamicObject, GroupVersionKind}};
+    let client = kube::Client::try_default().await?;
+    // Parse key
+    let (group, version, kind) = parse_gvk(gvk_key).ok_or_else(|| anyhow::anyhow!("invalid gvk: {}", gvk_key))?;
+    let gvk = GroupVersionKind { group, version, kind };
+    // Find ApiResource
+    let discovery = Discovery::new(client.clone()).run().await?;
+    let mut ar_opt: Option<(kube::core::ApiResource, bool)> = None;
+    for group in discovery.groups() {
+        for (ar, caps) in group.recommended_resources() {
+            if ar.group == gvk.group && ar.version == gvk.version && ar.kind == gvk.kind {
+                ar_opt = Some((ar.clone(), matches!(caps.scope, Scope::Namespaced)));
+                break;
+            }
+        }
+    }
+    let (ar, namespaced) = ar_opt.ok_or_else(|| anyhow::anyhow!("GVK not found: {}/{}/{}", gvk.group, gvk.version, gvk.kind))?;
+    let api: Api<DynamicObject> = if namespaced {
+        match namespace {
+            Some(ns) => Api::namespaced_with(client.clone(), ns, &ar),
+            None => return Err(anyhow::anyhow!("namespace required for namespaced kind")),
+        }
+    } else { Api::all_with(client.clone(), &ar) };
+    let obj = api.get(name).await?;
+    let uid = obj.metadata.uid.ok_or_else(|| anyhow::anyhow!("object missing metadata.uid"))?;
+    Ok(uid)
+}
+
+fn parse_uid(uid_str: &str) -> Result<orka_core::Uid> {
+    let u = uuid::Uuid::parse_str(uid_str).map_err(|e| anyhow::anyhow!("invalid uid: {}", e))?;
+    Ok(*u.as_bytes())
 }

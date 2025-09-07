@@ -11,6 +11,8 @@ orka-store = { path = "../store" }
 orka-kubehub = { path = "../kubehub" }
 orka-schema = { path = "../schema" }
 orka-search = { path = "../search" }
+orka-apply = { path = "../apply" }
+orka-persist = { path = "../persist" }
 anyhow = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
@@ -18,9 +20,17 @@ clap = { workspace = true }
 tokio = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
+serde_yaml = "0.9"
 metrics = { workspace = true }
 metrics-exporter-prometheus = { workspace = true }
+kube = { workspace = true }
+uuid = { workspace = true }
 
 [[bin]]
 name = "orkactl"
 path = "src/main.rs"
+
+[features]
+default = []
+# Enable CRD JSONSchema validation path in CLI via orka-schema feature
+validate = ["orka-schema/jsonschema-validate"]

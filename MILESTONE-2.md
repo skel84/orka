@@ -126,13 +126,22 @@ Env:
 
 ## Implementation Order (Checklist)
 
-- [ ] Add `crates/persist` (rusqlite + optional zstd), schema + APIs.
-- [ ] Add `crates/apply`: dry‑run + SSA helpers; diff pruning/summary.
-- [ ] Wire CLI: `edit`, `diff`, `last-applied` subcommands (+ JSON output).
-- [ ] Integrate persist: save last‑applied after SSA; keep latest 3.
-- [ ] Unit tests: persist (put/get/rotate); diff pruning; error mapping.
-- [ ] Docs: CLI usage + env in `crates/cli/README.md`.
-- [ ] Metrics: counters + histograms for apply/persist paths.
+- [x] Add `crates/persist` (rusqlite + optional zstd), schema + APIs.
+- [x] Add `crates/apply`: dry‑run + SSA helpers; diff pruning/summary.
+- [x] Wire CLI: `edit`, `diff`, `last-applied` subcommands (+ JSON output).
+- [x] Integrate persist: save last‑applied after SSA; keep latest 3.
+- [x] Unit tests: persist (put/get/rotate).
+- [x] Unit tests: diff pruning; error mapping.
+- [x] Docs: CLI usage + env in `crates/cli/README.md`.
+- [x] Metrics: counters + histograms for apply/persist paths.
+
+### Progress Notes
+
+- Persist: `SqliteStore` with table `last_applied(uid BLOB, rv TEXT, ts INTEGER, yaml BLOB)` and index `(uid, ts DESC)`; rotates to keep latest 3 per UID. Optional zstd compression behind feature flag.
+- Apply: SSA and server dry‑run with `fieldManager=orka`; prunes noisy fields (`managedFields`, `resourceVersion`, `status`, `generation`, `creationTimestamp`). Emits `DiffSummary { adds, updates, removes }`.
+- CLI: implemented `edit -f`, `diff -f`, and `last-applied get` (supports `-o json`); `--validate` is feature‑gated via `validate` feature enabling schema JSONSchema checks.
+- Metrics: `apply_attempts`, `apply_ok`, `apply_err`, `apply_dry_ok`; histograms `apply_latency_ms`, `persist_put_ms`, `persist_get_ms`.
+- Docs: updated usage and env in `crates/cli/README.md`.
+- Example: `examples/configmap.yaml` for quick dry‑run/apply.
 
 > Do the simplest thing that works. If it’s not critical for end‑to‑end edits, it waits.
-

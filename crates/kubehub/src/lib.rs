@@ -132,7 +132,7 @@ pub async fn start_watcher(gvk_key: &str, namespace: Option<&str>, delta_tx: mps
         let cfg = watcher::Config::default();
         let stream = watcher::watcher(api, cfg);
         futures::pin_mut!(stream);
-        let mut relist_timer = tokio::time::sleep(std::time::Duration::from_secs(relist_secs));
+        let relist_timer = tokio::time::sleep(std::time::Duration::from_secs(relist_secs));
         tokio::pin!(relist_timer);
         info!("watch stream opened");
 

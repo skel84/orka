@@ -1,0 +1,10 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: orka-example-config
+  namespace: default
+  labels:
+    app: orka-example
+data:
+  message: "hello, orka"
+  version: "2"
