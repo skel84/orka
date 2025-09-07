@@ -10,6 +10,7 @@ use tokio::sync::{mpsc, watch};
 use tracing::{debug, info};
 use arc_swap::ArcSwap;
 use std::sync::Arc;
+use metrics::{counter, gauge, histogram};
 
 /// Coalescing queue keyed by UID with FIFO order and fixed capacity.
 pub struct Coalescer {
@@ -34,11 +35,13 @@ impl Coalescer {
                 if let Some(old) = self.order.pop_front() {
                     self.map.remove(&old);
                     self.dropped += 1;
+                    counter!("coalescer_dropped_total", 1);
                 }
             }
             self.order.push_back(uid);
         }
         self.map.insert(uid, d);
+        gauge!("coalescer_len", self.map.len() as f64);
     }
 
     /// Drain all currently coalesced deltas (simple version for M0).
@@ -49,6 +52,7 @@ impl Coalescer {
                 out.push(d);
             }
         }
+        gauge!("coalescer_len", self.map.len() as f64);
         out
     }
 }
@@ -131,11 +135,17 @@ pub fn spawn_ingest(cap: usize) -> (mpsc::Sender<Delta>, BackendHandle) {
                             debug!("delta channel closed; draining and exiting ingest loop");
                             let batch = coalescer.drain_ready();
                             if !batch.is_empty() {
+                                let drained = batch.len();
+                                let dropped = coalescer.dropped();
                                 builder.apply(batch);
                                 let next = builder.freeze();
                                 let epoch = next.epoch;
                                 snap_clone.store(next);
                                 let _ = epoch_tx.send(epoch);
+                                debug!(drained, dropped, epoch, "ingest applied batch");
+                                histogram!("ingest_batch_size", drained as f64);
+                                gauge!("ingest_epoch", epoch as f64);
+                                gauge!("snapshot_items", snap_clone.load().items.len() as f64);
                             }
                             break;
                         }
@@ -144,11 +154,17 @@ pub fn spawn_ingest(cap: usize) -> (mpsc::Sender<Delta>, BackendHandle) {
                 _ = ticker.tick() => {
                     let batch = coalescer.drain_ready();
                     if !batch.is_empty() {
+                        let drained = batch.len();
+                        let dropped = coalescer.dropped();
                         builder.apply(batch);
                         let next = builder.freeze();
                         let epoch = next.epoch;
                         snap_clone.store(next);
                         let _ = epoch_tx.send(epoch);
+                        debug!(drained, dropped, epoch, "ingest applied batch");
+                        histogram!("ingest_batch_size", drained as f64);
+                        gauge!("ingest_epoch", epoch as f64);
+                        gauge!("snapshot_items", snap_clone.load().items.len() as f64);
                     }
                 }
             }
@@ -157,4 +173,77 @@ pub fn spawn_ingest(cap: usize) -> (mpsc::Sender<Delta>, BackendHandle) {
     });
 
     (tx, BackendHandle { snap, epoch_rx })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use orka_core::{DeltaKind, Uid};
+
+    fn uid(n: u8) -> Uid {
+        let mut u = [0u8; 16];
+        u[0] = n;
+        u
+    }
+
+    fn obj(name: &str, ns: Option<&str>) -> serde_json::Value {
+        let mut meta = serde_json::json!({
+            "name": name,
+            "uid": format!("00000000-0000-0000-0000-{:012}", 1),
+            "creationTimestamp": "2020-01-01T00:00:00Z",
+        });
+        if let Some(ns) = ns { meta["namespace"] = serde_json::Value::String(ns.to_string()); }
+        serde_json::json!({ "metadata": meta })
+    }
+
+    #[test]
+    fn coalescer_capacity_and_drop() {
+        let mut c = Coalescer::with_capacity(2);
+        // push 3 unique uids -> 1 drop expected
+        for i in 0..3u8 {
+            c.push(Delta { uid: uid(i), kind: DeltaKind::Applied, raw: serde_json::json!({}) });
+        }
+        assert_eq!(c.len(), 2);
+        assert_eq!(c.dropped(), 1);
+
+        let drained = c.drain_ready();
+        assert_eq!(drained.len(), 2);
+        assert_eq!(c.len(), 0);
+    }
+
+    #[test]
+    fn coalescer_overwrite_same_uid() {
+        let mut c = Coalescer::with_capacity(4);
+        let u = uid(42);
+        c.push(Delta { uid: u, kind: DeltaKind::Applied, raw: serde_json::json!({"a":1}) });
+        c.push(Delta { uid: u, kind: DeltaKind::Applied, raw: serde_json::json!({"a":2}) });
+        let drained = c.drain_ready();
+        assert_eq!(drained.len(), 1);
+        assert_eq!(drained[0].raw["a"], 2);
+    }
+
+    #[test]
+    fn worldbuilder_apply_add_update_delete() {
+        let mut wb = WorldBuilder::new();
+        let u1 = uid(1);
+        let u2 = uid(2);
+
+        // add two
+        wb.apply(vec![
+            Delta { uid: u1, kind: DeltaKind::Applied, raw: obj("a", Some("ns")) },
+            Delta { uid: u2, kind: DeltaKind::Applied, raw: obj("b", None) },
+        ]);
+        assert_eq!(wb.items.len(), 2);
+
+        // update one (rename)
+        let mut o = obj("a2", Some("ns"));
+        o["metadata"]["uid"] = serde_json::Value::String("00000000-0000-0000-0000-000000000001".to_string());
+        wb.apply(vec![Delta { uid: u1, kind: DeltaKind::Applied, raw: o }]);
+        assert_eq!(wb.items.iter().find(|x| x.uid == u1).unwrap().name, "a2");
+
+        // delete one
+        wb.apply(vec![Delta { uid: u2, kind: DeltaKind::Deleted, raw: serde_json::json!({}) }]);
+        assert_eq!(wb.items.len(), 1);
+        assert_eq!(wb.items[0].name, "a2");
+    }
 }

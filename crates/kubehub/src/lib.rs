@@ -111,38 +111,75 @@ pub async fn start_watcher(gvk_key: &str, namespace: Option<&str>, delta_tx: mps
     let gvk = parse_gvk_key(gvk_key)?;
     let (ar, namespaced) = find_api_resource(client.clone(), &gvk).await?;
 
-    let api: Api<DynamicObject> = if namespaced {
-        match namespace {
-            Some(ns) => Api::namespaced_with(client.clone(), ns, &ar),
-            None => Api::all_with(client.clone(), &ar),
-        }
-    } else {
-        Api::all_with(client.clone(), &ar)
-    };
+    // Periodic relist interval (seconds)
+    let relist_secs: u64 = std::env::var("ORKA_RELIST_SECS")
+        .ok()
+        .and_then(|s| s.parse::<u64>().ok())
+        .unwrap_or(300);
 
-    let cfg = watcher::Config::default();
-    let stream = watcher::watcher(api, cfg);
-    futures::pin_mut!(stream);
-    info!(gvk = %gvk_key, ns = ?namespace, "watcher started");
-    while let Some(ev) = stream.try_next().await? {
-        match ev {
-            Event::Applied(o) => {
-                let d = delta_from(&o, DeltaKind::Applied)?;
-                let _ = delta_tx.send(d).await;
+    info!(gvk = %gvk_key, ns = ?namespace, relist_secs, "watcher starting");
+
+    loop {
+        let api: Api<DynamicObject> = if namespaced {
+            match namespace {
+                Some(ns) => Api::namespaced_with(client.clone(), ns, &ar),
+                None => Api::all_with(client.clone(), &ar),
             }
-            Event::Deleted(o) => {
-                let d = delta_from(&o, DeltaKind::Deleted)?;
-                let _ = delta_tx.send(d).await;
-            }
-            Event::Restarted(list) => {
-                debug!(count = list.len(), "watch restart");
-                for o in list.iter() {
-                    let d = delta_from(o, DeltaKind::Applied)?;
-                    let _ = delta_tx.send(d).await;
+        } else {
+            Api::all_with(client.clone(), &ar)
+        };
+
+        let cfg = watcher::Config::default();
+        let stream = watcher::watcher(api, cfg);
+        futures::pin_mut!(stream);
+        let mut relist_timer = tokio::time::sleep(std::time::Duration::from_secs(relist_secs));
+        tokio::pin!(relist_timer);
+        info!("watch stream opened");
+
+        // Read until stream ends or relist timer fires
+        let ended = loop {
+            tokio::select! {
+                maybe_ev = stream.try_next() => {
+                    match maybe_ev? {
+                        Some(Event::Applied(o)) => {
+                            let d = delta_from(&o, DeltaKind::Applied)?;
+                            if delta_tx.send(d).await.is_err() {
+                                info!("delta channel closed; stopping watcher");
+                                return Ok(());
+                            }
+                        }
+                        Some(Event::Deleted(o)) => {
+                            let d = delta_from(&o, DeltaKind::Deleted)?;
+                            if delta_tx.send(d).await.is_err() {
+                                info!("delta channel closed; stopping watcher");
+                                return Ok(());
+                            }
+                        }
+                        Some(Event::Restarted(list)) => {
+                            debug!(count = list.len(), "watch restart");
+                            for o in list.iter() {
+                                let d = delta_from(o, DeltaKind::Applied)?;
+                                if delta_tx.send(d).await.is_err() {
+                                    info!("delta channel closed; stopping watcher");
+                                    return Ok(());
+                                }
+                            }
+                        }
+                        None => break true, // stream ended
+                    }
+                }
+                _ = &mut relist_timer => {
+                    info!("periodic relist interval reached; restarting watch");
+                    break false;
                 }
             }
+        };
+
+        if ended {
+            warn!("watcher stream ended");
+            break;
         }
+        // else: fallthrough and recreate stream (periodic relist)
     }
-    warn!("watcher stream ended");
     Ok(())
 }

@@ -6,6 +6,7 @@ use tracing::{error, info, warn};
 use orka_store::spawn_ingest;
 use tokio::sync::mpsc;
 use std::collections::HashMap;
+use tokio::signal;
 
 #[derive(Parser, Debug)]
 #[command(name = "orkactl", version, about = "Orka CLI (M0)")]
@@ -51,9 +52,24 @@ fn init_tracing() {
     tracing_subscriber::fmt().with_env_filter(filter).with_target(true).init();
 }
 
+fn init_metrics() {
+    if let Ok(addr) = std::env::var("ORKA_METRICS_ADDR") {
+        if let Ok(sock) = addr.parse::<std::net::SocketAddr>() {
+            let builder = metrics_exporter_prometheus::PrometheusBuilder::new();
+            match builder.with_http_listener(sock).install() {
+                Ok(_) => tracing::info!(addr = %addr, "Prometheus metrics exporter listening"),
+                Err(e) => tracing::warn!(error = %e, "failed to install metrics exporter"),
+            }
+        } else {
+            tracing::warn!(addr = %addr, "invalid ORKA_METRICS_ADDR; expected host:port");
+        }
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     init_tracing();
+    init_metrics();
     let cli = Cli::parse();
 
     match cli.command {
@@ -80,11 +96,12 @@ async fn main() -> Result<()> {
             let ns = cli.namespace.as_deref();
             info!(gvk = %gvk, ns = ?ns, "ls invoked");
             let cap = std::env::var("ORKA_QUEUE_CAP").ok().and_then(|s| s.parse::<usize>().ok()).unwrap_or(2048);
-            let (tx, backend) = spawn_ingest(cap);
+            let (ingest_tx, backend) = spawn_ingest(cap);
             // Start watcher
-            tokio::spawn({
+            let watcher_handle = tokio::spawn({
                 let gvk = gvk.clone();
                 let ns = ns.map(|s| s.to_string());
+                let tx = ingest_tx.clone();
                 async move {
                     if let Err(e) = orka_kubehub::start_watcher(&gvk, ns.as_deref(), tx).await {
                         error!(error = ?e, "watcher failed");
@@ -94,16 +111,37 @@ async fn main() -> Result<()> {
 
             // Wait briefly for first snapshot; fallback to empty
             let mut rx = backend.subscribe_epoch();
-            let _ = tokio::time::timeout(std::time::Duration::from_secs(2), rx.changed()).await;
+            let mut timeout = tokio::time::sleep(std::time::Duration::from_secs(2));
+            tokio::pin!(timeout);
+            tokio::select! {
+                _ = rx.changed() => {}
+                _ = &mut timeout => {}
+                _ = signal::ctrl_c() => { info!("Ctrl-C received during ls; finishing up"); }
+            }
             let snap = backend.current();
 
-            // Render table
-            println!("NAMESPACE   NAME                 AGE");
-            for item in snap.items.iter().filter(|o| ns.map(|n| o.namespace.as_deref() == Some(n)).unwrap_or(true)) {
-                let ns_col = item.namespace.clone().unwrap_or_else(|| "-".to_string());
-                let age = render_age(item.creation_ts);
-                println!("{:<11} {:<20} {}", ns_col, item.name, age);
+            match cli.output {
+                Output::Human => {
+                    println!("NAMESPACE   NAME                 AGE");
+                    for item in snap.items.iter().filter(|o| ns.map(|n| o.namespace.as_deref() == Some(n)).unwrap_or(true)) {
+                        let ns_col = item.namespace.clone().unwrap_or_else(|| "-".to_string());
+                        let age = render_age(item.creation_ts);
+                        println!("{:<11} {:<20} {}", ns_col, item.name, age);
+                    }
+                }
+                Output::Json => {
+                    // Filter by namespace if provided
+                    let items: Vec<_> = snap.items
+                        .iter()
+                        .filter(|o| ns.map(|n| o.namespace.as_deref() == Some(n)).unwrap_or(true))
+                        .cloned()
+                        .collect();
+                    println!("{}", serde_json::to_string_pretty(&items)?);
+                }
             }
+            // Graceful shutdown: drop last sender and abort watcher to close ingest and flush
+            drop(ingest_tx);
+            watcher_handle.abort();
         }
         Commands::Watch { gvk } => {
             let ns = cli.namespace.as_deref();
@@ -113,7 +151,7 @@ async fn main() -> Result<()> {
             let (tap_tx, mut tap_rx) = mpsc::channel::<orka_core::Delta>(cap);
 
             // Start watcher writing into our tap
-            tokio::spawn({
+            let watcher_handle = tokio::spawn({
                 let gvk = gvk.clone();
                 let ns = ns.map(|s| s.to_string());
                 let tap_tx = tap_tx.clone();
@@ -126,49 +164,69 @@ async fn main() -> Result<()> {
 
             // Pump deltas into ingest and print lines directly
             let mut seen_rv: HashMap<orka_core::Uid, String> = HashMap::new();
-            while let Some(d) = tap_rx.recv().await {
-                // forward to ingest (best-effort)
-                let _ = ingest_tx.send(d.clone()).await;
+            loop {
+                tokio::select! {
+                    maybe = tap_rx.recv() => {
+                        match maybe {
+                            Some(d) => {
+                                // forward to ingest (best-effort)
+                                let _ = ingest_tx.send(d.clone()).await;
 
-                // filter by ns if provided
-                if let Some(ns_filter) = ns {
-                    if let Some(mns) = d.raw.get("metadata").and_then(|m| m.get("namespace")).and_then(|v| v.as_str()) {
-                        if mns != ns_filter { continue; }
-                    } else {
-                        // cluster-scoped won't match a namespaced filter
-                        continue;
-                    }
-                }
-                let key = json_key(&d.raw);
-                let rv = d
-                    .raw
-                    .get("metadata")
-                    .and_then(|m| m.get("resourceVersion"))
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("")
-                    .to_string();
-                match d.kind {
-                    orka_core::DeltaKind::Applied => {
-                        match seen_rv.get_mut(&d.uid) {
-                            None => {
-                                seen_rv.insert(d.uid, rv);
-                                println!("+ {}", key);
+                                // filter by ns if provided
+                                if let Some(ns_filter) = ns {
+                                    if let Some(mns) = d.raw.get("metadata").and_then(|m| m.get("namespace")).and_then(|v| v.as_str()) {
+                                        if mns != ns_filter { continue; }
+                                    } else {
+                                        // cluster-scoped won't match a namespaced filter
+                                        continue;
+                                    }
+                                }
+                                let key = json_key(&d.raw);
+                                let rv = d
+                                    .raw
+                                    .get("metadata")
+                                    .and_then(|m| m.get("resourceVersion"))
+                                    .and_then(|v| v.as_str())
+                                    .unwrap_or("")
+                                    .to_string();
+                                match d.kind {
+                                    orka_core::DeltaKind::Applied => {
+                                        match seen_rv.get_mut(&d.uid) {
+                                            None => {
+                                                seen_rv.insert(d.uid, rv);
+                                                println!("+ {}", key);
+                                            }
+                                            Some(prev_rv) => {
+                                                if *prev_rv != rv {
+                                                    *prev_rv = rv;
+                                                    println!("+ {}", key);
+                                                } // else duplicate; ignore
+                                            }
+                                        }
+                                    }
+                                    orka_core::DeltaKind::Deleted => {
+                                        let _ = seen_rv.remove(&d.uid);
+                                        println!("- {}", key);
+                                    }
+                                }
                             }
-                            Some(prev_rv) => {
-                                if *prev_rv != rv {
-                                    *prev_rv = rv;
-                                    println!("~ {}", key);
-                                } // else duplicate; ignore
+                            None => {
+                                warn!("tap channel closed; exiting watch loop");
+                                break;
                             }
                         }
                     }
-                    orka_core::DeltaKind::Deleted => {
-                        let _ = seen_rv.remove(&d.uid);
-                        println!("- {}", key);
+                    _ = signal::ctrl_c() => {
+                        info!("Ctrl-C received; shutting down watch loop");
+                        break;
                     }
                 }
             }
-            warn!("watch loop ended (watcher closed)");
+
+            // Graceful shutdown: close ingest and abort watcher to stop kube stream, allowing final snapshot flush
+            drop(ingest_tx);
+            watcher_handle.abort();
+            warn!("watch loop ended (graceful shutdown)");
         }
     }
 

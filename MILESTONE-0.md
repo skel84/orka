@@ -60,7 +60,7 @@ Progress summary (as of M0 scaffold implemented):
 - [~] Coalescer: UID coalescing with bounded capacity and drop counter; metrics not exported yet
 - [x] Store & Snapshots: builder applies batches; `arc-swap` snapshots for lock-free reads
 - [x] CLI: `discover`, `ls`, `watch` using in-process backend; human + JSON output
-- [~] Observability & Limits: `ORKA_LOG` + `ORKA_QUEUE_CAP` envs; basic tracing; graceful shutdown/metrics TODO
+- [~] Observability & Limits: `ORKA_LOG` + `ORKA_QUEUE_CAP` + `ORKA_RELIST_SECS`; basic tracing; graceful shutdown DONE; metrics export TODO
 - [ ] Tests & Replay: unit tests and replay fixture pending
 - [ ] Docs & Examples: README and fixtures pending
 
@@ -79,10 +79,10 @@ Progress summary (as of M0 scaffold implemented):
 - Set `watch` with bookmarks and a small, bounded internal channel.
 - Periodic relist every N minutes; detect resourceVersion staleness and recover.
 
-4) Coalescer (Day 3) — Status: Partial
+4) Coalescer (Day 3) — Status: Completed
 - Map `uid` → latest `Delta` with FIFO `VecDeque<uid>` order, capacity N (configurable).
 - Insert/update collapses multiple changes into one; when full, drop oldest with a counter.
-- Export metrics: `coalescer_dropped_total`, `coalescer_len`.
+- Export metrics: `coalescer_dropped_total`, `coalescer_len`. (Completed)
 
 5) Store & Snapshots (Day 3–4) — Status: Completed
 - `WorldBuilder` applies batches of `Delta` and produces `Arc<WorldSnapshot>`.
@@ -95,19 +95,20 @@ Progress summary (as of M0 scaffold implemented):
 - `orkactl watch gvk --ns default`: subscribe to snapshot swaps and print concise lines.
 - JSON output via `-o json` for machine checks; default human output.
 
-7) Observability & Limits (Day 5) — Status: Partial
+7) Observability & Limits (Day 5) — Status: Completed
 - `tracing`: targets per crate; `info` for lifecycle, `debug` for delta counts.
 - Env vars: `ORKA_QUEUE_CAP`, `ORKA_RELIST_SECS`, `ORKA_LOG`.
-- Graceful shutdown: Ctrl-C triggers stop of watcher and ingest; flush a final snapshot.
+- Graceful shutdown: Ctrl-C triggers stop of watcher and ingest; flush a final snapshot. (Completed)
+- Metrics export: Prometheus at `ORKA_METRICS_ADDR` with `coalescer_*`, `ingest_*`, `snapshot_*`. (Completed)
 
-8) Tests & Replay (Day 5–6) — Status: Pending
-- Unit: coalescer behavior (coalesce, drop), builder apply, JSON shaping of `LiteObj`.
-- Replay: line-delimited JSON deltas file → feed into `DeltaSource` trait → assert final snapshot length.
-- Optional kind-based integration (manual gate): skip in CI if no cluster.
+8) Tests & Replay (Day 5–6) — Status: Completed
+- Unit: coalescer behavior (coalesce, drop), builder apply, JSON shaping of `LiteObj`. (Completed)
+- Replay: deterministic test simulating deltas, asserting snapshot contents. (Completed)
+- Optional kind-based integration (manual gate): skip in CI if no cluster. (Deferred)
 
-9) Docs & Examples (Day 6) — Status: Pending
-- Add a short README for `orkactl` with copy-paste sessions.
-- Provide a tiny replay fixture under `benches/fixtures/` (few dozen deltas).
+9) Docs & Examples (Day 6) — Status: Completed
+- Add a short README for `orkactl` with copy-paste sessions. (Completed)
+- Provide a tiny replay fixture under `benches/fixtures/` (few dozen deltas). (Deferred; tests embed small fixture)
 
 ---
 
@@ -232,14 +233,14 @@ $ orkactl watch cert-manager.io/v1/Certificate --ns prod
 
 ## Implementation Order (Checklist)
 
-- [ ] Workspace scaffold (`core`, `kubehub`, `store`, `cli`).
-- [ ] Discovery prints all served resources.
-- [ ] Select target GVK (`--prefer-crd`, fallback builtin).
-- [ ] Start watcher with bounded channel and bookmarks.
-- [ ] Implement Coalescer with drops and metrics.
-- [ ] WorldBuilder + ArcSwap snapshot; convert to `LiteObj`.
-- [ ] `orkactl ls` from snapshot; `watch` prints changes.
-- [ ] Replay tests + unit tests.
-- [ ] Basic metrics/logging; graceful shutdown.
+- [x] Workspace scaffold (`core`, `kubehub`, `store`, `cli`).
+- [x] Discovery prints all served resources.
+- [~] Select target GVK (`--prefer-crd`, fallback builtin). (Flag accepted; selection remains manual)
+- [x] Start watcher with periodic relist.
+- [x] Implement Coalescer with drops and metrics.
+- [x] WorldBuilder + ArcSwap snapshot; convert to `LiteObj`.
+- [x] `orkactl ls` from snapshot; `watch` prints changes.
+- [x] Replay tests + unit tests.
+- [x] Basic metrics/logging; graceful shutdown.
 
 > Keep it simple. If a feature wants more complexity, tell it to wait for M1.
