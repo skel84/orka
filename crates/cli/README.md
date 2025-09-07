@@ -1,4 +1,4 @@
-# orkactl (Milestone 2)
+# orkactl (Milestone 3)
 
 CLI for Orka’s in-memory backend, with schema discovery for CRDs and a lightweight RAM search index. Commands use an in-process backend and the Kubernetes API via your current kubeconfig.
 
@@ -12,6 +12,7 @@ CLI for Orka’s in-memory backend, with schema discovery for CRDs and a lightwe
 - `orkactl edit -f file.yaml [--ns <ns>] [--dry-run|--apply] [--validate]`: dry-run or apply YAML via SSA
 - `orkactl diff -f file.yaml [--ns <ns>]`: show minimal diffs vs live and last-applied
 - `orkactl last-applied get <gvk> <name> [--ns <ns>] [--limit N] [-o json]`: inspect persisted last-applied snapshots
+- `orkactl stats`: show runtime knobs (env-derived) and metrics endpoint
 
 ## Examples
 
@@ -71,12 +72,20 @@ Free text is fuzzy-matched over `NAMESPACE/NAME` plus projected fields.
 - `ORKA_LOG`: tracing filter (e.g., `info`, `debug`, per-target is supported)
 - `ORKA_QUEUE_CAP`: bounded channel capacity for deltas (default 2048)
 - `ORKA_RELIST_SECS`: periodic relist interval for watchers (default 300)
+- `ORKA_WATCH_BACKOFF_MAX_SECS`: maximum backoff for watch errors (default 30)
+- `ORKA_SHARDS`: number of namespace buckets for ingest/search sharding (default 1)
 - `ORKA_METRICS_ADDR`: if set to `host:port`, exposes Prometheus metrics at `/metrics`
 - `ORKA_SEARCH_LIMIT`: default `--limit` for `search` (overridden by CLI)
 - `ORKA_SEARCH_MAX_CANDIDATES`: cap candidate set size after typed filters
 - `ORKA_SEARCH_MIN_SCORE`: minimum fuzzy score to include a hit
+- `ORKA_MAX_LABELS_PER_OBJ`: cap number of labels captured per object (optional)
+- `ORKA_MAX_ANNOS_PER_OBJ`: cap number of annotations captured per object (optional)
+- `ORKA_MAX_POSTINGS_PER_KEY`: cap postings list size per key to control cardinality (optional)
+- `ORKA_MAX_RSS_MB`: soft cap for in-memory snapshot size (approx); applies staged trimming (drop annotations → labels → projected) when exceeded
+- `ORKA_MAX_INDEX_BYTES`: soft cap for index memory; prunes value postings when exceeded to preserve stability
 - `ORKA_DB_PATH`: path to SQLite DB (default: `~/.orka/orka.db`)
 - `ORKA_ZSTD_LEVEL`: compression level for persisted YAML when built with `zstd` feature (default: 3)
+- `ORKA_DISABLE_APPLY_PREFLIGHT=1`: disable apply freshness guard (preflight GET)
 
 ## Notes
 

@@ -3,7 +3,9 @@ use std::str::FromStr;
 use anyhow::Result;
 use clap::{ArgAction, Parser, Subcommand, ValueEnum};
 use tracing::{error, info, warn};
-use orka_store::spawn_ingest_with_projector;
+use orka_store::spawn_ingest_with_planner;
+use std::sync::Arc;
+use orka_core::ModuloNsPlanner;
 use tokio::sync::mpsc;
 use std::collections::HashMap;
 use tokio::signal;
@@ -97,6 +99,8 @@ enum Commands {
         #[command(subcommand)]
         sub: LastAppliedCmd,
     },
+    /// Show runtime configuration and metrics endpoint
+    Stats {},
 }
 
 #[derive(Subcommand, Debug)]
@@ -179,7 +183,9 @@ async fn main() -> Result<()> {
                 Ok(Some(schema)) => Some(std::sync::Arc::new(schema.projector()) as std::sync::Arc<dyn orka_core::Projector + Send + Sync>),
                 _ => None,
             };
-            let (ingest_tx, backend) = spawn_ingest_with_projector(cap, projector);
+            let shards = std::env::var("ORKA_SHARDS").ok().and_then(|s| s.parse().ok()).unwrap_or(1);
+            let planner = Arc::new(ModuloNsPlanner::new(shards));
+            let (ingest_tx, backend) = spawn_ingest_with_planner(cap, projector, Some(planner));
             // Start watcher
             let watcher_handle = tokio::spawn({
                 let gvk = gvk.clone();
@@ -237,7 +243,9 @@ async fn main() -> Result<()> {
                 Ok(Some(schema)) => Some(std::sync::Arc::new(schema.projector()) as std::sync::Arc<dyn orka_core::Projector + Send + Sync>),
                 _ => None,
             };
-            let (ingest_tx, _backend) = spawn_ingest_with_projector(cap, projector);
+            let shards = std::env::var("ORKA_SHARDS").ok().and_then(|s| s.parse().ok()).unwrap_or(1);
+            let planner = Arc::new(ModuloNsPlanner::new(shards));
+            let (ingest_tx, _backend) = spawn_ingest_with_planner(cap, projector, Some(planner));
             let (tap_tx, mut tap_rx) = mpsc::channel::<orka_core::Delta>(cap);
 
             // Start watcher writing into our tap
@@ -360,7 +368,9 @@ async fn main() -> Result<()> {
                 Ok(Some(schema)) => Some(std::sync::Arc::new(schema.projector()) as std::sync::Arc<dyn orka_core::Projector + Send + Sync>),
                 _ => None,
             };
-            let (ingest_tx, backend) = spawn_ingest_with_projector(cap, projector);
+            let shards = std::env::var("ORKA_SHARDS").ok().and_then(|s| s.parse().ok()).unwrap_or(1);
+            let planner = Arc::new(ModuloNsPlanner::new(shards));
+            let (ingest_tx, backend) = spawn_ingest_with_planner(cap, projector, Some(planner));
             // Start watcher
             let watcher_handle = tokio::spawn({
                 let gvk = gvk.clone();
@@ -516,6 +526,46 @@ async fn main() -> Result<()> {
                         }
                     }
                 }
+            }
+        }
+        Commands::Stats {} => {
+            // Gather config from env
+            #[derive(serde::Serialize)]
+            struct StatsOut {
+                shards: usize,
+                relist_secs: u64,
+                watch_backoff_max_secs: u64,
+                max_labels_per_obj: Option<usize>,
+                max_annos_per_obj: Option<usize>,
+                max_postings_per_key: Option<usize>,
+                max_rss_mb: Option<usize>,
+                max_index_bytes: Option<usize>,
+                metrics_addr: Option<String>,
+            }
+            let shards = std::env::var("ORKA_SHARDS").ok().and_then(|s| s.parse().ok()).unwrap_or(1);
+            let relist_secs = std::env::var("ORKA_RELIST_SECS").ok().and_then(|s| s.parse().ok()).unwrap_or(300);
+            let watch_backoff_max_secs = std::env::var("ORKA_WATCH_BACKOFF_MAX_SECS").ok().and_then(|s| s.parse().ok()).unwrap_or(30);
+            let max_labels_per_obj = std::env::var("ORKA_MAX_LABELS_PER_OBJ").ok().and_then(|s| s.parse().ok());
+            let max_annos_per_obj = std::env::var("ORKA_MAX_ANNOS_PER_OBJ").ok().and_then(|s| s.parse().ok());
+            let max_postings_per_key = std::env::var("ORKA_MAX_POSTINGS_PER_KEY").ok().and_then(|s| s.parse().ok());
+            let max_rss_mb = std::env::var("ORKA_MAX_RSS_MB").ok().and_then(|s| s.parse().ok());
+            let max_index_bytes = std::env::var("ORKA_MAX_INDEX_BYTES").ok().and_then(|s| s.parse().ok());
+            let metrics_addr = std::env::var("ORKA_METRICS_ADDR").ok();
+
+            let out = StatsOut { shards, relist_secs, watch_backoff_max_secs, max_labels_per_obj, max_annos_per_obj, max_postings_per_key, max_rss_mb, max_index_bytes, metrics_addr };
+            match cli.output {
+                Output::Human => {
+                    println!("shards: {}", out.shards);
+                    println!("relist_secs: {}", out.relist_secs);
+                    println!("watch_backoff_max_secs: {}", out.watch_backoff_max_secs);
+                    println!("max_labels_per_obj: {}", out.max_labels_per_obj.map(|v| v.to_string()).unwrap_or_else(|| "(none)".into()));
+                    println!("max_annos_per_obj: {}", out.max_annos_per_obj.map(|v| v.to_string()).unwrap_or_else(|| "(none)".into()));
+                    println!("max_postings_per_key: {}", out.max_postings_per_key.map(|v| v.to_string()).unwrap_or_else(|| "(none)".into()));
+                    println!("max_rss_mb: {}", out.max_rss_mb.map(|v| v.to_string()).unwrap_or_else(|| "(none)".into()));
+                    println!("max_index_bytes: {}", out.max_index_bytes.map(|v| v.to_string()).unwrap_or_else(|| "(none)".into()));
+                    if let Some(addr) = out.metrics_addr { println!("metrics_addr: {} (exposes Prometheus /metrics)", addr); } else { println!("metrics_addr: (not set)"); }
+                }
+                Output::Json => println!("{}", serde_json::to_string_pretty(&out)?),
             }
         }
     }

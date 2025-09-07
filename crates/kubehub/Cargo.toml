@@ -17,3 +17,4 @@ kube = { workspace = true }
 k8s-openapi = { workspace = true }
 futures = { workspace = true }
 uuid = { workspace = true }
+metrics = { workspace = true }

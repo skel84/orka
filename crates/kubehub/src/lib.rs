@@ -5,6 +5,7 @@
 use anyhow::{anyhow, Context, Result};
 use serde::{Deserialize, Serialize};
 use tracing::{debug, info, warn};
+use metrics::{counter, histogram};
 
 use futures::TryStreamExt;
 use kube::{
@@ -116,9 +117,15 @@ pub async fn start_watcher(gvk_key: &str, namespace: Option<&str>, delta_tx: mps
         .ok()
         .and_then(|s| s.parse::<u64>().ok())
         .unwrap_or(300);
+    // Backoff max (seconds) for watch errors
+    let backoff_max: u64 = std::env::var("ORKA_WATCH_BACKOFF_MAX_SECS")
+        .ok()
+        .and_then(|s| s.parse::<u64>().ok())
+        .unwrap_or(30);
 
     info!(gvk = %gvk_key, ns = ?namespace, relist_secs, "watcher starting");
 
+    let mut backoff: u64 = 1;
     loop {
         let api: Api<DynamicObject> = if namespaced {
             match namespace {
@@ -132,30 +139,39 @@ pub async fn start_watcher(gvk_key: &str, namespace: Option<&str>, delta_tx: mps
         let cfg = watcher::Config::default();
         let stream = watcher::watcher(api, cfg);
         futures::pin_mut!(stream);
-        let relist_timer = tokio::time::sleep(std::time::Duration::from_secs(relist_secs));
+        // Jittered relist: ±10%
+        let jitter = ((relist_secs as f64) * 0.1) as i64;
+        let jval = if jitter > 0 {
+            // Fast, dependency-free pseudo-random using time
+            let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().subsec_nanos() as i64;
+            let sign = if (now & 1) == 0 { 1 } else { -1 };
+            (now % (jitter as i64 + 1)) * sign
+        } else { 0 };
+        let relist_actual = (relist_secs as i64 + jval).max(1) as u64;
+        let relist_timer = tokio::time::sleep(std::time::Duration::from_secs(relist_actual));
         tokio::pin!(relist_timer);
-        info!("watch stream opened");
+        info!(relist_actual, "watch stream opened");
 
         // Read until stream ends or relist timer fires
         let ended = loop {
             tokio::select! {
                 maybe_ev = stream.try_next() => {
-                    match maybe_ev? {
-                        Some(Event::Applied(o)) => {
+                    match maybe_ev {
+                        Ok(Some(Event::Applied(o))) => {
                             let d = delta_from(&o, DeltaKind::Applied)?;
                             if delta_tx.send(d).await.is_err() {
                                 info!("delta channel closed; stopping watcher");
                                 return Ok(());
                             }
                         }
-                        Some(Event::Deleted(o)) => {
+                        Ok(Some(Event::Deleted(o))) => {
                             let d = delta_from(&o, DeltaKind::Deleted)?;
                             if delta_tx.send(d).await.is_err() {
                                 info!("delta channel closed; stopping watcher");
                                 return Ok(());
                             }
                         }
-                        Some(Event::Restarted(list)) => {
+                        Ok(Some(Event::Restarted(list))) => {
                             debug!(count = list.len(), "watch restart");
                             for o in list.iter() {
                                 let d = delta_from(o, DeltaKind::Applied)?;
@@ -165,11 +181,32 @@ pub async fn start_watcher(gvk_key: &str, namespace: Option<&str>, delta_tx: mps
                                 }
                             }
                         }
-                        None => break true, // stream ended
+                        Ok(None) => break true, // stream ended
+                        Err(e) => {
+                            // Detect HTTP 410 Gone (Expired RV) and recover via full relist before restart.
+                            let es = e.to_string();
+                            if es.contains("410") || es.to_ascii_lowercase().contains("expired") {
+                                warn!(error = %es, "watch stream expired (410); performing full relist to recover");
+                                counter!("watch_errors_total", 1u64);
+                                // Attempt a full relist to repair drift
+                                if let Err(pe) = crate::prime_list(gvk_key, namespace, &delta_tx).await {
+                                    warn!(error = %pe, "relist after 410 failed");
+                                } else {
+                                    counter!("relist_total", 1u64);
+                                }
+                                // After relist, break to restart watcher without extra delay
+                                break true;
+                            } else {
+                                warn!(error = %e, "watch stream error; will backoff and restart");
+                                counter!("watch_errors_total", 1u64);
+                                break true;
+                            }
+                        }
                     }
                 }
                 _ = &mut relist_timer => {
                     info!("periodic relist interval reached; restarting watch");
+                    counter!("relist_total", 1u64);
                     break false;
                 }
             }
@@ -177,9 +214,17 @@ pub async fn start_watcher(gvk_key: &str, namespace: Option<&str>, delta_tx: mps
 
         if ended {
             warn!("watcher stream ended");
-            break;
+            // Backoff before restart
+            let dur = std::time::Duration::from_secs(backoff.min(backoff_max));
+            histogram!("watch_backoff_ms", dur.as_millis() as f64);
+            tokio::time::sleep(dur).await;
+            backoff = (backoff * 2).min(backoff_max).max(1);
+            counter!("watch_restarts_total", 1u64);
+            continue;
         }
         // else: fallthrough and recreate stream (periodic relist)
+        backoff = 1;
+        counter!("watch_restarts_total", 1u64);
     }
     Ok(())
 }

@@ -78,6 +78,27 @@ pub async fn edit_from_yaml(
         }
     }
 
+    // Optional preflight freshness guard: if live resourceVersion changed since we computed the diff, abort.
+    // Enabled by default; set ORKA_DISABLE_APPLY_PREFLIGHT=1 to skip this guard.
+    if std::env::var("ORKA_DISABLE_APPLY_PREFLIGHT").is_err() {
+        if let Some(prev_live) = &live_json {
+            let prev_rv = prev_live
+                .get("metadata").and_then(|m| m.get("resourceVersion")).and_then(|v| v.as_str()).map(|s| s.to_string());
+            if let Some(prev_rv) = prev_rv {
+                if let Some(obj2) = api.get_opt(&name).await? {
+                    let cur_rv = obj2.metadata.resource_version.clone().unwrap_or_default();
+                    if !cur_rv.is_empty() && cur_rv != prev_rv {
+                        metrics::counter!("apply_stale_blocked_total", 1u64);
+                        return Err(anyhow!(
+                            "live object changed (rv {} -> {}) during apply; re-run diff/dry-run and try again",
+                            prev_rv, cur_rv
+                        ));
+                    }
+                }
+            }
+        }
+    }
+
     // Real apply (SSA)
     let pp = PatchParams::apply("orka");
     let obj = match api.patch(&name, &pp, &Patch::Apply(&json)).await {

@@ -1,0 +1,4534 @@
+This file is a merged representation of the entire codebase, combined into a single document by Repomix.
+
+<file_summary>
+This section contains a summary of this file.
+
+<purpose>
+This file contains a packed representation of the entire repository's contents.
+It is designed to be easily consumable by AI systems for analysis, code review,
+or other automated processes.
+</purpose>
+
+<file_format>
+The content is organized as follows:
+1. This summary section
+2. Repository information
+3. Directory structure
+4. Repository files (if enabled)
+5. Multiple file entries, each consisting of:
+  - File path as an attribute
+  - Full contents of the file
+</file_format>
+
+<usage_guidelines>
+- This file should be treated as read-only. Any changes should be made to the
+  original repository files, not this packed version.
+- When processing this file, use the file path to distinguish
+  between different files in the repository.
+- Be aware that this file may contain sensitive information. Handle it with
+  the same level of security as you would the original repository.
+</usage_guidelines>
+
+<notes>
+- Some files may have been excluded based on .gitignore rules and Repomix's configuration
+- Binary files are not included in this packed representation. Please refer to the Repository Structure section for a complete list of file paths, including binary files
+- Files matching patterns in .gitignore are excluded
+- Files matching default ignore patterns are excluded
+- Files are sorted by Git change count (files with more changes are at the bottom)
+</notes>
+
+</file_summary>
+
+<directory_structure>
+crates/
+  apply/
+    src/
+      lib.rs
+    Cargo.toml
+  cli/
+    src/
+      main.rs
+    Cargo.toml
+    README.md
+  core/
+    src/
+      lib.rs
+    Cargo.toml
+  kubehub/
+    src/
+      lib.rs
+    Cargo.toml
+  persist/
+    src/
+      lib.rs
+    Cargo.toml
+  schema/
+    src/
+      lib.rs
+    Cargo.toml
+  search/
+    examples/
+      bench.rs
+    src/
+      lib.rs
+    tests/
+      replay.rs
+    Cargo.toml
+  store/
+    src/
+      lib.rs
+    tests/
+      replay.rs
+    Cargo.toml
+examples/
+  configmap.yaml
+.gitignore
+Cargo.toml
+MILESTONE-0.md
+MILESTONE-1.md
+MILESTONE-2.md
+MILESTONE-3.md
+plan.md
+</directory_structure>
+
+<files>
+This section contains the contents of the repository's files.
+
+<file path="MILESTONE-3.md">
+# Orka — Milestone 3 (Scale & Hardening)
+
+Status: In Progress — initial sharding, watcher jitter/backoff, caps, and preflight shipped
+
+> Goal: turn the feature‑complete core (M0–M2) into a predictable, bounded, and resilient engine that behaves under real cluster churn and size. Make ingest/search stable at scale, keep memory under control, and prove determinism via replay and real integrations.
+
+---
+
+## Scope (M3)
+
+- Sharding: partition ingest/store/search by GVK and namespace to reduce hotspots and enable parallelism.
+- Watch robustness: periodic relist with jitter, watch gap detection/recovery, clear backoff and resubscribe behavior.
+- Memory caps: enforce hard/soft limits; drop non‑essential payloads (`raw_ptr`) first; cap index postings and label cardinality.
+- Determinism: extend replay tests to multi‑GVK, multi‑namespace streams; assert stable snapshots and search results.
+- Real‑world integration: run against kind with popular operators to surface schema/validator quirks.
+- Observability: richer metrics for ingest lag, shard costs, snapshot sizes, memory pressure, restart counters.
+- Safety guardrails for apply: refuse mutation when snapshot is stale beyond a threshold; preflight GET for diffs when needed.
+
+Non‑goals (M3): new user features, RPC surface changes, UI work.
+
+Success = steady p99 latency and bounded memory on large and noisy clusters; no silent divergence after watch errors; reproducible behavior from recorded streams.
+
+---
+
+## Architecture Slice
+
+```
+            +── list/watch (per GVK) ──► Coalescer ──►
+ kube API ──┤                                     ┌────────────┐
+            +── list/watch (per GVK) ──► Coalescer ├─► Shard #1 │
+                                                ...│  Builder  │─► ArcSwap<WorldSnapshot>
+            +── list/watch (per GVK) ──► Coalescer ├─► Shard #N │
+                                                   └────────────┘
+                 ▲                 ▲                 ▲
+                 │                 │                 │
+             Periodic            Gap det.         Memory mgr
+              relist             & resume         (caps & drops)
+```
+
+Rules:
+
+- Shard by `(GVK, namespace)` (configurable: modulo buckets or actual namespaces); one coalescer and builder per shard.
+- Periodic relist for each watcher with jitter; detect `RV_TOO_OLD` and recover without lying.
+- Memory manager enforces caps; first drops `raw_ptr`, then trims postings; never panics on pressure.
+
+---
+
+## Workspace Additions (M3)
+
+- `crates/store`: shard‑aware ingest (namespace buckets via `ORKA_SHARDS`), merged snapshots, per‑object caps for labels/annos, snapshot size gauge.
+- `crates/kubehub`: periodic relist with jitter, bounded backoff + restarts metric for watch errors.
+- `crates/search`: postings caps per key and index size gauges (single‑shard for now).
+- `crates/apply`: freshness guard before SSA with optional preflight GET.
+- `crates/cli`: `stats` command to print runtime knobs and metrics endpoint.
+- `crates/persist` (optional): track audit/events for apply with diff summary (reuse table), not required for M3.
+
+---
+
+## Detailed Tasks
+
+1) Sharding
+- Introduce `ShardKey { gvk_id: u32, ns_bucket: u16 }` and a pluggable `ShardPlanner` (exact namespace or modulo N).
+- Coalescer per shard with capacity and drop counters; merge deltas into shard builders.
+- Compose `WorldSnapshot` from shard snapshots; keep `epoch` monotonic and shard contributions versioned.
+
+2) Watch Robustness
+- Add periodic relist per watcher with jitter (±10%) and configurable period.
+- Detect resourceVersion staleness (`Expired`, HTTP 410); recover via full relist and resume.
+- Backoff strategy (bounded exponential with jitter); metrics for restarts and backoff duration.
+
+3) Memory Caps & Pressure Handling
+- Add gauges: `snapshot_bytes`, `index_bytes`, `raw_bytes`, `docs_total`, `labels_cardinality`.
+- Drop policy: prefer dropping `raw_ptr` after TTL; cap postings per key; limit projected fields per doc if necessary.
+- Config: `ORKA_MAX_RSS_MB`, `ORKA_MAX_RAW_BYTES`, `ORKA_MAX_INDEX_BYTES`, `ORKA_SHARDS`, `ORKA_DROP_RAW_TTL_SECS`.
+
+4) Deterministic Replay
+- Extend fixtures to multi‑GVK/namespace streams; include out‑of‑order and bursty sequences.
+- Assert identical `WorldSnapshot` content and `search` top‑k for fixed seeds across runs.
+
+5) Real‑world Integration (kind)
+- Install selected operators: cert‑manager, prometheus‑operator, flux‑cd (minimum set). - DONE
+- Run discover → list/watch → search; validate validator behavior and projection stability.
+- Gate as manual or nightly (skipped in CI by default).
+
+6) Observability
+- Metrics: `watch_restarts_total`, `relist_total`, `ingest_lag_ms`, `coalescer_dropped_total{shard}`, `shard_build_ms`, `snapshot_swap_ms`, `snapshot_bytes`, `index_bytes`, `apply_stale_blocked_total`.
+- Logging: structured reasons on restarts; pressure events at `warn` with current caps and actions.
+
+7) Apply Freshness Guard
+- Before SSA, if snapshot age > `ORKA_MAX_SNAPSHOT_AGE_SECS` or object missing, do a preflight GET for diff source.
+- Abort with a friendly error when freshness cannot be established; suggest `--dry-run`.
+
+---
+
+## CLI Specs (M3)
+
+- `orkactl stats` — prints runtime knobs and metrics endpoint (human or `-o json`).
+
+Example:
+
+```
+$ orkactl stats
+shards: 4
+relist_secs: 300
+watch_backoff_max_secs: 30
+max_labels_per_obj: (none)
+max_annos_per_obj: 16
+max_postings_per_key: 5000
+metrics_addr: 127.0.0.1:9898 (exposes Prometheus /metrics)
+```
+
+---
+
+## Performance Targets (M3)
+
+- Snapshot build/swap: ≤ 12 ms p99 under steady ingest at 100k docs across shards.
+- Search: ≤ 10 ms p99 at 100k docs with `limit=50` (unchanged from M1).
+- Memory: default cap ≤ 800 MB RSS on large clusters; dropping `raw_ptr` keeps latency stable.
+- Watch robustness: auto‑recovery from `Expired` with full relist completes < 30 s for 50k objs; no stale snapshot served as “fresh”.
+
+---
+
+## Risks & Mitigations
+
+- Too many shards → overhead: start with modulo buckets; tune via `ORKA_SHARDS`; expose shard metrics.
+- Frequent relists overload API: jittered schedule and backoff; only one in flight per watcher.
+- Cardinality explosions (labels/annos) → cap postings per key and fall back to text search.
+- Memory caps hurting UX → prioritize droppable payloads (`raw_ptr`) and keep projected fields intact; clearly log pressure actions.
+
+---
+
+## Definition of Done (M3)
+
+- Under a recorded 100k‑doc replay, snapshot p99 ≤ 12 ms; search p99 ≤ 10 ms; memory ≤ configured cap with graceful drops.
+- Watchers survive `Expired` and network blips without lying; periodic relist repairs drift.
+- Replay tests deterministic across runs; integration on kind executes end‑to‑end.
+- Apply respects freshness guard; stale snapshots do not lead to blind mutations.
+- Metrics surface shard costs, drops, restarts, and memory usage; optional `stats` shows a concise summary.
+
+---
+
+## Implementation Order (Checklist)
+
+- [x] Route coalesced deltas per shard (namespace buckets via `ORKA_SHARDS`).
+- [x] Implement shard builders; compose global `WorldSnapshot` with monotonic epoch.
+- [~] Wire periodic relist with jitter; restart on errors with bounded backoff (gap detection specific to HTTP 410 pending).
+- [~] Add memory and index gauges + caps (labels/annos per object, postings per key); document knobs.
+- [ ] Extend search to shard‑local indexes; enforce limits with stable ranking across shards.
+- [ ] Expand replay fixtures; add deterministic multi‑GVK tests.
+- [x] Add apply freshness guard with optional preflight GET.
+- [x] Add metrics for restarts, relists, snapshot/index bytes.
+- [x] Implement `orkactl stats` for quick operator view.
+- [ ] Update docs: operations guide (caps, relist), env vars, integration notes.
+
+---
+
+### Env & Metrics
+
+Env knobs (current):
+
+- `ORKA_SHARDS` (default: 1)
+- `ORKA_RELIST_SECS` (default: 300)
+- `ORKA_WATCH_BACKOFF_MAX_SECS` (default: 30)
+- `ORKA_MAX_LABELS_PER_OBJ` (optional)
+- `ORKA_MAX_ANNOS_PER_OBJ` (optional)
+- `ORKA_MAX_POSTINGS_PER_KEY` (optional)
+- `ORKA_METRICS_ADDR` (optional `host:port` for Prometheus `/metrics`)
+- `ORKA_DISABLE_APPLY_PREFLIGHT=1` to skip apply freshness guard
+
+Metrics (current):
+
+- Watch: `watch_restarts_total`, `watch_backoff_ms`, `relist_total`
+- Ingest: `ingest_batch_size`, `ingest_epoch`, `snapshot_items`, `snapshot_bytes`
+- Search: `index_docs`, `index_bytes`, `index_postings_truncated_keys`
+- Apply: `apply_stale_blocked_total`
+
+### Progress Notes
+
+- Sharded ingest with namespace buckets; merged snapshot maintained.
+- Watcher relist jitter and bounded backoff implemented; restart counters in place.
+- Per‑object caps for labels/annos; postings caps in search; gauges for snapshot/index sizes.
+- Apply preflight freshness guard implemented; opt‑out via env.
+- `orkactl stats` added for quick operator view of runtime knobs.
+</file>
+
+<file path="crates/apply/src/lib.rs">
+//! Orka apply (Milestone 2): dry-run and SSA helpers + minimal diffs.
+
+#![forbid(unsafe_code)]
+
+use anyhow::{anyhow, Context, Result};
+use kube::{api::{Api, Patch, PatchParams}, core::{DynamicObject, GroupVersionKind}, discovery::{Discovery, Scope}, Client};
+use metrics::{counter, histogram};
+use serde::{Deserialize, Serialize};
+use serde_json::Value as Json;
+use tracing::warn;
+use orka_persist::Store;
+use uuid::Uuid;
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct DiffSummary { pub adds: usize, pub updates: usize, pub removes: usize }
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ApplyResult {
+    pub dry_run: bool,
+    pub applied: bool,
+    pub new_rv: Option<String>,
+    pub warnings: Vec<String>,
+    pub summary: DiffSummary,
+}
+
+pub async fn edit_from_yaml(
+    yaml: &str,
+    ns_override: Option<&str>,
+    validate: bool,
+    do_apply: bool,
+) -> Result<ApplyResult> {
+    let t0 = std::time::Instant::now();
+    counter!("apply_attempts", 1u64);
+    let (json, gvk, name, ns) = parse_yaml_for_target(yaml, ns_override)?;
+
+    if validate {
+        // M2: validation optional and only for CRDs; keep soft-fail with messages routed to CLI if needed.
+        // We do not wire jsonschema here to avoid heavy deps in this crate. CLI will call into orka_schema feature if enabled.
+    }
+
+    let client = Client::try_default().await?;
+    let (ar, namespaced) = find_api_resource(client.clone(), &gvk).await?;
+    let api: Api<DynamicObject> = if namespaced {
+        match ns.as_deref() {
+            Some(n) => Api::namespaced_with(client.clone(), n, &ar),
+            None => return Err(anyhow!("namespace required for namespaced kind")),
+        }
+    } else {
+        Api::all_with(client.clone(), &ar)
+    };
+
+    // Load live to compute diff summary
+    let live_json = match api.get_opt(&name).await? {
+        Some(obj) => Some(strip_noisy(serde_json::to_value(&obj)?)),
+        None => None,
+    };
+    let tgt_json = {
+        let mut v = strip_noisy(json.clone());
+        ensure_metadata(&mut v, &name, ns.as_deref());
+        v
+    };
+    let summary = diff_summary(&tgt_json, &live_json.clone().unwrap_or(Json::Null));
+
+    if !do_apply {
+        // Dry-run: ask server to validate the SSA patch but don't persist
+        let pp = PatchParams::apply("orka").dry_run();
+        let res = api.patch(&name, &pp, &Patch::Apply(&json)).await;
+        match res {
+            Ok(_) => {
+                histogram!("apply_latency_ms", t0.elapsed().as_secs_f64() * 1000.0);
+                counter!("apply_dry_ok", 1u64);
+                return Ok(ApplyResult { dry_run: true, applied: false, new_rv: None, warnings: vec![], summary });
+            }
+            Err(e) => {
+                counter!("apply_err", 1u64);
+                return Err(anyhow!("dry-run failed: {}", e));
+            }
+        }
+    }
+
+    // Optional preflight freshness guard: if live resourceVersion changed since we computed the diff, abort.
+    // Enabled by default; set ORKA_DISABLE_APPLY_PREFLIGHT=1 to skip this guard.
+    if std::env::var("ORKA_DISABLE_APPLY_PREFLIGHT").is_err() {
+        if let Some(prev_live) = &live_json {
+            let prev_rv = prev_live
+                .get("metadata").and_then(|m| m.get("resourceVersion")).and_then(|v| v.as_str()).map(|s| s.to_string());
+            if let Some(prev_rv) = prev_rv {
+                if let Some(obj2) = api.get_opt(&name).await? {
+                    let cur_rv = obj2.metadata.resource_version.clone().unwrap_or_default();
+                    if !cur_rv.is_empty() && cur_rv != prev_rv {
+                        metrics::counter!("apply_stale_blocked_total", 1u64);
+                        return Err(anyhow!(
+                            "live object changed (rv {} -> {}) during apply; re-run diff/dry-run and try again",
+                            prev_rv, cur_rv
+                        ));
+                    }
+                }
+            }
+        }
+    }
+
+    // Real apply (SSA)
+    let pp = PatchParams::apply("orka");
+    let obj = match api.patch(&name, &pp, &Patch::Apply(&json)).await {
+        Ok(o) => o,
+        Err(e) => { counter!("apply_err", 1u64); return Err(anyhow!("server-side apply failed: {}", e)); }
+    };
+    let new_rv = obj.metadata.resource_version.clone();
+    histogram!("apply_latency_ms", t0.elapsed().as_secs_f64() * 1000.0);
+    counter!("apply_ok", 1u64);
+
+    // Persist last-applied YAML snapshot (zstd if enabled)
+    let uid = obj.metadata.uid.as_deref().ok_or_else(|| anyhow!("applied object missing metadata.uid"))?;
+    let uid_bin = parse_uid(uid)?;
+    let rv = new_rv.clone().unwrap_or_default();
+    let la = orka_persist::LastApplied { uid: uid_bin, rv, ts: orka_persist::now_ts(), yaml_zstd: orka_persist::maybe_compress(yaml) };
+    match orka_persist::SqliteStore::open_default() {
+        Ok(store) => { let _ = store.put_last(la); }
+        Err(e) => warn!(error = %e, "persist open failed; skipping last-applied save"),
+    }
+
+    Ok(ApplyResult { dry_run: false, applied: true, new_rv, warnings: vec![], summary })
+}
+
+pub async fn diff_from_yaml(yaml: &str, ns_override: Option<&str>) -> Result<(DiffSummary, Option<DiffSummary>)> {
+    let (json, gvk, name, ns) = parse_yaml_for_target(yaml, ns_override)?;
+    let client = Client::try_default().await?;
+    let (ar, namespaced) = find_api_resource(client.clone(), &gvk).await?;
+    let api: Api<DynamicObject> = if namespaced {
+        match ns.as_deref() {
+            Some(n) => Api::namespaced_with(client.clone(), n, &ar),
+            None => return Err(anyhow!("namespace required for namespaced kind")),
+        }
+    } else {
+        Api::all_with(client.clone(), &ar)
+    };
+    let live_json = match api.get_opt(&name).await? {
+        Some(obj) => Some(strip_noisy(serde_json::to_value(&obj)?)),
+        None => None,
+    };
+    let tgt_json = {
+        let mut v = strip_noisy(json.clone());
+        ensure_metadata(&mut v, &name, ns.as_deref());
+        v
+    };
+    let live_summary = diff_summary(&tgt_json, &live_json.clone().unwrap_or(Json::Null));
+
+    // Diff against last-applied if present
+    let last_summary = if let Some(uid_str) = live_json.as_ref().and_then(|v| v.get("metadata")).and_then(|m| m.get("uid")).and_then(|s| s.as_str()) {
+        if let Ok(store) = orka_persist::SqliteStore::open_default() {
+            if let Ok(rows) = store.get_last(parse_uid(uid_str)?, Some(1)) {
+                if let Some(top) = rows.get(0) {
+                    let prev_yaml = orka_persist::maybe_decompress(&top.yaml_zstd);
+                    if let Ok(prev_val_yaml) = serde_yaml::from_str::<serde_yaml::Value>(&prev_yaml) {
+                        let prev_json = serde_json::to_value(prev_val_yaml).unwrap_or(Json::Null);
+                        let prev = strip_noisy(prev_json);
+                        let sum = diff_summary(&tgt_json, &prev);
+                        Some(sum)
+                    } else { None }
+                } else { None }
+            } else { None }
+        } else { None }
+    } else { None };
+
+    Ok((live_summary, last_summary))
+}
+
+fn parse_yaml_for_target(yaml: &str, ns_override: Option<&str>) -> Result<(Json, GroupVersionKind, String, Option<String>)> {
+    let val: serde_yaml::Value = serde_yaml::from_str(yaml).context("parsing YAML")?;
+    let json = serde_json::to_value(val).context("converting YAML to JSON")?;
+    let api_version_s = json.get("apiVersion").and_then(|v| v.as_str()).ok_or_else(|| anyhow!("YAML missing apiVersion"))?.to_string();
+    let kind_s = json.get("kind").and_then(|v| v.as_str()).ok_or_else(|| anyhow!("YAML missing kind"))?.to_string();
+    let (group, version) = if let Some((g, v)) = api_version_s.split_once('/') { (g.to_string(), v.to_string()) } else { (String::new(), api_version_s) };
+    let name = json.get("metadata").and_then(|m| m.get("name")).and_then(|v| v.as_str()).ok_or_else(|| anyhow!("YAML missing metadata.name"))?.to_string();
+    let ns = ns_override.map(|s| s.to_string()).or_else(|| json.get("metadata").and_then(|m| m.get("namespace")).and_then(|v| v.as_str()).map(|s| s.to_string()));
+    Ok((json, GroupVersionKind { group, version, kind: kind_s }, name, ns))
+}
+
+async fn find_api_resource(client: Client, gvk: &GroupVersionKind) -> Result<(kube::core::ApiResource, bool)> {
+    let discovery = Discovery::new(client).run().await?;
+    for group in discovery.groups() {
+        for (ar, caps) in group.recommended_resources() {
+            if ar.group == gvk.group && ar.version == gvk.version && ar.kind == gvk.kind {
+                let namespaced = matches!(caps.scope, Scope::Namespaced);
+                return Ok((ar.clone(), namespaced));
+            }
+        }
+    }
+    Err(anyhow!("GVK not found: {}/{}/{}", gvk.group, gvk.version, gvk.kind))
+}
+
+fn strip_noisy(mut v: Json) -> Json {
+    if let Some(meta) = v.get_mut("metadata") {
+        if let Some(obj) = meta.as_object_mut() {
+            obj.remove("managedFields");
+            obj.remove("resourceVersion");
+            obj.remove("generation");
+            obj.remove("creationTimestamp");
+        }
+    }
+    // Status is server-populated; ignore it during diffs
+    if let Some(obj) = v.as_object_mut() { obj.remove("status"); }
+    v
+}
+
+fn ensure_metadata(v: &mut Json, name: &str, ns: Option<&str>) {
+    let meta = v.as_object_mut().unwrap().entry("metadata").or_insert(Json::Object(serde_json::Map::new()));
+    if let Some(obj) = meta.as_object_mut() {
+        obj.insert("name".into(), Json::String(name.to_string()));
+        if let Some(ns) = ns { obj.insert("namespace".into(), Json::String(ns.to_string())); }
+    }
+}
+
+pub fn diff_summary(target: &Json, base: &Json) -> DiffSummary {
+    fn walk(a: &Json, b: &Json, adds: &mut usize, ups: &mut usize, rems: &mut usize) {
+        use serde_json::Value as V;
+        match (a, b) {
+            (V::Object(ao), V::Object(bo)) => {
+                for (k, av) in ao.iter() {
+                    if let Some(bv) = bo.get(k) {
+                        if av == bv { continue; }
+                        walk(av, bv, adds, ups, rems);
+                    } else {
+                        *adds += 1;
+                    }
+                }
+                for (k, _bv) in bo.iter() {
+                    if !ao.contains_key(k) { *rems += 1; }
+                }
+            }
+            (V::Array(aa), V::Array(bb)) => {
+                let min_len = aa.len().min(bb.len());
+                for i in 0..min_len { if aa[i] != bb[i] { *ups += 1; } }
+                if aa.len() > bb.len() { *adds += aa.len() - bb.len(); }
+                if bb.len() > aa.len() { *rems += bb.len() - aa.len(); }
+            }
+            // Scalars differ or type differs
+            (av, bv) => { if av != bv { *ups += 1; } }
+        }
+    }
+    let mut adds = 0usize; let mut ups = 0usize; let mut rems = 0usize;
+    walk(target, base, &mut adds, &mut ups, &mut rems);
+    DiffSummary { adds, updates: ups, removes: rems }
+}
+
+fn parse_uid(uid_str: &str) -> Result<[u8; 16]> {
+    let u = Uuid::parse_str(uid_str).context("parsing metadata.uid as uuid")?;
+    Ok(*u.as_bytes())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn strip_noisy_prunes_common_fields() {
+        let v = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "ConfigMap",
+            "metadata": {
+                "name": "x",
+                "namespace": "ns",
+                "managedFields": [ {"foo": "bar"} ],
+                "resourceVersion": "123",
+                "generation": 5,
+                "creationTimestamp": "2020-01-01T00:00:00Z"
+            },
+            "status": { "obs": true },
+            "data": { "k": "v" }
+        });
+        let pruned = strip_noisy(v);
+        let meta = pruned.get("metadata").unwrap().as_object().unwrap();
+        assert!(!meta.contains_key("managedFields"));
+        assert!(!meta.contains_key("resourceVersion"));
+        assert!(!meta.contains_key("generation"));
+        assert!(!meta.contains_key("creationTimestamp"));
+        assert!(!pruned.as_object().unwrap().contains_key("status"));
+    }
+
+    #[test]
+    fn diff_summary_counts_adds_updates_removes() {
+        let base = serde_json::json!({
+            "a": 1,
+            "b": { "x": 1 },
+            "c": [1, 2, 3]
+        });
+        let target = serde_json::json!({
+            "a": 2,                // scalar update
+            "b": { "x": 1, "y": 2 }, // object add
+            "c": [1, 9],           // array element update + removals
+            "d": true              // key add
+        });
+        let s = diff_summary(&target, &base);
+        // adds: b.y, d, and array shrink by 1 element => 2 adds? array shrink is removes, not adds.
+        // target has shorter array than base -> removes count 1; array index 1 changed -> updates 1
+        // scalar a changed -> updates += 1
+        // new key d -> adds += 1; new key b.y -> adds += 1
+        assert_eq!(s.adds, 2);
+        assert_eq!(s.updates, 2);
+        assert_eq!(s.removes, 1);
+    }
+
+    #[test]
+    fn parse_yaml_errors_are_friendly() {
+        // missing apiVersion
+        let y1 = "kind: Foo\nmetadata:\n  name: x\n";
+        let e1 = parse_yaml_for_target(y1, None).unwrap_err().to_string();
+        assert!(e1.contains("missing apiVersion"), "e1={}", e1);
+
+        // missing kind
+        let y2 = "apiVersion: v1\nmetadata:\n  name: x\n";
+        let e2 = parse_yaml_for_target(y2, None).unwrap_err().to_string();
+        assert!(e2.contains("missing kind"), "e2={}", e2);
+
+        // missing metadata.name
+        let y3 = "apiVersion: v1\nkind: ConfigMap\nmetadata: {}\n";
+        let e3 = parse_yaml_for_target(y3, None).unwrap_err().to_string();
+        assert!(e3.contains("missing metadata.name"), "e3={}", e3);
+    }
+}
+</file>
+
+<file path="crates/apply/Cargo.toml">
+[package]
+name = "orka-apply"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+anyhow = { workspace = true }
+serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true }
+serde_yaml = "0.9"
+tracing = { workspace = true }
+metrics = { workspace = true }
+kube = { workspace = true }
+k8s-openapi = { workspace = true }
+uuid = { workspace = true }
+orka-persist = { path = "../persist" }
+time = "0.3"
+</file>
+
+<file path="crates/kubehub/Cargo.toml">
+[package]
+name = "orka-kubehub"
+version = "0.0.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+description = "Orka kube integration (Milestone 0)"
+
+[dependencies]
+orka-core = { path = "../core" }
+anyhow = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tokio = { workspace = true }
+kube = { workspace = true }
+k8s-openapi = { workspace = true }
+futures = { workspace = true }
+uuid = { workspace = true }
+</file>
+
+<file path="crates/persist/src/lib.rs">
+//! Orka persistence (Milestone 2): minimal SQLite store for last-applied.
+//! Keep code tiny and predictable.
+
+#![forbid(unsafe_code)]
+
+use anyhow::{Context, Result};
+use metrics::{counter, histogram};
+use serde::{Deserialize, Serialize};
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LastApplied {
+    pub uid: [u8; 16],
+    pub rv: String,
+    pub ts: i64,
+    pub yaml_zstd: Vec<u8>,
+}
+
+pub trait Store {
+    fn put_last(&self, la: LastApplied) -> Result<()>;
+    fn get_last(&self, uid: [u8; 16], limit: Option<usize>) -> Result<Vec<LastApplied>>;
+}
+
+/// SQLite-backed store. Simple, synchronous. The CLI isn’t latency sensitive here.
+pub struct SqliteStore {
+    db: std::sync::Mutex<rusqlite::Connection>,
+}
+
+impl SqliteStore {
+    pub fn open_default() -> Result<Self> {
+        let path = std::env::var("ORKA_DB_PATH").unwrap_or_else(|_| default_db_path());
+        Self::open(&path)
+    }
+
+    pub fn open(path: &str) -> Result<Self> {
+        let started = std::time::Instant::now();
+        let db = rusqlite::Connection::open(path).with_context(|| format!("opening sqlite db at {}", path))?;
+        db.pragma_update(None, "journal_mode", &"WAL").ok();
+        db.pragma_update(None, "synchronous", &"NORMAL").ok();
+        db.execute(
+            "CREATE TABLE IF NOT EXISTS last_applied (
+                uid  BLOB NOT NULL,
+                rv   TEXT NOT NULL,
+                ts   INTEGER NOT NULL,
+                yaml BLOB NOT NULL
+            )",
+            [],
+        ).context("creating last_applied table")?;
+        db.execute(
+            "CREATE INDEX IF NOT EXISTS idx_last_applied_uid_ts ON last_applied(uid, ts DESC)",
+            [],
+        ).ok();
+        let me = Self { db: std::sync::Mutex::new(db) };
+        histogram!("persist_open_ms", started.elapsed().as_secs_f64() * 1000.0);
+        Ok(me)
+    }
+}
+
+impl Store for SqliteStore {
+    fn put_last(&self, la: LastApplied) -> Result<()> {
+        let started = std::time::Instant::now();
+        let mut db = self.db.lock().unwrap();
+        let tx = db.transaction()?;
+        tx.execute(
+            "INSERT INTO last_applied(uid, rv, ts, yaml) VALUES (?1, ?2, ?3, ?4)",
+            (
+                &la.uid[..],
+                &la.rv,
+                la.ts,
+                &la.yaml_zstd,
+            ),
+        )?;
+        // Keep latest 3 by ts per uid (delete older rows by rowid)
+        tx.execute(
+            "DELETE FROM last_applied
+             WHERE uid = ?1
+               AND rowid NOT IN (
+                   SELECT rowid FROM last_applied WHERE uid = ?1 ORDER BY ts DESC, rowid DESC LIMIT 3
+               )",
+            [&la.uid[..]],
+        )?;
+        tx.commit()?;
+        histogram!("persist_put_ms", started.elapsed().as_secs_f64() * 1000.0);
+        counter!("persist_put_total", 1u64);
+        Ok(())
+    }
+
+    fn get_last(&self, uid: [u8; 16], limit: Option<usize>) -> Result<Vec<LastApplied>> {
+        let started = std::time::Instant::now();
+        let cap = limit.unwrap_or(3);
+        let db = self.db.lock().unwrap();
+        let mut stmt = db.prepare(
+            "SELECT rv, ts, yaml FROM last_applied WHERE uid = ?1 ORDER BY ts DESC, rowid DESC LIMIT ?2",
+        )?;
+        let mut rows = stmt.query((uid.as_slice(), cap as i64))?;
+        let mut out: Vec<LastApplied> = Vec::new();
+        while let Some(row) = rows.next()? {
+            let rv: String = row.get(0)?;
+            let ts: i64 = row.get(1)?;
+            let yaml: Vec<u8> = row.get(2)?;
+            out.push(LastApplied { uid, rv, ts, yaml_zstd: yaml });
+        }
+        histogram!("persist_get_ms", started.elapsed().as_secs_f64() * 1000.0);
+        Ok(out)
+    }
+}
+
+fn default_db_path() -> String {
+    if let Some(home) = std::env::var_os("HOME") {
+        let mut p = std::path::PathBuf::from(home);
+        p.push(".orka");
+        let _ = std::fs::create_dir_all(&p);
+        p.push("orka.db");
+        return p.to_string_lossy().to_string();
+    }
+    // Fallback to current directory
+    "orka.db".to_string()
+}
+
+pub fn now_ts() -> i64 {
+    // seconds since epoch
+    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default();
+    now.as_secs() as i64
+}
+
+pub fn maybe_compress(yaml: &str) -> Vec<u8> {
+    #[cfg(feature = "zstd")]
+    {
+        let lvl: i32 = std::env::var("ORKA_ZSTD_LEVEL").ok().and_then(|s| s.parse().ok()).unwrap_or(3);
+        return zstd::encode_all(yaml.as_bytes(), lvl as i32).unwrap_or_else(|_| yaml.as_bytes().to_vec());
+    }
+    yaml.as_bytes().to_vec()
+}
+
+pub fn maybe_decompress(blob: &[u8]) -> String {
+    #[cfg(feature = "zstd")]
+    {
+        if let Ok(de) = zstd::decode_all(std::io::Cursor::new(blob)) {
+            return String::from_utf8_lossy(&de).to_string();
+        }
+    }
+    String::from_utf8_lossy(blob).to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn temp_db() -> String {
+        let dir = std::env::temp_dir();
+        let f = format!("orka-test-{}.db", std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos());
+        dir.join(f).to_string_lossy().to_string()
+    }
+
+    #[test]
+    fn put_get_rotate() {
+        let path = temp_db();
+        let s = SqliteStore::open(&path).unwrap();
+        let uid = [7u8; 16];
+        for i in 0..5 {
+            let la = LastApplied { uid, rv: format!("rv-{}", i), ts: i as i64, yaml_zstd: maybe_compress(&format!("k: v{}\n", i)) };
+            s.put_last(la).unwrap();
+        }
+        let rows = s.get_last(uid, None).unwrap();
+        assert_eq!(rows.len(), 3);
+        assert_eq!(rows[0].rv, "rv-4");
+        assert_eq!(rows[1].rv, "rv-3");
+        assert_eq!(rows[2].rv, "rv-2");
+    }
+}
+</file>
+
+<file path="crates/persist/Cargo.toml">
+[package]
+name = "orka-persist"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+anyhow = { workspace = true }
+serde = { workspace = true, features = ["derive"] }
+tracing = { workspace = true }
+metrics = { workspace = true }
+rusqlite = { version = "0.31", features = ["bundled"] }
+time = "0.3"
+
+[features]
+default = []
+zstd = ["dep:zstd"]
+
+[dependencies.zstd]
+version = "0.13"
+optional = true
+</file>
+
+<file path="crates/search/examples/bench.rs">
+use orka_core::{LiteObj, WorldSnapshot, Uid};
+use orka_search::{Index, SearchOpts};
+use std::time::{Duration, Instant};
+
+fn uid(n: u64) -> Uid {
+    let mut u = [0u8; 16];
+    u[0..8].copy_from_slice(&n.to_le_bytes());
+    u
+}
+
+fn gen_obj(i: usize) -> LiteObj {
+    let ns_idx = i % 10;
+    let team_idx = i % 20;
+    let app = match i % 3 { 0 => "web", 1 => "api", _ => "batch" };
+    let name = format!("obj-{i:06}");
+    let ns = format!("ns{ns_idx}");
+    let proj1 = format!("v{}", i % 1000);
+    let proj2 = format!("zone-{}", i % 20);
+    LiteObj {
+        uid: uid(i as u64),
+        namespace: Some(ns),
+        name,
+        creation_ts: 1_577_836_800, // 2020-01-01
+        projected: smallvec::smallvec![(1u32, proj1), (2u32, proj2)],
+        labels: smallvec::smallvec![("app".to_string(), app.to_string()), (format!("team{team_idx}"), "1".to_string())],
+        annotations: smallvec::SmallVec::new(),
+    }
+}
+
+fn gen_snapshot(n: usize) -> WorldSnapshot {
+    let mut items = Vec::with_capacity(n);
+    for i in 0..n { items.push(gen_obj(i)); }
+    WorldSnapshot { epoch: 1, items }
+}
+
+fn percentile_us(xs: &mut [u128], p: f64) -> u128 {
+    xs.sort_unstable();
+    let idx = ((xs.len() as f64 - 1.0) * p).round() as usize;
+    xs[idx]
+}
+
+fn approx_index_bytes(idx: &Index) -> usize {
+    // Crude: sum lengths of stored strings and postings counts
+    // NOTE: This intentionally avoids private fields; put approximation here as a placeholder.
+    // We rebuild a rough snapshot-based estimate instead.
+    0 // Placeholder: private fields are not accessible; rely on snapshot-based estimate below.
+}
+
+fn main() {
+    let n: usize = std::env::var("ORKA_BENCH_DOCS").ok().and_then(|s| s.parse().ok()).unwrap_or(100_000);
+    let limit: usize = std::env::var("ORKA_BENCH_LIMIT").ok().and_then(|s| s.parse().ok()).unwrap_or(50);
+    let max_candidates: usize = std::env::var("ORKA_BENCH_MAXC").ok().and_then(|s| s.parse().ok()).unwrap_or(10_000);
+    let min_score: Option<f32> = std::env::var("ORKA_BENCH_MINSCORE").ok().and_then(|s| s.parse().ok());
+
+    eprintln!("building snapshot: {} docs", n);
+    let t0 = Instant::now();
+    let snap = gen_snapshot(n);
+    let build_snap_ms = t0.elapsed().as_secs_f64() * 1_000.0;
+
+    eprintln!("building index...");
+    let t1 = Instant::now();
+    let index = Index::build_from_snapshot_with_meta(&snap, Some(&[("spec.unit".to_string(), 1u32)]), Some("Demo"), Some("demo.example.com"));
+    let build_idx_ms = t1.elapsed().as_secs_f64() * 1_000.0;
+
+    // Prepare queries
+    let mut typed_only: Vec<String> = Vec::new();
+    for ns in 0..10 { typed_only.push(format!("ns:ns{} label:app=web", ns)); }
+    let mut typed_fuzzy: Vec<String> = Vec::new();
+    for step in (0..n).step_by(n.saturating_div(200).max(1)) {
+        typed_fuzzy.push(format!("ns:ns{} obj-{:06}", step % 10, step));
+    }
+    // Field filters (projected)
+    let mut field_queries: Vec<String> = Vec::new();
+    for v in 0..20 { field_queries.push(format!("field:spec.unit=v{}", v)); }
+
+    let opts = SearchOpts { max_candidates: Some(max_candidates), min_score };
+
+    // Run and time searches
+    let mut run = |label: &str, qs: &[String]| {
+        let mut times: Vec<u128> = Vec::with_capacity(qs.len());
+        for q in qs { let t = Instant::now(); let _ = index.search_with_debug_opts(q, limit, opts).0; times.push(t.elapsed().as_micros()); }
+        let p50 = percentile_us(&mut times.clone(), 0.50) as f64 / 1000.0;
+        let p99 = percentile_us(&mut times, 0.99) as f64 / 1000.0;
+        println!("{}: p50={:.3}ms p99={:.3}ms ({} queries, limit={})", label, p50, p99, qs.len(), limit);
+    };
+
+    println!("index_build: snapshot={:.1}ms index={:.1}ms docs={}", build_snap_ms, build_idx_ms, n);
+    run("typed_only", &typed_only);
+    run("typed+fuzzy", &typed_fuzzy);
+    run("field", &field_queries);
+}
+</file>
+
+<file path="crates/search/tests/replay.rs">
+use orka_core::{Delta, DeltaKind, Uid};
+use orka_search::Index;
+
+fn uid(n: u8) -> Uid { let mut u = [0u8; 16]; u[0] = n; u }
+
+fn obj_raw(name: &str, ns: &str, labels: &[(&str, &str)]) -> serde_json::Value {
+    let mut meta = serde_json::json!({
+        "name": name,
+        "namespace": ns,
+        "creationTimestamp": "2020-01-01T00:00:00Z",
+    });
+    if !labels.is_empty() {
+        let mut map = serde_json::Map::new();
+        for (k, v) in labels.iter() { map.insert((*k).to_string(), serde_json::Value::String((*v).to_string())); }
+        meta["labels"] = serde_json::Value::Object(map);
+    }
+    serde_json::json!({ "metadata": meta })
+}
+
+#[test]
+fn replay_deltas_produce_stable_index_and_ordering() {
+    // Build a world by replaying deltas (apply updates and a delete)
+    let mut wb = orka_store::WorldBuilder::new();
+    let u1 = uid(1);
+    let u2 = uid(2);
+    let u3 = uid(3);
+    // initial apply for three objects
+    wb.apply(vec![
+        Delta { uid: u1, kind: DeltaKind::Applied, raw: obj_raw("alpha", "default", &[("app","web")]) },
+        Delta { uid: u2, kind: DeltaKind::Applied, raw: obj_raw("beta",  "default", &[("app","api")]) },
+        Delta { uid: u3, kind: DeltaKind::Applied, raw: obj_raw("gamma", "default", &[]) },
+    ]);
+    // rename beta -> alpha (tests tie-break by uid when names equal)
+    let mut o2 = obj_raw("alpha", "default", &[("app","api")]);
+    wb.apply(vec![Delta { uid: u2, kind: DeltaKind::Applied, raw: o2 }]);
+    // delete gamma
+    wb.apply(vec![Delta { uid: u3, kind: DeltaKind::Deleted, raw: serde_json::json!({}) }]);
+
+    let snap = wb.freeze();
+    // Build index and search; with no free text it sorts by name then uid
+    let idx = Index::build_from_snapshot(&snap);
+    let hits = idx.search("ns:default", 10);
+    // Two items remain, both named "alpha"; ordering should be by uid asc (1 before 2)
+    assert_eq!(hits.len(), 2);
+    let d0 = hits[0].doc as usize; let d1 = hits[1].doc as usize;
+    assert_eq!(snap.items[d0].name, "alpha");
+    assert_eq!(snap.items[d1].name, "alpha");
+    assert_eq!(snap.items[d0].uid[0], 1);
+    assert_eq!(snap.items[d1].uid[0], 2);
+
+    // Typed filter via label should isolate u1 (web)
+    let hits_label = idx.search("label:app=web", 10);
+    assert_eq!(hits_label.len(), 1);
+    let d = hits_label[0].doc as usize;
+    assert_eq!(snap.items[d].uid[0], 1);
+}
+</file>
+
+<file path="crates/store/tests/replay.rs">
+#![forbid(unsafe_code)]
+
+use orka_store::WorldBuilder;
+use orka_core::{Delta, DeltaKind};
+
+fn uid(n: u8) -> [u8; 16] { let mut u = [0u8; 16]; u[0] = n; u }
+
+fn obj(name: &str, ns: Option<&str>, ts: &str) -> serde_json::Value {
+    let mut meta = serde_json::json!({
+        "name": name,
+        "uid": format!("00000000-0000-0000-0000-{:012}", 1),
+        "creationTimestamp": ts,
+    });
+    if let Some(ns) = ns { meta["namespace"] = serde_json::Value::String(ns.to_string()); }
+    serde_json::json!({ "metadata": meta })
+}
+
+#[test]
+fn replay_basic_sequence() {
+    let mut wb = WorldBuilder::new();
+
+    // Simulate a stream of deltas (applied, updated, deleted)
+    let deltas = vec![
+        // add a/ns
+        Delta { uid: uid(1), kind: DeltaKind::Applied, raw: obj("a", Some("ns"), "2020-01-01T00:00:00Z") },
+        // duplicate add should coalesce at queue normally; here builder just replaces
+        Delta { uid: uid(1), kind: DeltaKind::Applied, raw: obj("a", Some("ns"), "2020-01-01T00:00:00Z") },
+        // add b cluster-scoped
+        Delta { uid: uid(2), kind: DeltaKind::Applied, raw: obj("b", None, "2020-01-01T00:00:01Z") },
+        // update a -> a2
+        Delta { uid: uid(1), kind: DeltaKind::Applied, raw: obj("a2", Some("ns"), "2020-01-01T00:00:00Z") },
+        // delete b
+        Delta { uid: uid(2), kind: DeltaKind::Deleted, raw: serde_json::json!({}) },
+    ];
+
+    // Apply in two batches like ingest would
+    wb.apply(deltas[..2].to_vec());
+    let snap1 = wb.freeze();
+    assert_eq!(snap1.epoch, 1);
+    assert_eq!(snap1.items.len(), 1);
+    assert_eq!(snap1.items[0].name, "a");
+
+    wb.apply(deltas[2..].to_vec());
+    let snap2 = wb.freeze();
+    assert_eq!(snap2.epoch, 2);
+    assert_eq!(snap2.items.len(), 1);
+    assert_eq!(snap2.items[0].name, "a2");
+    assert_eq!(snap2.items[0].namespace.as_deref(), Some("ns"));
+}
+</file>
+
+<file path="examples/configmap.yaml">
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: orka-example-config
+  namespace: default
+  labels:
+    app: orka-example
+data:
+  message: "hello, orka"
+  version: "2"
+</file>
+
+<file path=".gitignore">
+/target
+</file>
+
+<file path="plan.md">
+# Orka – Backend‑First Design & Implementation Plan
+
+> **Mission:** Build a CRD‑native, ultra‑responsive Kubernetes IDE engine in Rust, with a thin UI client layered on top. Ship the **backend first** (headless), then attach an egui-based UI using mostly existing crates.
+
+---
+
+## 1) Product Vision
+
+* **CRD‑first:** Treat CustomResourceDefinitions as first‑class citizens: discover, list/watch, validate, and edit with server‑side apply (SSA).
+* **Latency:** Interactive operations (search, list updates) feel instant: <10 ms p99 query latency, lock‑free UI reads via snapshots.
+* **Safety:** Read‑only by default; dry‑run required before any mutation.
+* **Portability:** Single static binary per OS, no external deps required for core operation.
+
+### Non‑goals (v0)
+
+* Helm UI, dashboards, collaborative sharing, terminal multiplexer.
+* Disk‑backed full‑text history search (feature‑gated for later).
+
+---
+
+## 2) Repository Layout
+
+```
+orka/
+├─ crates/
+│  ├─ core/            # shared types, errors, feature flags
+│  ├─ kubehub/         # kube client, discovery, watchers (DynamicObject)
+│  ├─ schema/          # CRD OpenAPI model, printer-cols, projection, validation glue
+│  ├─ store/           # in-RAM store (lite objs), interning, RCU snapshots
+│  ├─ search/          # RAM index + fuzzy scoring (fuzzy-matcher); optional tantivy
+│  ├─ apply/           # dry-run + server-side-apply, diffs, snapshots
+│  ├─ persist/         # SQLite adapters (prefs, schema cache, last-applied, audit)
+│  ├─ rpc/             # gRPC or JSON-RPC server + client
+│  └─ cli/             # orkactl: exercise backend headlessly
+├─ benches/
+└─ docs/
+```
+
+Feature flags:
+
+* `persist-sqlite`, `search-tantivy`, `strip-managed-fields`, `jsonschema-validate` (default on).
+
+---
+
+## 3) High-Level Architecture
+
+```
++---------------- Orka Backend ----------------+
+| Discovery ◁── kube API ──▶ Watchers (per GVK) |
+|         │                         │          |
+|         ▼                         ▼          |
+|      Schema Engine        Coalescing Queue    |
+|         │                         │          |
+|         ▼                         ▼          |
+|        Projection        World Builder (RCU)  |
+|         │                         │          |
+|         ▼                         ▼          |
+|    Search Index  ◀──────  World Snapshot      |
+|         │                         │          |
+|         ▼                         ▼          |
+|      RPC Server  ◀──────  Apply/Diff/Snap    |
++----------------------------------------------+
+```
+
+* **Watchers**: one per ApiResource (CRD version); list+watch with bookmarks.
+* **Store**: builds immutable **WorldSnapshot** instances (RCU via `arc-swap`).
+* **Search**: RAM index using `fuzzy-matcher`; typed filters; optional FST for prefix.
+* **Apply**: dry‑run then SSA; local last‑applied snapshots; diffs.
+* **RPC**: streaming endpoints for discover/list/watch/search; UI and CLI are clients.
+
+---
+
+## 4) Core Data Structures
+
+```rust
+// crates/core/src/types.rs
+pub type InternId = u32;
+pub type Uid = [u8; 16];
+
+#[derive(Clone)]
+pub struct LiteObj {
+    pub uid: Uid,
+    pub cluster: InternId,
+    pub group: InternId,
+    pub version: InternId,
+    pub kind: InternId,
+    pub namespaced: bool,
+    pub namespace: Option<InternId>,
+    pub name: InternId,
+    pub creation_ts: i64,
+    pub labels: smallvec::SmallVec<[(InternId, InternId); 8]>,
+    pub annotations: smallvec::SmallVec<[(InternId, InternId); 4]>,
+    pub projected: smallvec::SmallVec<[(u32, String); 8]>, // (PathId, rendered scalar)
+    pub raw_ptr: Option<alloc::sync::Arc<[u8]>>,           // lazy JSON bytes
+}
+
+#[derive(Clone)]
+pub struct WorldSnapshot {
+    pub epoch: u64,
+    pub kinds: alloc::collections::BTreeMap<u32, Vec<LiteObj>>, // by KindId
+    // additional indexes for fast filtering
+}
+```
+
+**Interning Pools**: `lasso` for namespaces, kinds, groups, label keys/values; stable across epochs.
+
+**Projection**: schema engine selects a few scalar `spec`/`status` paths per GVK for list/search.
+
+---
+
+## 5) Kube Integration (kubehub)
+
+* Use `kube` + `k8s-openapi`.
+* Discovery via `kube::discovery::Discovery` + read CRDs: `apiextensions.k8s.io/v1/CustomResourceDefinition`.
+* For each `ApiResource` (served version):
+
+  * Create `Api<DynamicObject>` (namespaced/all depending on scope).
+  * Start `reflector` with **bounded** channel and **coalescing** by UID.
+  * Schedule periodic relist.
+* Strip `metadata.managedFields` under `strip-managed-fields` feature to reduce memory.
+
+**Coalescing Queue (sketch):**
+
+```rust
+struct Coalescer { map: FxHashMap<Uid, Delta>, order: VecDeque<Uid>, cap: usize }
+impl Coalescer { /* insert/update by uid; drop oldest when cap exceeded */ }
+```
+
+---
+
+## 6) Schema Engine (schema)
+
+**Responsibilities**
+
+* Normalize `openAPIV3Schema` per served version.
+* Extract `additionalPrinterColumns` when present.
+* Derive **projected fields** if columns absent: choose 3–6 scalar leaves with highest information value.
+* Handle k8s quirks: `x-kubernetes-int-or-string`, `additionalProperties`, `oneOf/anyOf/allOf` (mark as YAML-only), `preserveUnknownFields`.
+* Validate edited YAML (async) using `serde_yaml` → `serde_json::Value` → `jsonschema`.
+
+**Outputs**
+
+```rust
+pub struct CrdSchema {
+    pub served_version: String,
+    pub printer_cols: Vec<PrinterCol>,
+    pub projected_paths: Vec<PathSpec>, // with renderers
+    pub flags: SchemaFlags,
+}
+```
+
+**Schema Cache** (persist optionally): key `{cluster, group, plural, version}` with ETag `resourceVersion`.
+
+---
+
+## 7) Store & Snapshots (store)
+
+* World built on an ingest thread from coalesced deltas.
+* RCU via `arc_swap::ArcSwap<WorldSnapshot>` for **lock‑free reads**.
+* Memory caps enforced by sharding and dropping `raw_ptr` for cold objects.
+
+**Swap Loop (sketch):**
+
+```rust
+static WORLD: arc_swap::ArcSwap<WorldSnapshot> = arc_swap::ArcSwap::from_pointee(WorldSnapshot { epoch: 0, kinds: Default::default() });
+
+fn ingest_loop(mut rx: Receiver<Delta>) {
+    let mut builder = WorldBuilder::new();
+    loop {
+        let batch = coalesce_for(8 /* ms */ , &mut rx);
+        if batch.is_empty() { continue; }
+        builder.apply(batch);
+        let next = builder.freeze(); // Arc<WorldSnapshot>
+        WORLD.store(next);
+    }
+}
+```
+
+---
+
+## 8) Search (search)
+
+* **Default:** RAM index only; rebuild incrementally from deltas.
+* **Scoring:** `fuzzy-matcher` (SkimMatcherV2).
+* **Grammar:** `k:Kind g:group ns:foo label:app=bar anno:team=core field:spec.path=value` + free text.
+* **Pipeline:** fast set intersections for typed filters → fuzzy scoring on candidates.
+* Optional: `fst` for exact/prefix acceleration.
+
+Targets: **<10 ms p99** at 100k docs, single thread.
+
+---
+
+## 9) Apply & Diffs (apply)
+
+* **Dry‑run first** (server): validate and preview.
+* **Server‑side apply** with `fieldManager="orka"` on success.
+* Store **last‑applied** (up to 3) per object in SQLite (zstd blobs).
+* Produce humanized diffs via `json_patch` + `similar` for presentation.
+* Support `status` subresource explicitly when present.
+
+---
+
+## 10) Persistence (persist)
+
+* Optional, via `rusqlite`:
+
+  * `prefs(key TEXT PRIMARY KEY, val BLOB)`
+  * `schema_cache(key TEXT PRIMARY KEY, etag TEXT, blob BLOB)`
+  * `snap(uid TEXT, ts INTEGER, blob BLOB, PRIMARY KEY(uid, ts))`
+  * `audit(ts INTEGER, cluster TEXT, verb TEXT, gvk TEXT, ns TEXT, name TEXT, diff_summary TEXT)`
+
+---
+
+## 11) RPC Surface (rpc)
+
+Choose **gRPC** with `tonic` (recommended) or JSON‑RPC with `jsonrpsee`.
+
+**Proto (sketch):**
+
+```proto
+syntax = "proto3";
+package orka.v1;
+
+message ResourceKind { string group=1; string version=2; string kind=3; bool namespaced=4; }
+message ResourceRef  { string cluster=1; ResourceKind gvk=2; string namespace=3; string name=4; }
+message Lite {
+  string uid=1; string cluster=2;
+  string group=3; string version=4; string kind=5;
+  string namespace=6; string name=7; int64 creation_ts=8;
+  map<string,string> labels=9; map<string,string> annotations=10;
+  map<string,string> projected=11;
+}
+message SearchQuery { string q=1; string cluster=2; int32 limit=3; }
+message SearchHit { Lite doc=1; float score=2; }
+message ApplyReport { bool ok=1; string message=2; bytes server_patch=3; }
+
+service Orka {
+  rpc Discover(.google.protobuf.Empty) returns (stream ResourceKind);
+  rpc List(ResourceKind) returns (stream Lite);
+  rpc Watch(ResourceKind) returns (stream Lite);
+  rpc GetRaw(ResourceRef) returns (bytes);
+  rpc Search(SearchQuery) returns (stream SearchHit);
+  rpc DryRunApply(bytes) returns (ApplyReport);
+  rpc ServerApply(bytes) returns (ApplyReport);
+}
+```
+
+Auth: respect kubeconfig contexts; pass through exec‑plugin flows.
+
+---
+
+## 12) CLI: **`orkactl`** (no UI required)
+
+Commands:
+
+* `orkactl discover`
+* `orkactl ls gvk --ns default`
+* `orkactl watch gvk --ns default`
+* `orkactl get ref -o yaml`
+* `orkactl search "k:Application ns:prod payments"`
+* `orkactl edit ref.yaml --dry-run | --apply`
+* `orkactl schema gvk`
+
+Use this to validate backend behavior and performance in CI and locally.
+
+---
+
+## 13) Testing & Benchmarks
+
+**Unit tests**: schema parsing, projection selection, validator edge cases, search scoring.
+
+**Replay tests**: record List/Watch streams (newline‑delimited JSON). Feed into a `DeltaSource` trait to produce deterministic ingest.
+
+**Integration (kind cluster)**:
+
+* Install operators: cert‑manager, prometheus‑operator, argo‑cd, istio (selected CRDs).
+* Run end‑to‑end flows: discover → list → watch → search → dry‑run → apply.
+
+**Benches (criterion)**:
+
+* 100k CRs synthetic dataset → measure ingest throughput, snapshot build time, search p99, memory footprint.
+
+---
+
+## 14) Performance Budgets & Tuning
+
+* Snapshot swap cadence: build in ≤8–12 ms under steady state.
+* Search: ≤10 ms p99 @100k docs.
+* Memory cap: default 600–800 MB on large clusters. Strategies: interning, projected fields, drop raw bytes when idle, shard by GVK.
+* Backpressure: bounded queues; coalesce by UID; periodic relists.
+
+---
+
+## 15) Security & RBAC
+
+* Read verbs discovered via `SelfSubjectRulesReview`/`SelfSubjectAccessReview`.
+* Gray‑out mutating RPCs when not allowed; enforce server checks regardless.
+* Never store tokens unencrypted; rely on kubeconfig/exec‑plugins.
+
+---
+
+## 16) UI (Later) – Leverage Existing Crates
+
+* `egui`, `eframe`, `egui_extras::TableBuilder`, `egui_dock`, `egui_code_editor`, `syntect`, `egui-toast`, `egui-modal`.
+* UI acts as a **client** of Orka RPC: subscribe to `Watch`, render `Lite` tables, open YAML with `GetRaw`, call `DryRunApply`/`ServerApply`.
+
+---
+
+## 17) Milestones (Backend‑first)
+
+**M0 – Skeleton (1–2 weeks)**
+
+* kube client, discovery, single CRD watcher, coalescing, RCU snapshot, basic CLI `discover`, `ls`, `watch`.
+
+**M1 – Schema & Search (2–3 weeks)**
+
+* Schema engine (printer columns, projection, validation). RAM index + typed filters + fuzzy. CLI: `schema`, `search`.
+
+**M2 – Apply & Persistence (2 weeks)**
+
+* Dry‑run + SSA; last‑applied snapshots; diffs; optional SQLite cache. CLI: `edit --dry-run|--apply`.
+
+**M3 – Scale & Hardening (2 weeks)**
+
+* Namespaced sharding, periodic relist, memory caps, replay tests, integration on kind with operators.
+
+**M4 – RPC Stabilization (1 week)**
+
+* Finalize proto; add streaming endpoints; CLI switches to RPC path.
+
+*(UI milestones follow afterwards.)*
+
+---
+
+## 18) Risks & Mitigations
+
+* **CRD schema variance** → robust YAML fallback; tolerant validator.
+* **Large clusters** → sharding, coalescing, projected fields, memory caps.
+* **Auth/exec plugins** → rely on `kube` support; surface expiry and retry gracefully.
+* **Index rebuild costs** → incremental ingest + generational swap; optional snapshot persistence.
+
+---
+
+## 19) Coding Standards & Tooling
+
+* Edition 2021+, `clippy` pedantic profile; `rustfmt` enforced.
+* Observability via `tracing` with targets per crate; feature‑gated in release.
+* Error handling via `thiserror`/`anyhow` where appropriate.
+* CI: fmt, clippy, tests, benches (smoke), kind integration (nightly).
+
+---
+
+## 20) Next Actions (Week 0 Checklist)
+
+* [ ] Init repo + workspace layout
+* [ ] `kubehub`: kube client + discovery; print all resources
+* [ ] Start first CRD watcher (e.g., cert‑manager `Certificate`)
+* [ ] Implement coalescing queue + ingest loop + `WorldSnapshot` swap
+* [ ] `orkactl discover | ls | watch` minimal commands
+* [ ] Decide RPC flavor (tonic vs jsonrpsee) & add crate skeleton
+* [ ] Add criterion baseline bench with synthetic deltas
+
+> When M0 is green, we’ll lock the RPC surface and start on schema/search.
+</file>
+
+<file path="crates/core/src/lib.rs">
+//! Orka core types (Milestone 0)
+
+#![forbid(unsafe_code)]
+
+use serde::{Deserialize, Serialize};
+use smallvec::SmallVec;
+
+pub type Uid = [u8; 16];
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub enum DeltaKind {
+    Applied,
+    Deleted,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Delta {
+    pub uid: Uid,
+    pub kind: DeltaKind,
+    /// Raw object (possibly stripped of oversized fields under feature flags)
+    pub raw: serde_json::Value,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LiteObj {
+    pub uid: Uid,
+    pub namespace: Option<String>,
+    pub name: String,
+    pub creation_ts: i64,
+    /// Projected fields for search/listing (M1). For M0, this may be empty.
+    pub projected: SmallVec<[(u32, String); 8]>,
+    /// Kubernetes labels as key/value pairs.
+    pub labels: SmallVec<[(String, String); 8]>,
+    /// Kubernetes annotations as key/value pairs.
+    pub annotations: SmallVec<[(String, String); 4]>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct WorldSnapshot {
+    pub epoch: u64,
+    /// For Milestone 0, we hold items only for the selected GVK.
+    pub items: Vec<LiteObj>,
+}
+
+pub mod prelude {
+    pub use super::{Delta, DeltaKind, LiteObj, Uid, WorldSnapshot, Projector, ProjectedEntry};
+}
+
+/// Entry representing a projected field: `(PathId, RenderedValue)`
+pub type ProjectedEntry = (u32, String);
+
+/// Projector takes a raw JSON object and yields rendered projected scalars.
+pub trait Projector: Send + Sync {
+    fn project(&self, raw: &serde_json::Value) -> SmallVec<[(u32, String); 8]>;
+}
+</file>
+
+<file path="crates/core/Cargo.toml">
+[package]
+name = "orka-core"
+version = "0.0.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+description = "Orka core types and errors (Milestone 0)"
+
+[features]
+default = ["strip-managed-fields"]
+strip-managed-fields = []
+persist-sqlite = [] # stubbed for later milestones
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+anyhow = { workspace = true }
+smallvec = { workspace = true }
+</file>
+
+<file path="crates/schema/src/lib.rs">
+//! Orka schema (Milestone 1 stub): discover CRD schema, printer columns, and projected paths.
+
+#![forbid(unsafe_code)]
+
+use anyhow::{anyhow, Context, Result};
+use serde::{Deserialize, Serialize};
+use smallvec::SmallVec;
+// tracing optional here; keep code quiet for now
+use orka_core::Projector;
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PrinterCol {
+    pub name: String,
+    pub json_path: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PathSpec {
+    pub id: u32,
+    pub json_path: String,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct SchemaFlags {
+    pub yaml_only_nodes: bool,
+    pub preserves_unknown: bool,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct CrdSchema {
+    pub served_version: String,
+    pub printer_cols: Vec<PrinterCol>,
+    pub projected_paths: Vec<PathSpec>,
+    pub flags: SchemaFlags,
+}
+
+fn normalize_json_path(jp: &str) -> Option<String> {
+    // Accept only simple paths like .spec.foo.bar[0]
+    if jp.contains('?') || jp.contains('*') { return None; }
+    let s = if let Some(stripped) = jp.strip_prefix('.') { stripped } else { jp };
+    if s.is_empty() { return None; }
+    // Validate segments: allow alnum/underscore/hyphen keys; optional single [index] at end
+    for seg in s.split('.') {
+        if seg.is_empty() { return None; }
+        let bytes = seg.as_bytes();
+        // count '[' occurrences
+        let mut open_idx: Option<usize> = None;
+        for (i, ch) in bytes.iter().enumerate() {
+            match *ch as char {
+                '[' => {
+                    if open_idx.is_some() { return None; } // multiple [
+                    open_idx = Some(i);
+                }
+                ']' => {
+                    // ']' only allowed if we saw '[' and it must be the last char
+                    match open_idx {
+                        Some(start) => {
+                            if i != bytes.len() - 1 { return None; }
+                            // ensure digits between [ and ]
+                            if start + 1 >= i { return None; }
+                            if !seg[start+1..i].chars().all(|c| c.is_ascii_digit()) { return None; }
+                        }
+                        None => return None,
+                    }
+                }
+                c => {
+                    // before '[' ensure key chars are safe
+                    if open_idx.is_none() {
+                        if !(c.is_ascii_alphanumeric() || c == '_' || c == '-') { return None; }
+                    } else {
+                        // inside index; digits validated on closing
+                    }
+                }
+            }
+        }
+        // if '[' opened, we must have seen a closing ']' (enforced above by requiring it as last char)
+        if let Some(start) = open_idx {
+            if !seg.ends_with(']') || start >= seg.len()-1 { return None; }
+        }
+    }
+    Some(s.to_string())
+}
+
+/// Try to fetch CRD schema for the provided `gvk_key` (e.g. "group/v1/Kind" or "v1/Kind").
+/// Returns Ok(None) for built-in kinds without a CRD.
+pub async fn fetch_crd_schema(gvk_key: &str) -> Result<Option<CrdSchema>> {
+    use kube::Client;
+    use k8s_openapi::apiextensions_apiserver::pkg::apis::apiextensions::v1 as apiextv1;
+    use kube::{Api, api::ListParams};
+
+    let client = Client::try_default().await?;
+    // Parse key
+    let parts: Vec<_> = gvk_key.split('/').collect();
+    let (group, version, kind) = match parts.as_slice() {
+        [version, kind] => ("", *version, *kind),
+        [group, version, kind] => (*group, *version, *kind),
+        _ => return Err(anyhow!("invalid gvk key: {}", gvk_key)),
+    };
+
+    if group.is_empty() {
+        // Builtins have no CRD
+        return Ok(None);
+    }
+
+    // List CRDs and find the one matching group + kind (robust across discovery quirks)
+    let api: Api<apiextv1::CustomResourceDefinition> = Api::all(client.clone());
+    let crds = api.list(&ListParams::default()).await.context("listing CustomResourceDefinitions")?;
+    let mut v_opt: Option<serde_json::Value> = None;
+    for crd in crds {
+        let v = serde_json::to_value(&crd)?;
+        let spec = match v.get("spec") { Some(s) => s, None => continue };
+        let g = spec.get("group").and_then(|s| s.as_str()).unwrap_or("");
+        let k = spec.get("names").and_then(|n| n.get("kind")).and_then(|s| s.as_str()).unwrap_or("");
+        if g == group && k == kind { v_opt = Some(v); break; }
+    }
+    let v = match v_opt { Some(v) => v, None => return Err(anyhow!("CRD not found for {}", gvk_key)) };
+    let versions = v
+        .get("spec").and_then(|s| s.get("versions"))
+        .and_then(|vv| vv.as_array())
+        .cloned()
+        .unwrap_or_default();
+
+    // Pick a served version: prefer storage=true, else first served=true, else requested version
+    let mut served_version = version.to_string();
+    if !versions.is_empty() {
+        if let Some(storage_v) = versions.iter().find(|ver| ver.get("storage").and_then(|b| b.as_bool()).unwrap_or(false)) {
+            if let Some(name) = storage_v.get("name").and_then(|s| s.as_str()) { served_version = name.to_string(); }
+        } else if let Some(served_v) = versions.iter().find(|ver| ver.get("served").and_then(|b| b.as_bool()).unwrap_or(false)) {
+            if let Some(name) = served_v.get("name").and_then(|s| s.as_str()) { served_version = name.to_string(); }
+        }
+    }
+
+    // Extract additionalPrinterColumns for the chosen version; fallback to top-level spec.additionalPrinterColumns (v1beta1 style)
+    let mut printer_cols: Vec<PrinterCol> = Vec::new();
+    if let Some(ver) = versions.iter().find(|ver| ver.get("name").and_then(|s| s.as_str()) == Some(served_version.as_str())) {
+        if let Some(cols) = ver.get("additionalPrinterColumns").and_then(|c| c.as_array()) {
+            for c in cols {
+                let name = c.get("name").and_then(|s| s.as_str()).unwrap_or("").to_string();
+                let raw = c.get("jsonPath").and_then(|s| s.as_str()).unwrap_or("");
+                if !name.is_empty() {
+                    if let Some(jp) = normalize_json_path(raw) {
+                        printer_cols.push(PrinterCol { name, json_path: jp });
+                    }
+                }
+            }
+        }
+    }
+    if printer_cols.is_empty() {
+        if let Some(cols) = v.get("spec").and_then(|s| s.get("additionalPrinterColumns")).and_then(|c| c.as_array()) {
+            for c in cols {
+                let name = c.get("name").and_then(|s| s.as_str()).unwrap_or("").to_string();
+                let raw = c.get("jsonPath").and_then(|s| s.as_str()).unwrap_or("");
+                if !name.is_empty() {
+                    if let Some(jp) = normalize_json_path(raw) {
+                        printer_cols.push(PrinterCol { name, json_path: jp });
+                    }
+                }
+            }
+        }
+    }
+
+    // Projected paths: prefer printer columns; else derive from OpenAPI schema
+    let mut projected_paths: Vec<PathSpec> = Vec::new();
+    if !printer_cols.is_empty() {
+        for (i, c) in printer_cols.iter().enumerate() {
+            projected_paths.push(PathSpec { id: i as u32, json_path: c.json_path.clone() });
+            if projected_paths.len() >= 6 { break; }
+        }
+    } else {
+        // Try to locate openAPIV3Schema for the chosen version
+        let mut schema_opt: Option<&serde_json::Value> = None;
+        if let Some(ver) = versions.iter().find(|ver| ver.get("name").and_then(|s| s.as_str()) == Some(served_version.as_str())) {
+            schema_opt = ver.get("schema").and_then(|s| s.get("openAPIV3Schema"));
+        }
+        if schema_opt.is_none() {
+            // legacy v1beta1 location
+            schema_opt = v.get("spec").and_then(|s| s.get("validation")).and_then(|s| s.get("openAPIV3Schema"));
+        }
+
+        let candidates = schema_opt
+            .and_then(|s| derive_projected_from_openapi(s))
+            .unwrap_or_else(|| vec![
+                "spec.name".to_string(),
+                "spec.namespace".to_string(),
+            ]);
+        for (i, p) in candidates.iter().take(6).enumerate() {
+            projected_paths.push(PathSpec { id: i as u32, json_path: p.clone() });
+        }
+    }
+
+    Ok(Some(CrdSchema { served_version, printer_cols, projected_paths, flags: SchemaFlags::default() }))
+}
+
+/// Simple projector built from a `CrdSchema` projected paths.
+#[derive(Clone)]
+pub struct SchemaProjector {
+    specs: Vec<PathSpec>,
+}
+
+impl SchemaProjector {
+    pub fn new(specs: Vec<PathSpec>) -> Self { Self { specs } }
+
+    /// Extract a scalar string from a JSON value following a minimal json-path-like grammar:
+    /// dot fields and single `[index]` on a segment, e.g., `spec.dnsNames[0]`.
+    fn extract_path<'a>(root: &'a serde_json::Value, path: &str) -> Option<&'a serde_json::Value> {
+        use serde_json::Value;
+        let mut cur = root;
+        for seg in path.split('.') {
+            if seg.is_empty() { return None; }
+            // Handle optional [index]
+            let (key, idx_opt) = if let Some(brk) = seg.find('[') {
+                let end = seg.get(brk+1..)?.find(']')? + brk + 1;
+                let key = &seg[..brk];
+                let idx_str = &seg[brk+1..end];
+                let idx: usize = idx_str.parse().ok()?;
+                (key, Some(idx))
+            } else {
+                (seg, None)
+            };
+            match cur {
+                Value::Object(map) => {
+                    cur = map.get(key)?;
+                }
+                _ => return None,
+            }
+            if let Some(i) = idx_opt {
+                match cur {
+                    Value::Array(arr) => { cur = arr.get(i)?; }
+                    _ => return None,
+                }
+            }
+        }
+        Some(cur)
+    }
+}
+
+impl Projector for SchemaProjector {
+    fn project(&self, raw: &serde_json::Value) -> SmallVec<[(u32, String); 8]> {
+        let mut out: SmallVec<[(u32, String); 8]> = SmallVec::new();
+        for spec in self.specs.iter() {
+            if let Some(v) = Self::extract_path(raw, &spec.json_path) {
+                let s = match v {
+                    serde_json::Value::String(s) => s.clone(),
+                    serde_json::Value::Number(n) => n.to_string(),
+                    serde_json::Value::Bool(b) => b.to_string(),
+                    _ => continue,
+                };
+                out.push((spec.id, s));
+                if out.len() >= 8 { break; }
+            }
+        }
+        out
+    }
+}
+
+impl CrdSchema {
+    pub fn projector(&self) -> SchemaProjector {
+        SchemaProjector::new(self.projected_paths.clone())
+    }
+}
+
+// Feature-gated JSON Schema validation utilities
+#[cfg(feature = "jsonschema-validate")]
+pub mod validate {
+    use super::*;
+    use anyhow::{Context, Result};
+    use jsonschema::{Draft, JSONSchema};
+
+    #[derive(Debug, Clone, Serialize, Deserialize)]
+    pub struct ValidationIssue {
+        pub path: String,
+        pub error: String,
+        pub hint: Option<String>,
+    }
+
+    async fn fetch_openapi_schema(gvk_key: &str) -> Result<Option<serde_json::Value>> {
+        use kube::Client;
+        use k8s_openapi::apiextensions_apiserver::pkg::apis::apiextensions::v1 as apiextv1;
+        use kube::{Api, api::ListParams};
+
+        let client = Client::try_default().await?;
+        let parts: Vec<_> = gvk_key.split('/').collect();
+        let (group, version, kind) = match parts.as_slice() {
+            [version, kind] => ("", *version, *kind),
+            [group, version, kind] => (*group, *version, *kind),
+            _ => return Err(anyhow::anyhow!("invalid gvk key: {}", gvk_key)),
+        };
+        if group.is_empty() { return Ok(None); }
+
+        let api: Api<apiextv1::CustomResourceDefinition> = Api::all(client.clone());
+        let crds = api.list(&ListParams::default()).await.context("listing CustomResourceDefinitions")?;
+        let mut v_opt: Option<serde_json::Value> = None;
+        for crd in crds {
+            let v = serde_json::to_value(&crd)?;
+            let spec = match v.get("spec") { Some(s) => s, None => continue };
+            let g = spec.get("group").and_then(|s| s.as_str()).unwrap_or("");
+            let k = spec.get("names").and_then(|n| n.get("kind")).and_then(|s| s.as_str()).unwrap_or("");
+            if g == group && k == kind { v_opt = Some(v); break; }
+        }
+        let v = match v_opt { Some(v) => v, None => return Err(anyhow::anyhow!("CRD not found for {}", gvk_key)) };
+        let versions = v.get("spec").and_then(|s| s.get("versions")).and_then(|vv| vv.as_array()).cloned().unwrap_or_default();
+        let mut served_version = version.to_string();
+        if !versions.is_empty() {
+            if let Some(storage_v) = versions.iter().find(|ver| ver.get("storage").and_then(|b| b.as_bool()).unwrap_or(false)) {
+                if let Some(name) = storage_v.get("name").and_then(|s| s.as_str()) { served_version = name.to_string(); }
+            } else if let Some(served_v) = versions.iter().find(|ver| ver.get("served").and_then(|b| b.as_bool()).unwrap_or(false)) {
+                if let Some(name) = served_v.get("name").and_then(|s| s.as_str()) { served_version = name.to_string(); }
+            }
+        }
+        // Find openAPIV3Schema in chosen version or legacy location
+        let mut schema_opt: Option<serde_json::Value> = None;
+        if let Some(ver) = versions.iter().find(|ver| ver.get("name").and_then(|s| s.as_str()) == Some(served_version.as_str())) {
+            if let Some(s) = ver.get("schema").and_then(|s| s.get("openAPIV3Schema")).cloned() { schema_opt = Some(s); }
+        }
+        if schema_opt.is_none() {
+            schema_opt = v.get("spec").and_then(|s| s.get("validation")).and_then(|s| s.get("openAPIV3Schema")).cloned();
+        }
+        Ok(schema_opt)
+    }
+
+    /// Validate a YAML document against the CRD's `openAPIV3Schema` for the given GVK.
+    /// Returns a list of human-friendly issues; empty on success.
+    pub async fn validate_yaml_for_gvk(gvk_key: &str, yaml: &str) -> Result<Vec<ValidationIssue>> {
+        let schema = match fetch_openapi_schema(gvk_key).await? {
+            Some(s) => s,
+            None => return Ok(vec![ValidationIssue { path: "".into(), error: "no CRD schema available for builtin kind".into(), hint: None }]),
+        };
+        let json: serde_json::Value = match serde_yaml::from_str::<serde_yaml::Value>(yaml) {
+            Ok(v) => serde_json::to_value(v).context("converting YAML to JSON")?,
+            Err(e) => return Ok(vec![ValidationIssue { path: "".into(), error: format!("YAML parse error: {}", e), hint: Some("check indentation and syntax".into()) }]),
+        };
+        // JSONSchema 0.17 requires a 'static schema reference; leak for now (acceptable for CLI usage).
+        let schema_static: &'static serde_json::Value = Box::leak(Box::new(schema));
+        let compiled = JSONSchema::options().with_draft(Draft::Draft7).compile(schema_static).context("compiling CRD JSON Schema")?;
+        let mut issues: Vec<ValidationIssue> = Vec::new();
+        let result = compiled.validate(&json);
+        if let Err(errors) = result {
+            for err in errors {
+                let path = err.instance_path.to_string();
+                let error = err.to_string();
+                // Keep hints minimal to avoid depending on specific jsonschema internals
+                let hint = if error.contains("required property") {
+                    Some("missing required field".into())
+                } else if error.contains("type:") || error.contains("expected type") {
+                    Some("mismatched type".into())
+                } else if error.contains("enum") {
+                    Some("value not in allowed set".into())
+                } else {
+                    None
+                };
+                issues.push(ValidationIssue { path, error, hint });
+            }
+        }
+        Ok(issues)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn normalize_json_path_accepts_simple_paths() {
+        assert_eq!(normalize_json_path(".spec.foo"), Some("spec.foo".to_string()));
+        assert_eq!(normalize_json_path("spec.dnsNames[0]"), Some("spec.dnsNames[0]".to_string()));
+        assert_eq!(normalize_json_path("").is_none(), true);
+        assert_eq!(normalize_json_path("spec.*").is_none(), true);
+        assert_eq!(normalize_json_path("spec.foo[0][1]").is_some(), false);
+    }
+
+    #[test]
+    fn projector_extracts_scalars() {
+        let json = serde_json::json!({
+            "spec": {
+                "dnsNames": ["a.example.com", "b.example.com"],
+                "replicas": 3,
+                "paused": false
+            }
+        });
+        let specs = vec![
+            PathSpec { id: 1, json_path: "spec.dnsNames[0]".to_string() },
+            PathSpec { id: 2, json_path: "spec.replicas".to_string() },
+            PathSpec { id: 3, json_path: "spec.paused".to_string() },
+        ];
+        let pj = SchemaProjector::new(specs);
+        let out = pj.project(&json);
+        assert!(out.contains(&(1, "a.example.com".to_string())));
+        assert!(out.contains(&(2, "3".to_string())));
+        assert!(out.contains(&(3, "false".to_string())));
+    }
+}
+
+fn derive_projected_from_openapi(schema: &serde_json::Value) -> Option<Vec<String>> {
+    use serde_json::Value;
+    let mut out: Vec<String> = Vec::new();
+    let spec_props = schema.get("properties")?.get("spec")?.get("properties")?.as_object()?;
+
+    fn is_scalar_type(ty: &str) -> bool { matches!(ty, "string" | "integer" | "number" | "boolean") }
+
+    fn walk_object(obj: &serde_json::Map<String, Value>, base: &str, depth: usize, out: &mut Vec<String>) {
+        if depth > 3 || out.len() >= 16 { return; }
+        for (k, v) in obj.iter() {
+            let path = if base.is_empty() { k.clone() } else { format!("{}.{}", base, k) };
+            let ty = v.get("type").and_then(|s| s.as_str()).unwrap_or("");
+            match ty {
+                "object" => {
+                    if let Some(props) = v.get("properties").and_then(|p| p.as_object()) {
+                        walk_object(props, &path, depth+1, out);
+                    }
+                }
+                "array" => {
+                    if let Some(items) = v.get("items") {
+                        let ity = items.get("type").and_then(|s| s.as_str()).unwrap_or("");
+                        if is_scalar_type(ity) {
+                            out.push(format!("{}[0]", path));
+                        } else if ity == "object" {
+                            if let Some(props) = items.get("properties").and_then(|p| p.as_object()) {
+                                walk_object(props, &format!("{}[0]", path), depth+1, out);
+                            }
+                        }
+                    }
+                }
+                t if is_scalar_type(t) => {
+                    out.push(path);
+                }
+                _ => {}
+            }
+            if out.len() >= 16 { return; }
+        }
+    }
+
+    walk_object(spec_props, "spec", 0, &mut out);
+
+    if out.is_empty() { None } else { Some(out) }
+}
+</file>
+
+<file path="crates/schema/Cargo.toml">
+[package]
+name = "orka-schema"
+version = "0.0.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+description = "Orka CRD schema engine (Milestone 1 stub)"
+
+[dependencies]
+orka-core = { path = "../core" }
+anyhow = { workspace = true }
+thiserror = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tracing = { workspace = true }
+smallvec = { workspace = true }
+kube = { workspace = true }
+k8s-openapi = { workspace = true }
+serde_yaml = { version = "0.9", optional = true }
+jsonschema = { version = "0.17", optional = true }
+
+[features]
+jsonschema-validate = ["serde_yaml", "jsonschema"]
+</file>
+
+<file path="crates/search/Cargo.toml">
+[package]
+name = "orka-search"
+version = "0.0.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+description = "Orka RAM search index (Milestone 1 stub)"
+
+[dependencies]
+orka-core = { path = "../core" }
+anyhow = { workspace = true }
+rustc-hash = { workspace = true }
+fuzzy-matcher = { workspace = true }
+smallvec = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+metrics = { workspace = true }
+
+[dev-dependencies]
+orka-store = { path = "../store" }
+</file>
+
+<file path="MILESTONE-0.md">
+# Orka — Milestone 0 (Skeleton Backend)
+
+> Goal: get a boring, predictable skeleton that does less but never lies. Make it correct and observable first; then fast. Keep the moving parts few. Ship a single binary that can discover, list, and watch one CRD reliably.
+
+---
+
+## Scope (M0)
+
+- kube client and discovery of all served resources (incl. CRDs).
+- One CRD watcher end-to-end (namespaced or cluster-scoped), coalescing queue, ingest, and RCU snapshots.
+- Minimal in-RAM representations (LiteObj subset) aimed at listing and watching.
+- CLI: `discover`, `ls`, `watch` implemented against the in-process backend (no RPC yet).
+- Logging, backpressure, and simple metrics; graceful shutdown.
+
+Non-goals (M0): schema engine, search index, apply/diffs, persistence, UI, multi-cluster.
+
+Success = commands behave deterministically on a real cluster and under replay, with bounded memory/CPU.
+
+---
+
+## Architecture Slice
+
+```
++--------- kube API ---------+
+        list/watch (1 GVK)
+               │
+               ▼
+        Coalescing Queue  →  Ingest Thread  →  ArcSwap<WorldSnapshot>
+               ▲                                   ▲
+               │                                   │
+            orkactl --------------------------→ read-only views
+```
+
+Rules:
+
+- No blocking in the watch path; coalesce before ingest.
+- Reads are lock-free via `arc-swap` snapshots.
+- Bounded memory: fixed-capacity queues; drop oldest on pressure.
+
+---
+
+## Workspace Layout (M0)
+
+- `crates/core`: types, tiny errors, feature flags.
+- `crates/kubehub`: kube client, discovery, single-GVK watcher.
+- `crates/store`: Delta, Coalescer, WorldBuilder, WorldSnapshot.
+- `crates/cli` (binary `orkactl`): `discover | ls | watch` using in-process backend.
+
+Later crates (schema, search, apply, rpc, persist) are out of scope for M0.
+
+---
+
+## Detailed Tasks
+
+Progress summary (as of M0 scaffold implemented):
+
+- [x] Bootstrap: workspace, tracing, feature flags (strip-managed-fields on; persist-sqlite stubbed)
+- [x] Discovery: list served resources via kube discovery; CLI `discover` + `-o json`
+- [~] Watcher: list+watch for a selected GVK works; bookmarks/backoff defaulted; periodic relist not wired yet
+- [~] Coalescer: UID coalescing with bounded capacity and drop counter; metrics not exported yet
+- [x] Store & Snapshots: builder applies batches; `arc-swap` snapshots for lock-free reads
+- [x] CLI: `discover`, `ls`, `watch` using in-process backend; human + JSON output
+- [~] Observability & Limits: `ORKA_LOG` + `ORKA_QUEUE_CAP` + `ORKA_RELIST_SECS`; basic tracing; graceful shutdown DONE; metrics export TODO
+- [ ] Tests & Replay: unit tests and replay fixture pending
+- [ ] Docs & Examples: README and fixtures pending
+
+1) Bootstrap (Day 0–1) — Status: Completed
+- Cargo workspace with crates above; CI with fmt/clippy/test.
+- Minimal `tracing` setup with env filter; error handling via `anyhow`/`thiserror`.
+- Feature flags: `strip-managed-fields` (on), `persist-sqlite` (off), others stubbed.
+
+2) Discovery (Day 1) — Status: Completed
+- Use `kube::discovery::Discovery` to list served resources (incl. CRDs).
+- Print canonical key per resource: `group/version/kind (namespaced|cluster)`.
+- Accept a `--prefer-crd` flag to select the first CRD automatically for M0 demos.
+
+3) Watcher (Day 2–3) — Status: Partial
+- For the selected GVK, start `Api<DynamicObject>` with list+watch.
+- Set `watch` with bookmarks and a small, bounded internal channel.
+- Periodic relist every N minutes; detect resourceVersion staleness and recover.
+
+4) Coalescer (Day 3) — Status: Completed
+- Map `uid` → latest `Delta` with FIFO `VecDeque<uid>` order, capacity N (configurable).
+- Insert/update collapses multiple changes into one; when full, drop oldest with a counter.
+- Export metrics: `coalescer_dropped_total`, `coalescer_len`. (Completed)
+
+5) Store & Snapshots (Day 3–4) — Status: Completed
+- `WorldBuilder` applies batches of `Delta` and produces `Arc<WorldSnapshot>`.
+- Use `arc_swap::ArcSwap<WorldSnapshot>` for readers; swap on every non-empty batch.
+- Snapshot contains only what CLI needs for `ls` (a Vec of `LiteObj` for the GVK).
+
+6) CLI (Day 4–5) — Status: Completed
+- `orkactl discover`: print served resources.
+- `orkactl ls gvk --ns default`: read current snapshot and render a table.
+- `orkactl watch gvk --ns default`: subscribe to snapshot swaps and print concise lines.
+- JSON output via `-o json` for machine checks; default human output.
+
+7) Observability & Limits (Day 5) — Status: Completed
+- `tracing`: targets per crate; `info` for lifecycle, `debug` for delta counts.
+- Env vars: `ORKA_QUEUE_CAP`, `ORKA_RELIST_SECS`, `ORKA_LOG`.
+- Graceful shutdown: Ctrl-C triggers stop of watcher and ingest; flush a final snapshot. (Completed)
+- Metrics export: Prometheus at `ORKA_METRICS_ADDR` with `coalescer_*`, `ingest_*`, `snapshot_*`. (Completed)
+
+8) Tests & Replay (Day 5–6) — Status: Completed
+- Unit: coalescer behavior (coalesce, drop), builder apply, JSON shaping of `LiteObj`. (Completed)
+- Replay: deterministic test simulating deltas, asserting snapshot contents. (Completed)
+- Optional kind-based integration (manual gate): skip in CI if no cluster. (Deferred)
+
+9) Docs & Examples (Day 6) — Status: Completed
+- Add a short README for `orkactl` with copy-paste sessions. (Completed)
+- Provide a tiny replay fixture under `benches/fixtures/` (few dozen deltas). (Deferred; tests embed small fixture)
+
+---
+
+## Minimal Types (M0)
+
+```rust
+// crates/core
+pub type Uid = [u8; 16];
+
+pub enum DeltaKind { Applied, Deleted }
+
+pub struct Delta {
+    pub uid: Uid,
+    pub kind: DeltaKind,
+    pub raw: serde_json::Value, // for now, keep small; drop large fields optionally
+}
+
+pub struct LiteObj {
+    pub uid: Uid,
+    pub namespace: Option<String>,
+    pub name: String,
+    pub creation_ts: i64,
+}
+
+pub struct WorldSnapshot {
+    pub epoch: u64,
+    pub items: Vec<LiteObj>, // for the selected GVK only in M0
+}
+```
+
+Notes:
+- Convert from `DynamicObject` to `LiteObj` once, at ingest.
+- Under `strip-managed-fields`, remove `.metadata.managedFields` immediately.
+
+---
+
+## Coalescer Sketch
+
+```rust
+pub struct Coalescer {
+    map: rustc_hash::FxHashMap<Uid, Delta>,
+    order: std::collections::VecDeque<Uid>,
+    cap: usize,
+    dropped: u64,
+}
+```
+
+- `push(delta)`: if new uid and full, pop_front → increment `dropped`; insert; else update.
+- `drain_for(ms)`: collect up to T milliseconds of arrivals or until empty.
+
+---
+
+## Ingest Loop
+
+- Single thread pulls batches from Coalescer, applies to `WorldBuilder`, then swaps snapshot.
+- Swap cadence goal: ≤ 50 ms in M0 (loose), we’ll tighten later.
+- On errors, log and continue; builder must be total (never panic on user data).
+
+---
+
+## CLI Specs (M0)
+
+- `orkactl discover`
+  - Output: one resource per line: `group/version • Kind • namespaced|cluster`
+- `orkactl ls group/version/kind --ns <ns>`
+  - Output: table of `NAMESPACE NAME AGE` (AGE as short human string).
+- `orkactl watch group/version/kind --ns <ns>`
+  - Output: `+` on add/update, `-` on delete, with `ns/name`.
+
+Examples:
+
+```
+$ orkactl discover
+apiextensions.k8s.io/v1 • CustomResourceDefinition • cluster
+cert-manager.io/v1 • Certificate • namespaced
+...
+
+$ orkactl ls cert-manager.io/v1/Certificate --ns prod
+NAMESPACE   NAME                 AGE
+prod        payments-cert        3d4h
+...
+
+$ orkactl watch cert-manager.io/v1/Certificate --ns prod
++ prod/payments-cert
+- prod/old-cert
+```
+
+---
+
+## Config & Defaults
+
+- Kubeconfig detection via `kube` defaults (env var first, then files).
+- Namespace default: current context namespace; override with `--ns`.
+- For M0 demos, if no CRDs present, fallback to a built-in (e.g., `v1/ConfigMap`).
+
+---
+
+## Performance Targets (M0)
+
+- Able to ingest and hold 5k objects with ≤ 200 MB RSS.
+- Coalescer never blocks producer; dropped counter visible.
+- List/print of snapshot under 30 ms for 5k entries (single thread).
+
+---
+
+## Risks & Mitigations
+
+- No CRDs in cluster → builtin fallback; document clearly.
+- RBAC incomplete → exit with a clear error and suggested `kubectl auth can-i` check.
+- Watch staleness → periodic relist; backoff on errors; resume from RV when possible.
+
+---
+
+## Definition of Done (M0)
+
+- `orkactl discover | ls | watch` work against a kind cluster and minikube.
+- Replay tests pass deterministically; unit tests cover coalescer and builder edge cases.
+- Swap-based reads are lock-free; no panics under malformed objects.
+- Documented flags and example sessions; short README in `crates/cli`.
+
+---
+
+## Implementation Order (Checklist)
+
+- [x] Workspace scaffold (`core`, `kubehub`, `store`, `cli`).
+- [x] Discovery prints all served resources.
+- [~] Select target GVK (`--prefer-crd`, fallback builtin). (Flag accepted; selection remains manual)
+- [x] Start watcher with periodic relist.
+- [x] Implement Coalescer with drops and metrics.
+- [x] WorldBuilder + ArcSwap snapshot; convert to `LiteObj`.
+- [x] `orkactl ls` from snapshot; `watch` prints changes.
+- [x] Replay tests + unit tests.
+- [x] Basic metrics/logging; graceful shutdown.
+
+> Keep it simple. If a feature wants more complexity, tell it to wait for M1.
+</file>
+
+<file path="MILESTONE-2.md">
+# Orka — Milestone 2 (Apply & Persistence)
+
+Goal: make edits real. Dry‑run and server‑side apply (SSA). Persist last‑applied snapshots in SQLite. Show minimal diffs. Keep it simple and fast.
+
+---
+
+## Scope (M2)
+
+- Apply engine: `--dry-run` and real SSA with `fieldManager="orka"`.
+- Validation: reuse M1 `jsonschema-validate` (optional feature), friendly errors.
+- Persistence: SQLite store for last‑applied (keep up to 3 per UID), optional schema cache.
+- Diff: minimal JSON/YAML diff vs live and vs last‑applied; human summary.
+- CLI: `edit -f file.yaml --dry-run|--apply`, `diff -f file.yaml`, `last-applied get`.
+
+Non‑goals (M2): RPC surface, UI, bulk imports, advanced 3‑way merging beyond SSA semantics, multi‑object transactions.
+
+Success = edit flows are reliable and predictable; last‑applied survives restarts; diffs are useful, not perfect.
+
+---
+
+## Architecture Slice
+
+```
+YAML  ──► Validate ──► Diff (live/last) ──► SSA (server)
+                           │                 │
+                           └──────── Persist ◄┘
+```
+
+Rules:
+
+- Always validate before apply if feature is enabled.
+- Always persist last‑applied after successful SSA, keeping the last 3.
+- Diffs are pragmatic: key additions/removals/changes; skip noisy managed fields.
+
+---
+
+## Workspace Additions (M2)
+
+- `crates/persist`: SQLite adapter (rusqlite), zstd blobs for YAML (optional feature).
+- `crates/apply`: dry‑run + SSA helpers, diff renderer, field pruning.
+- Extend `crates/cli`: `edit`, `diff`, `last-applied` subcommands.
+
+---
+
+## Minimal Types (M2)
+
+```rust
+// crates/persist
+pub struct LastApplied { pub uid: [u8;16], pub rv: String, pub ts: i64, pub yaml_zstd: Vec<u8> }
+pub trait Store { fn put_last(&self, la: LastApplied) -> Result<()>; fn get_last(&self, uid: [u8;16]) -> Result<Vec<LastApplied>>; }
+
+// crates/apply
+pub struct ApplyResult { pub dry_run: bool, pub applied: bool, pub new_rv: Option<String>, pub warnings: Vec<String>, pub summary: DiffSummary }
+pub struct DiffSummary { pub adds: usize, pub updates: usize, pub removes: usize }
+```
+
+---
+
+## CLI Specs (M2)
+
+- `orkactl edit -f file.yaml [--ns NS] [--dry-run | --apply] [--validate]`
+  - Output: diff summary (when `--dry-run`), or `applied rv=<rv>`.
+- `orkactl diff -f file.yaml [--ns NS]`
+  - Output: minimal diff vs live and vs last‑applied (two panes or sections).
+- `orkactl last-applied get <gvk> <name> [--ns NS] [--limit N]`
+  - Output: timestamps and RVs; `-o json` to dump payload if requested.
+
+Env:
+
+- `ORKA_DB_PATH` (default: `~/.orka/orka.db`)
+- `ORKA_ZSTD_LEVEL` (default: 3)
+
+---
+
+## Detailed Tasks
+
+1) Persistence
+- Schema: `last_applied(uid BLOB, rv TEXT, ts INTEGER, yaml BLOB)`; index on `(uid, ts DESC)`.
+- APIs: `put_last`, `get_last(uid, limit)`, basic migrations, corruption handling.
+
+2) Apply
+- Load live object; compute minimal diff (prune `managedFields`, timestamps).
+- Dry‑run: server `?dryRun=All`; render diff summary; no persist.
+- SSA: set `fieldManager=orka`, apply; on success persist last‑applied.
+
+3) CLI
+- `edit -f`: read from file/stdin; detect GVK, name, ns; options `--validate`, `--dry-run|--apply`.
+- `diff -f`: compare given YAML vs live and vs last‑applied (if present).
+- `last-applied get`: list recent entries for a resource.
+
+4) Tests
+- Unit: persist put/get/rotate; diff pruning; apply error mapping.
+- (Optional) Smoke: dry‑run flow behind feature flag requiring cluster.
+
+5) Observability
+- Counters: `apply_attempts`, `apply_ok`, `apply_err`, `apply_dry_ok`.
+- Histograms: `persist_put_ms`, `persist_get_ms`, `apply_latency_ms`.
+
+---
+
+## Performance Targets (M2)
+
+- Dry‑run p99 ≤ 150 ms (small/medium CRs).
+- Apply p99 ≤ 300 ms.
+- Persist ops p50 ≤ 2 ms; ≤ 5 ms p95.
+- DB size: ≤ 50 MB default cap; prune older than 3 entries per UID.
+
+---
+
+## Risks & Mitigations
+
+- RBAC / SSA denied → clear error messages; suggest `--dry-run`.
+- Drift vs last‑applied → show both live and last diffs; don’t block apply.
+- DB corruption → recreate DB; log and proceed without blocking applies.
+
+---
+
+## Definition of Done (M2)
+
+- `edit --dry-run` shows a sane diff; `edit --apply` succeeds and persists last‑applied (rotates to 3).
+- `diff -f` works without side effects.
+- Persist unit tests green; no panics on malformed input or DB issues.
+- Metrics visible; knobs documented.
+
+---
+
+## Implementation Order (Checklist)
+
+- [x] Add `crates/persist` (rusqlite + optional zstd), schema + APIs.
+- [x] Add `crates/apply`: dry‑run + SSA helpers; diff pruning/summary.
+- [x] Wire CLI: `edit`, `diff`, `last-applied` subcommands (+ JSON output).
+- [x] Integrate persist: save last‑applied after SSA; keep latest 3.
+- [x] Unit tests: persist (put/get/rotate).
+- [x] Unit tests: diff pruning; error mapping.
+- [x] Docs: CLI usage + env in `crates/cli/README.md`.
+- [x] Metrics: counters + histograms for apply/persist paths.
+
+### Progress Notes
+
+- Persist: `SqliteStore` with table `last_applied(uid BLOB, rv TEXT, ts INTEGER, yaml BLOB)` and index `(uid, ts DESC)`; rotates to keep latest 3 per UID. Optional zstd compression behind feature flag.
+- Apply: SSA and server dry‑run with `fieldManager=orka`; prunes noisy fields (`managedFields`, `resourceVersion`, `status`, `generation`, `creationTimestamp`). Emits `DiffSummary { adds, updates, removes }`.
+- CLI: implemented `edit -f`, `diff -f`, and `last-applied get` (supports `-o json`); `--validate` is feature‑gated via `validate` feature enabling schema JSONSchema checks.
+- Metrics: `apply_attempts`, `apply_ok`, `apply_err`, `apply_dry_ok`; histograms `apply_latency_ms`, `persist_put_ms`, `persist_get_ms`.
+- Docs: updated usage and env in `crates/cli/README.md`.
+- Example: `examples/configmap.yaml` for quick dry‑run/apply.
+
+> Do the simplest thing that works. If it’s not critical for end‑to‑end edits, it waits.
+</file>
+
+<file path="crates/cli/README.md">
+# orkactl (Milestone 2)
+
+CLI for Orka’s in-memory backend, with schema discovery for CRDs and a lightweight RAM search index. Commands use an in-process backend and the Kubernetes API via your current kubeconfig.
+
+## Commands
+
+- `orkactl discover`: list served resources (including CRDs)
+- `orkactl ls <group/version/kind> [--ns <ns>]`: list objects from the latest snapshot
+- `orkactl watch <group/version/kind> [--ns <ns>]`: stream changes as +/- lines
+- `orkactl schema <group/version/kind>`: show CRD served version, printer columns, and projected paths
+- `orkactl search <group/version/kind> "query" [--ns <ns>] [--limit N] [--max-candidates N] [--min-score F] [--explain]`: search current snapshot
+- `orkactl edit -f file.yaml [--ns <ns>] [--dry-run|--apply] [--validate]`: dry-run or apply YAML via SSA
+- `orkactl diff -f file.yaml [--ns <ns>]`: show minimal diffs vs live and last-applied
+- `orkactl last-applied get <gvk> <name> [--ns <ns>] [--limit N] [-o json]`: inspect persisted last-applied snapshots
+
+## Examples
+
+```
+$ orkactl discover
+apiextensions.k8s.io/v1 • CustomResourceDefinition • cluster
+v1 • ConfigMap • namespaced
+...
+
+$ ORKA_LOG=info ORKA_QUEUE_CAP=4096 orkactl ls v1/ConfigMap --ns default
+NAMESPACE   NAME                 AGE
+default     kube-root-ca.crt     3d4h
+
+$ orkactl schema cert-manager.io/v1/Certificate
+served: v1
+printer-cols: Ready, Age, SecretName
+projected: spec.dnsNames[0], status.conditions[?type==Ready].status, ...
+
+$ orkactl search cert-manager.io/v1/Certificate "ns:prod k:Certificate payments" --limit 20
+KIND      NAMESPACE/NAME                SCORE
+Certificate  prod/payments-cert         0.86
+
+$ orkactl watch v1/ConfigMap --ns default
++ default/my-app-config
+- default/old-config
+
+$ orkactl edit -f cm.yaml --dry-run
+dry-run: +3 ~1 -0
+
+$ orkactl edit -f cm.yaml --apply
+applied rv=12345
+
+$ orkactl diff -f cm.yaml
+vs live: +2 ~0 -1
+vs last: +1 ~1 -0
+
+$ orkactl last-applied get v1/ConfigMap my-cm --ns default -o json
+[
+  { "ts": 1700000000, "rv": "12345", "yaml": "apiVersion: v1..." }
+]
+```
+
+## Search Grammar
+
+Typed filters combine with free text. Examples:
+
+- `ns:<name>`: namespace filter
+- `k:<Kind>` and `g:<group>`: restrict to a specific Kind or API group
+- `label:<key>=<value>` or `label:<key>`: label value or existence
+- `anno:<key>=<value>` or `anno:<key>`: annotation value or existence
+- `field:<json.path>=<value>`: projected field exact match (paths from `schema`)
+
+Free text is fuzzy-matched over `NAMESPACE/NAME` plus projected fields.
+
+## Environment
+
+- `ORKA_LOG`: tracing filter (e.g., `info`, `debug`, per-target is supported)
+- `ORKA_QUEUE_CAP`: bounded channel capacity for deltas (default 2048)
+- `ORKA_RELIST_SECS`: periodic relist interval for watchers (default 300)
+- `ORKA_METRICS_ADDR`: if set to `host:port`, exposes Prometheus metrics at `/metrics`
+- `ORKA_SEARCH_LIMIT`: default `--limit` for `search` (overridden by CLI)
+- `ORKA_SEARCH_MAX_CANDIDATES`: cap candidate set size after typed filters
+- `ORKA_SEARCH_MIN_SCORE`: minimum fuzzy score to include a hit
+- `ORKA_DB_PATH`: path to SQLite DB (default: `~/.orka/orka.db`)
+- `ORKA_ZSTD_LEVEL`: compression level for persisted YAML when built with `zstd` feature (default: 3)
+
+## Notes
+
+- Requires access to a Kubernetes cluster and RBAC to list/watch the selected kind.
+- JSON output is available with `-o json` for most commands.
+- Validation (YAML → JSON → JSON Schema) is available with CLI feature `validate` which enables schema crate feature `jsonschema-validate`.
+</file>
+
+<file path="crates/search/src/lib.rs">
+//! Orka search (Milestone 1 stub): lightweight in-RAM index and query over LiteObj.
+
+#![forbid(unsafe_code)]
+
+use fuzzy_matcher::skim::SkimMatcherV2;
+use fuzzy_matcher::FuzzyMatcher;
+use orka_core::WorldSnapshot;
+use std::collections::HashMap;
+
+pub type DocId = u32;
+
+#[derive(Debug, Clone, Copy)]
+pub struct Hit { pub doc: DocId, pub score: f32 }
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct SearchDebugInfo {
+    pub total: usize,
+    pub after_ns: usize,
+    pub after_label_keys: usize,
+    pub after_labels: usize,
+    pub after_anno_keys: usize,
+    pub after_annos: usize,
+    pub after_fields: usize,
+}
+
+pub struct Index {
+    texts: Vec<String>,      // by DocId
+    namespaces: Vec<String>, // empty string for cluster-scoped
+    names: Vec<String>,      // object names by DocId
+    uids: Vec<[u8; 16]>,     // object UIDs by DocId
+    projected: Vec<Vec<(u32, String)>>,
+    field_ids: HashMap<String, u32>, // json_path -> id
+    label_post: HashMap<String, Vec<usize>>, // "key=value" -> doc ids (sorted)
+    anno_post: HashMap<String, Vec<usize>>,  // "key=value" -> doc ids (sorted)
+    label_key_post: HashMap<String, Vec<usize>>, // key -> doc ids
+    anno_key_post: HashMap<String, Vec<usize>>,  // key -> doc ids
+    // Single-GVK metadata useful for typed filters (k:, g:) in M1
+    kind: Option<String>,  // lowercased kind
+    group: Option<String>, // lowercased group (empty for core)
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+pub struct SearchOpts {
+    pub max_candidates: Option<usize>,
+    pub min_score: Option<f32>,
+}
+
+impl Index {
+    pub fn build_from_snapshot(snap: &WorldSnapshot) -> Self {
+        Self::build_from_snapshot_with_meta(snap, None, None, None)
+    }
+    fn intersect_sorted(a: &Vec<usize>, b: &Vec<usize>) -> Vec<usize> {
+        let mut i = 0usize;
+        let mut j = 0usize;
+        let mut out = Vec::new();
+        while i < a.len() && j < b.len() {
+            match a[i].cmp(&b[j]) {
+                std::cmp::Ordering::Less => i += 1,
+                std::cmp::Ordering::Greater => j += 1,
+                std::cmp::Ordering::Equal => { out.push(a[i]); i += 1; j += 1; }
+            }
+        }
+        out
+    }
+
+    pub fn build_from_snapshot_with_fields(
+        snap: &WorldSnapshot,
+        fields: Option<&[(String, u32)]>,
+    ) -> Self {
+        Self::build_from_snapshot_with_meta(snap, fields, None, None)
+    }
+
+    /// Build index, optionally providing field path ids and single-GVK metadata (kind, group).
+    pub fn build_from_snapshot_with_meta(
+        snap: &WorldSnapshot,
+        fields: Option<&[(String, u32)]>,
+        kind: Option<&str>,
+        group: Option<&str>,
+    ) -> Self {
+        let mut texts = Vec::with_capacity(snap.items.len());
+        let mut namespaces = Vec::with_capacity(snap.items.len());
+        let mut names = Vec::with_capacity(snap.items.len());
+        let mut uids = Vec::with_capacity(snap.items.len());
+        let mut projected = Vec::with_capacity(snap.items.len());
+        let mut field_ids: HashMap<String, u32> = HashMap::new();
+        let mut label_post: HashMap<String, Vec<usize>> = HashMap::new();
+        let mut anno_post: HashMap<String, Vec<usize>> = HashMap::new();
+        let mut label_key_post: HashMap<String, Vec<usize>> = HashMap::new();
+        let mut anno_key_post: HashMap<String, Vec<usize>> = HashMap::new();
+        if let Some(pairs) = fields {
+            for (k, v) in pairs.iter() { field_ids.insert(k.clone(), *v); }
+        }
+        // Optional limit for postings per key to avoid cardinality explosions
+        let postings_cap: Option<usize> = std::env::var("ORKA_MAX_POSTINGS_PER_KEY").ok().and_then(|s| s.parse::<usize>().ok());
+        let mut truncated_keys: usize = 0;
+
+        for (i, o) in snap.items.iter().enumerate() {
+            let ns = o.namespace.as_deref().unwrap_or("");
+            let mut display = String::new();
+            if !ns.is_empty() { display.push_str(ns); display.push('/'); }
+            display.push_str(&o.name);
+            // Include projected values if any
+            if !o.projected.is_empty() {
+                display.push(' ');
+                for (_id, val) in o.projected.iter() {
+                    display.push_str(val);
+                    display.push(' ');
+                }
+            }
+            texts.push(display);
+            namespaces.push(ns.to_string());
+            names.push(o.name.clone());
+            uids.push(o.uid);
+            projected.push(o.projected.iter().map(|(id, val)| (*id, val.clone())).collect());
+
+            // labels/annotations postings
+            for (k, v) in o.labels.iter() {
+                let key = format!("{}={}", k, v);
+                let vec = label_post.entry(key).or_default();
+                if let Some(cap) = postings_cap { if vec.len() >= cap { truncated_keys += 1; } else { vec.push(i); } } else { vec.push(i); }
+                let veck = label_key_post.entry(k.clone()).or_default();
+                if let Some(cap) = postings_cap { if veck.len() < cap { veck.push(i); } } else { veck.push(i); }
+            }
+            for (k, v) in o.annotations.iter() {
+                let key = format!("{}={}", k, v);
+                let vec = anno_post.entry(key).or_default();
+                if let Some(cap) = postings_cap { if vec.len() >= cap { truncated_keys += 1; } else { vec.push(i); } } else { vec.push(i); }
+                let veck = anno_key_post.entry(k.clone()).or_default();
+                if let Some(cap) = postings_cap { if veck.len() < cap { veck.push(i); } } else { veck.push(i); }
+            }
+        }
+        // postings are naturally sorted by increasing i
+        metrics::gauge!("index_docs", snap.items.len() as f64);
+        // Rough size estimate for index
+        let mut approx_bytes: usize = 0;
+        for t in &texts { approx_bytes += t.len(); }
+        for ns in &namespaces { approx_bytes += ns.len(); }
+        for n in &names { approx_bytes += n.len(); }
+        for (_k, v) in &field_ids { approx_bytes += std::mem::size_of_val(v); }
+        for (_k, v) in &label_post { approx_bytes += v.len() * std::mem::size_of::<usize>(); }
+        for (_k, v) in &anno_post { approx_bytes += v.len() * std::mem::size_of::<usize>(); }
+        metrics::gauge!("index_bytes", approx_bytes as f64);
+        metrics::gauge!("index_postings_truncated_keys", truncated_keys as f64);
+        let me = Self {
+            texts,
+            namespaces,
+            names,
+            uids,
+            projected,
+            field_ids,
+            label_post,
+            anno_post,
+            label_key_post,
+            anno_key_post,
+            kind: kind.map(|s| s.to_ascii_lowercase()),
+            group: group.map(|s| s.to_ascii_lowercase()),
+        };
+        // Approximate index bytes: sum string lengths and posting sizes
+        let mut bytes: usize = 0;
+        bytes += me.texts.iter().map(|s| s.len()).sum::<usize>();
+        bytes += me.namespaces.iter().map(|s| s.len()).sum::<usize>();
+        bytes += me.names.iter().map(|s| s.len()).sum::<usize>();
+        bytes += me.projected.iter().map(|v| v.iter().map(|(_id, s)| s.len()).sum::<usize>()).sum::<usize>();
+        bytes += me.field_ids.iter().map(|(k, _)| k.len() + std::mem::size_of::<u32>()).sum::<usize>();
+        bytes += me.label_post.iter().map(|(k, v)| k.len() + v.len() * std::mem::size_of::<usize>()).sum::<usize>();
+        bytes += me.anno_post.iter().map(|(k, v)| k.len() + v.len() * std::mem::size_of::<usize>()).sum::<usize>();
+        bytes += me.label_key_post.iter().map(|(k, v)| k.len() + v.len() * std::mem::size_of::<usize>()).sum::<usize>();
+        bytes += me.anno_key_post.iter().map(|(k, v)| k.len() + v.len() * std::mem::size_of::<usize>()).sum::<usize>();
+        metrics::gauge!("index_bytes", bytes as f64);
+        me
+    }
+
+    pub fn search(&self, q: &str, limit: usize) -> Vec<Hit> {
+        self.search_with_debug_opts(q, limit, SearchOpts::default()).0
+    }
+
+    pub fn search_with_debug(&self, q: &str, limit: usize) -> (Vec<Hit>, SearchDebugInfo) {
+        self.search_with_debug_opts(q, limit, SearchOpts::default())
+    }
+
+    pub fn search_with_debug_opts(&self, q: &str, limit: usize, opts: SearchOpts) -> (Vec<Hit>, SearchDebugInfo) {
+        let started = std::time::Instant::now();
+        let matcher = SkimMatcherV2::default();
+        let mut hits: Vec<Hit> = Vec::new();
+        // Simple typed filters: ns:NAME, field:json.path=value, label:key=value, anno:key=value
+        let mut ns_filter: Option<&str> = None;
+        let mut kind_filters: Vec<String> = Vec::new();
+        let mut group_filters: Vec<String> = Vec::new();
+        let mut field_filters: Vec<(u32, String)> = Vec::new();
+        let mut label_filters: Vec<String> = Vec::new();
+        let mut anno_filters: Vec<String> = Vec::new();
+        let mut label_key_filters: Vec<String> = Vec::new();
+        let mut anno_key_filters: Vec<String> = Vec::new();
+        let mut free_terms: Vec<&str> = Vec::new();
+        for tok in q.split_whitespace() {
+            if let Some(rest) = tok.strip_prefix("ns:") { ns_filter = Some(rest); continue; }
+            if let Some(rest) = tok.strip_prefix("k:") { if !rest.is_empty() { kind_filters.push(rest.to_string()); continue; } }
+            if let Some(rest) = tok.strip_prefix("g:") { if !rest.is_empty() { group_filters.push(rest.to_string()); continue; } }
+            if let Some(rest) = tok.strip_prefix("field:") {
+                if let Some(eq) = rest.find('=') {
+                    let path = &rest[..eq];
+                    let val = &rest[eq+1..];
+                    if let Some(id) = self.field_ids.get(path) {
+                        field_filters.push((*id, val.to_string()));
+                        continue;
+                    }
+                }
+            }
+            if let Some(rest) = tok.strip_prefix("label:") {
+                if rest.contains('=') { label_filters.push(rest.to_string()); continue; }
+                if !rest.is_empty() { label_key_filters.push(rest.to_string()); continue; }
+            }
+            if let Some(rest) = tok.strip_prefix("anno:") {
+                if rest.contains('=') { anno_filters.push(rest.to_string()); continue; }
+                if !rest.is_empty() { anno_key_filters.push(rest.to_string()); continue; }
+            }
+            free_terms.push(tok);
+        }
+        let free_q = free_terms.join(" ");
+
+        // Apply single-GVK kind/group filters early. Mismatch => no hits.
+        if !kind_filters.is_empty() {
+            let cur = self.kind.as_deref().unwrap_or("");
+            let ok = kind_filters.iter().any(|k| k.eq_ignore_ascii_case(cur));
+            if !ok { return (Vec::new(), SearchDebugInfo { total: self.texts.len(), after_ns: 0, after_label_keys: 0, after_labels: 0, after_anno_keys: 0, after_annos: 0, after_fields: 0 }); }
+        }
+        if !group_filters.is_empty() {
+            let cur = self.group.as_deref().unwrap_or("");
+            let ok = group_filters.iter().any(|g| g.eq_ignore_ascii_case(cur));
+            if !ok { return (Vec::new(), SearchDebugInfo { total: self.texts.len(), after_ns: 0, after_label_keys: 0, after_labels: 0, after_anno_keys: 0, after_annos: 0, after_fields: 0 }); }
+        }
+        // Seed candidates
+        let mut candidates: Vec<usize> = if let Some(ns) = ns_filter {
+            (0..self.texts.len()).filter(|i| self.namespaces.get(*i).map(|s| s == ns).unwrap_or(false)).collect()
+        } else {
+            (0..self.texts.len()).collect()
+        };
+        let total = self.texts.len();
+        let after_ns = candidates.len();
+        metrics::histogram!("search_candidates_seed", after_ns as f64);
+
+        // Intersect label key existence filters
+        for key in label_key_filters {
+            if let Some(post) = self.label_key_post.get(&key) {
+                candidates = Self::intersect_sorted(&candidates, post);
+            } else {
+                let dbg = SearchDebugInfo { total, after_ns, after_label_keys: 0, after_labels: 0, after_anno_keys: 0, after_annos: 0, after_fields: 0 };
+                return (Vec::new(), dbg);
+            }
+        }
+        let after_label_keys = candidates.len();
+
+        // Intersect label value filters
+        for key in label_filters {
+            if let Some(post) = self.label_post.get(&key) {
+                candidates = Self::intersect_sorted(&candidates, post);
+            } else {
+                let dbg = SearchDebugInfo { total, after_ns, after_label_keys, after_labels: 0, after_anno_keys: 0, after_annos: 0, after_fields: 0 };
+                return (Vec::new(), dbg);
+            }
+        }
+        let after_labels = candidates.len();
+
+        // Intersect anno key existence filters
+        for key in anno_key_filters {
+            if let Some(post) = self.anno_key_post.get(&key) {
+                candidates = Self::intersect_sorted(&candidates, post);
+            } else {
+                let dbg = SearchDebugInfo { total, after_ns, after_label_keys, after_labels, after_anno_keys: 0, after_annos: 0, after_fields: 0 };
+                return (Vec::new(), dbg);
+            }
+        }
+        let after_anno_keys = candidates.len();
+
+        // Intersect anno value filters
+        for key in anno_filters {
+            if let Some(post) = self.anno_post.get(&key) {
+                candidates = Self::intersect_sorted(&candidates, post);
+            } else {
+                let dbg = SearchDebugInfo { total, after_ns, after_label_keys, after_labels, after_anno_keys, after_annos: 0, after_fields: 0 };
+                return (Vec::new(), dbg);
+            }
+        }
+        let after_annos = candidates.len();
+
+        // Cap candidate set size if configured
+        if let Some(maxc) = opts.max_candidates {
+            if candidates.len() > maxc { candidates.truncate(maxc); }
+        }
+        metrics::histogram!("search_candidates", candidates.len() as f64);
+
+        // Apply field filters and optional fuzzy
+        let mut passed_fields: usize = 0;
+        'doc: for i in candidates.into_iter() {
+            for (pid, ref val) in field_filters.iter() {
+                let ok = self.projected.get(i).map(|vec| vec.iter().any(|(id, v)| id == pid && v == val)).unwrap_or(false);
+                if !ok { continue 'doc; }
+            }
+            passed_fields += 1;
+            if free_q.is_empty() {
+                let score = 0.0f32;
+                if opts.min_score.map(|m| score >= m).unwrap_or(true) {
+                    hits.push(Hit { doc: i as u32, score });
+                }
+            } else if let Some(score_i) = matcher.fuzzy_match(&self.texts[i], &free_q) {
+                let score = score_i as f32;
+                if opts.min_score.map(|m| score >= m).unwrap_or(true) {
+                    hits.push(Hit { doc: i as u32, score });
+                }
+            }
+        }
+        hits.sort_by(|a, b| {
+            b.score
+                .total_cmp(&a.score)
+                .then_with(|| {
+                    let an = &self.names[a.doc as usize];
+                    let bn = &self.names[b.doc as usize];
+                    an.cmp(bn)
+                })
+                .then_with(|| {
+                    let au = &self.uids[a.doc as usize];
+                    let bu = &self.uids[b.doc as usize];
+                    au.cmp(bu)
+                })
+        });
+        hits.truncate(limit);
+        let dbg = SearchDebugInfo { total, after_ns, after_label_keys, after_labels, after_anno_keys, after_annos, after_fields: passed_fields };
+        let elapsed = started.elapsed();
+        metrics::histogram!("search_eval_ms", elapsed.as_secs_f64() * 1_000.0);
+        (hits, dbg)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use orka_core::{LiteObj, WorldSnapshot, Uid};
+    
+
+    fn uid(n: u8) -> Uid { let mut u = [0u8; 16]; u[0] = n; u }
+
+    fn obj(
+        id: u8,
+        name: &str,
+        ns: Option<&str>,
+        labels: &[(&str, &str)],
+        annos: &[(&str, &str)],
+        projected: &[(u32, &str)],
+        ts: i64,
+    ) -> LiteObj {
+        LiteObj {
+            uid: uid(id),
+            namespace: ns.map(|s| s.to_string()),
+            name: name.to_string(),
+            creation_ts: ts,
+            projected: projected
+                .iter()
+                .map(|(k, v)| (*k, (*v).to_string()))
+                .collect(),
+            labels: labels.iter().map(|(k, v)| ((*k).to_string(), (*v).to_string())).collect(),
+            annotations: annos.iter().map(|(k, v)| ((*k).to_string(), (*v).to_string())).collect(),
+        }
+    }
+
+    fn snap(items: Vec<LiteObj>) -> WorldSnapshot { WorldSnapshot { epoch: 1, items } }
+
+    #[test]
+    fn ns_filter_works() {
+        let s = snap(vec![
+            obj(1, "a", Some("default"), &[], &[], &[], 0),
+            obj(2, "b", Some("prod"), &[], &[], &[], 0),
+        ]);
+        let idx = Index::build_from_snapshot_with_meta(&s, None, Some("ConfigMap"), Some(""));
+        let (hits, _dbg) = idx.search_with_debug("ns:default", 10);
+        assert_eq!(hits.len(), 1);
+        assert_eq!(s.items[hits[0].doc as usize].name, "a");
+    }
+
+    #[test]
+    fn label_and_anno_filters() {
+        let s = snap(vec![
+            obj(1, "a", Some("default"), &[("app","web"), ("tier","frontend")], &[("team","core")], &[], 0),
+            obj(2, "b", Some("default"), &[("app","api")], &[("team","platform")], &[], 0),
+        ]);
+        let idx = Index::build_from_snapshot(&s);
+        let (hits, _dbg) = idx.search_with_debug("label:app=web", 10);
+        assert_eq!(hits.len(), 1);
+        assert_eq!(s.items[hits[0].doc as usize].name, "a");
+
+        let (hits2, _dbg2) = idx.search_with_debug("label:app", 10);
+        assert_eq!(hits2.len(), 2, "label key existence should match both items");
+
+        let (hits3, _dbg3) = idx.search_with_debug("anno:team=platform", 10);
+        assert_eq!(hits3.len(), 1);
+        assert_eq!(s.items[hits3[0].doc as usize].name, "b");
+    }
+
+    #[test]
+    fn field_filter_matches_projected() {
+        let s = snap(vec![
+            obj(1, "a", Some("default"), &[], &[], &[(1, "x"), (2, "y")], 0),
+            obj(2, "b", Some("default"), &[], &[], &[(1, "z")], 0),
+        ]);
+        let pairs = vec![("spec.foo".to_string(), 1u32), ("spec.bar".to_string(), 2u32)];
+        let idx = Index::build_from_snapshot_with_meta(&s, Some(&pairs), Some("ConfigMap"), Some(""));
+        let (hits, _dbg) = idx.search_with_debug("field:spec.foo=x", 10);
+        assert_eq!(hits.len(), 1);
+        assert_eq!(s.items[hits[0].doc as usize].name, "a");
+
+        let (hits2, _dbg2) = idx.search_with_debug("field:spec.bar=y", 10);
+        assert_eq!(hits2.len(), 1);
+        assert_eq!(s.items[hits2[0].doc as usize].name, "a");
+
+        let (hits3, _dbg3) = idx.search_with_debug("field:spec.foo=notfound", 10);
+        assert_eq!(hits3.len(), 0);
+    }
+
+    #[test]
+    fn tie_break_by_name_then_uid() {
+        let s = snap(vec![
+            obj(2, "alpha", Some("b"), &[], &[], &[], 0),
+            obj(1, "alpha", Some("a"), &[], &[], &[], 0),
+            obj(3, "beta", Some("a"), &[], &[], &[], 0),
+        ]);
+        // No free text or filters -> all items, score 0.0 -> sort by name asc then uid asc
+        let idx = Index::build_from_snapshot(&s);
+        let (hits, _dbg) = idx.search_with_debug("", 10);
+        let ordered: Vec<(String, [u8; 16])> = hits
+            .iter()
+            .map(|h| (s.items[h.doc as usize].name.clone(), s.items[h.doc as usize].uid))
+            .collect();
+        assert_eq!(ordered[0].0, "alpha");
+        assert_eq!(ordered[1].0, "alpha");
+        // uid with first byte 1 should come before 2 for same name
+        assert_eq!(ordered[0].1[0], 1);
+        assert_eq!(ordered[1].1[0], 2);
+        assert_eq!(ordered[2].0, "beta");
+    }
+
+    #[test]
+    fn kind_and_group_filters_gate_results() {
+        let s = snap(vec![
+            obj(1, "a", Some("default"), &[], &[], &[], 0),
+            obj(2, "b", Some("default"), &[], &[], &[], 0),
+        ]);
+        let idx = Index::build_from_snapshot_with_meta(&s, None, Some("ConfigMap"), Some(""));
+        assert_eq!(idx.search("k:ConfigMap", 10).len(), 2);
+        assert_eq!(idx.search("k:Pod", 10).len(), 0);
+        assert_eq!(idx.search("g:apps", 10).len(), 0);
+    }
+}
+
+#[cfg(test)]
+mod opts_tests {
+    use super::*;
+    use orka_core::{LiteObj, WorldSnapshot, Uid};
+
+    fn uid(n: u8) -> Uid { let mut u = [0u8; 16]; u[0] = n; u }
+    fn obj(name: &str, ns: Option<&str>, projected: &[(u32, &str)]) -> LiteObj {
+        LiteObj {
+            uid: uid(1),
+            namespace: ns.map(|s| s.to_string()),
+            name: name.to_string(),
+            creation_ts: 0,
+            projected: projected.iter().map(|(k, v)| (*k, (*v).to_string())).collect(),
+            labels: smallvec::SmallVec::new(),
+            annotations: smallvec::SmallVec::new(),
+        }
+    }
+    fn snap(items: Vec<LiteObj>) -> WorldSnapshot { WorldSnapshot { epoch: 1, items } }
+
+    #[test]
+    fn max_candidates_caps_evaluation() {
+        let s = snap(vec![
+            obj("alpha", Some("ns"), &[]),
+            obj("beta", Some("ns"), &[]),
+            obj("gamma", Some("ns"), &[]),
+        ]);
+        let idx = Index::build_from_snapshot(&s);
+        let (hits, _dbg) = idx.search_with_debug_opts("ns:ns", 10, SearchOpts { max_candidates: Some(2), min_score: None });
+        // with no free text and no field filters, all pass, but candidate cap truncates prior to ranking
+        assert_eq!(hits.len(), 2);
+    }
+
+    #[test]
+    fn min_score_filters_low_scores() {
+        let s = snap(vec![obj("alpha", Some("default"), &[])]);
+        let idx = Index::build_from_snapshot(&s);
+        // Free text "zzz" should not match; with min_score = 1.0, no hits
+        let (hits, _dbg) = idx.search_with_debug_opts("zzz", 10, SearchOpts { max_candidates: None, min_score: Some(1.0) });
+        assert_eq!(hits.len(), 0);
+    }
+}
+</file>
+
+<file path="crates/store/src/lib.rs">
+//! Orka store (Milestone 0): Coalescer and World builder stubs
+
+#![forbid(unsafe_code)]
+
+use std::collections::VecDeque;
+
+use orka_core::{Delta, LiteObj, WorldSnapshot, Projector};
+use rustc_hash::FxHashMap;
+use tokio::sync::{mpsc, watch};
+use tracing::{debug, info};
+use arc_swap::ArcSwap;
+use std::sync::Arc;
+use metrics::{counter, gauge, histogram};
+
+/// Coalescing queue keyed by UID with FIFO order and fixed capacity.
+pub struct Coalescer {
+    map: FxHashMap<orka_core::Uid, Delta>,
+    order: VecDeque<orka_core::Uid>,
+    cap: usize,
+    dropped: u64,
+}
+
+impl Coalescer {
+    pub fn with_capacity(cap: usize) -> Self {
+        Self { map: FxHashMap::default(), order: VecDeque::new(), cap, dropped: 0 }
+    }
+
+    pub fn len(&self) -> usize { self.map.len() }
+    pub fn dropped(&self) -> u64 { self.dropped }
+
+    pub fn push(&mut self, d: Delta) {
+        let uid = d.uid;
+        if !self.map.contains_key(&uid) {
+            if self.order.len() >= self.cap {
+                if let Some(old) = self.order.pop_front() {
+                    self.map.remove(&old);
+                    self.dropped += 1;
+                    counter!("coalescer_dropped_total", 1);
+                }
+            }
+            self.order.push_back(uid);
+        }
+        self.map.insert(uid, d);
+        gauge!("coalescer_len", self.map.len() as f64);
+    }
+
+    /// Drain all currently coalesced deltas (simple version for M0).
+    pub fn drain_ready(&mut self) -> Vec<Delta> {
+        let mut out = Vec::with_capacity(self.order.len());
+        while let Some(uid) = self.order.pop_front() {
+            if let Some(d) = self.map.remove(&uid) {
+                out.push(d);
+            }
+        }
+        gauge!("coalescer_len", self.map.len() as f64);
+        out
+    }
+}
+
+/// Builds WorldSnapshot instances from deltas.
+pub struct WorldBuilder {
+    epoch: u64,
+    items: Vec<LiteObj>,
+    projector: Option<std::sync::Arc<dyn Projector + Send + Sync>>,
+    max_labels_per_obj: Option<usize>,
+    max_annos_per_obj: Option<usize>,
+}
+
+impl WorldBuilder {
+    pub fn new() -> Self { Self::with_projector(None) }
+
+    pub fn with_projector(projector: Option<std::sync::Arc<dyn Projector + Send + Sync>>) -> Self {
+        let max_labels_per_obj = std::env::var("ORKA_MAX_LABELS_PER_OBJ").ok().and_then(|s| s.parse::<usize>().ok());
+        let max_annos_per_obj = std::env::var("ORKA_MAX_ANNOS_PER_OBJ").ok().and_then(|s| s.parse::<usize>().ok());
+        Self { epoch: 0, items: Vec::new(), projector, max_labels_per_obj, max_annos_per_obj }
+    }
+
+    /// Apply a batch of deltas and update in-memory items.
+    /// M0: naive implementation; to be replaced with UID-indexed map.
+    pub fn apply(&mut self, batch: Vec<Delta>) {
+        for d in batch {
+            match d.kind {
+                orka_core::DeltaKind::Applied => {
+                    // Convert raw to LiteObj (placeholder)
+                    if let Some(meta) = d.raw.get("metadata") {
+                        let name = meta.get("name").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                        let namespace = meta.get("namespace").and_then(|v| v.as_str()).map(|s| s.to_string());
+                        let creation_ts = meta
+                            .get("creationTimestamp")
+                            .and_then(|v| v.as_str())
+                            .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
+                            .map(|dt| dt.timestamp())
+                            .unwrap_or(0);
+                        let projected = if let Some(p) = &self.projector { p.project(&d.raw) } else { smallvec::SmallVec::<[(u32, String); 8]>::new() };
+                        // Extract labels and annotations from metadata
+                        let mut labels = smallvec::SmallVec::<[(String, String); 8]>::new();
+                        let mut annotations = smallvec::SmallVec::<[(String, String); 4]>::new();
+                        if let Some(meta_obj) = d.raw.get("metadata").and_then(|m| m.as_object()) {
+                            if let Some(lbls) = meta_obj.get("labels").and_then(|m| m.as_object()) {
+                                for (k, v) in lbls.iter() {
+                                    if let Some(val) = v.as_str() { labels.push((k.clone(), val.to_string())); }
+                                    if let Some(cap) = self.max_labels_per_obj { if labels.len() >= cap { break; } }
+                                }
+                            }
+                            if let Some(ann) = meta_obj.get("annotations").and_then(|m| m.as_object()) {
+                                for (k, v) in ann.iter() {
+                                    if let Some(val) = v.as_str() { annotations.push((k.clone(), val.to_string())); }
+                                    if let Some(cap) = self.max_annos_per_obj { if annotations.len() >= cap { break; } }
+                                }
+                            }
+                        }
+
+                        let lo = LiteObj { uid: d.uid, namespace, name, creation_ts, projected, labels, annotations };
+                        // Replace existing by uid (linear scan for M0 stub)
+                        if let Some(idx) = self.items.iter().position(|x| x.uid == d.uid) {
+                            self.items[idx] = lo;
+                        } else {
+                            self.items.push(lo);
+                        }
+                    }
+                }
+                orka_core::DeltaKind::Deleted => {
+                    self.items.retain(|x| x.uid != d.uid);
+                }
+            }
+        }
+        self.epoch = self.epoch.saturating_add(1);
+    }
+
+    pub fn freeze(&self) -> std::sync::Arc<WorldSnapshot> {
+        std::sync::Arc::new(WorldSnapshot { epoch: self.epoch, items: self.items.clone() })
+    }
+}
+
+/// Handle for readers to access the current snapshot and subscribe to swaps.
+pub struct BackendHandle {
+    snap: Arc<ArcSwap<WorldSnapshot> >,
+    epoch_rx: watch::Receiver<u64>,
+}
+
+impl BackendHandle {
+    pub fn current(&self) -> std::sync::Arc<WorldSnapshot> { self.snap.load_full() }
+    pub fn subscribe_epoch(&self) -> watch::Receiver<u64> { self.epoch_rx.clone() }
+}
+
+/// Spawn an ingest loop consuming deltas and swapping snapshots. Returns a sender for deltas and a handle for reads.
+pub fn spawn_ingest(cap: usize) -> (mpsc::Sender<Delta>, BackendHandle) {
+    spawn_ingest_with_projector(cap, None)
+}
+
+/// Variant that accepts an optional projector used during LiteObj shaping.
+pub fn spawn_ingest_with_projector(
+    cap: usize,
+    projector: Option<std::sync::Arc<dyn Projector + Send + Sync>>,
+) -> (mpsc::Sender<Delta>, BackendHandle) {
+    // Number of shards for ingest/build; default 1
+    let shards: usize = std::env::var("ORKA_SHARDS").ok().and_then(|s| s.parse().ok()).unwrap_or(1).max(1);
+
+    let (tx, mut rx) = mpsc::channel::<Delta>(cap);
+    let snap = Arc::new(ArcSwap::from_pointee(WorldSnapshot::default()));
+    let (epoch_tx, epoch_rx) = watch::channel(0u64);
+    let snap_clone = Arc::clone(&snap);
+
+    tokio::spawn(async move {
+        // Build shard workers
+        struct Shard { coalescer: Coalescer, builder: WorldBuilder }
+        let mut shard_workers: Vec<Shard> = (0..shards)
+            .map(|_| Shard { coalescer: Coalescer::with_capacity(cap), builder: WorldBuilder::with_projector(projector.clone()) })
+            .collect();
+
+        let mut ticker = tokio::time::interval(std::time::Duration::from_millis(8));
+
+        // Namespace bucket function (simple hash modulo shards)
+        fn ns_bucket(d: &Delta, shards: usize) -> usize {
+            if shards <= 1 { return 0; }
+            let ns = d.raw
+                .get("metadata")
+                .and_then(|m| m.get("namespace"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            // A tiny FNV-1a style hash
+            let mut h: u64 = 0xcbf29ce484222325;
+            for b in ns.as_bytes() { h ^= *b as u64; h = h.wrapping_mul(0x100000001b3); }
+            (h as usize) % shards
+        }
+
+        let mut global_epoch: u64 = 0;
+
+        loop {
+            tokio::select! {
+                maybe = rx.recv() => {
+                    match maybe {
+                        Some(d) => {
+                            let idx = ns_bucket(&d, shards);
+                            shard_workers[idx].coalescer.push(d);
+                        }
+                        None => {
+                            debug!("delta channel closed; draining shards and exiting ingest loop");
+                            let mut any = false;
+                            for (i, sh) in shard_workers.iter_mut().enumerate() {
+                                let batch = sh.coalescer.drain_ready();
+                                if !batch.is_empty() {
+                                    let drained = batch.len();
+                                    let dropped = sh.coalescer.dropped();
+                                    sh.builder.apply(batch);
+                                    any = true;
+                                    debug!(shard = i, drained, dropped, "ingest applied batch (final)");
+                                    histogram!("ingest_batch_size", drained as f64);
+                                }
+                            }
+                            if any {
+                                global_epoch = global_epoch.saturating_add(1);
+                                // Merge items from all shards into a single snapshot
+                                let mut items: Vec<LiteObj> = Vec::new();
+                                for sh in shard_workers.iter() {
+                                    items.extend(sh.builder.items.clone());
+                                }
+                                let merged = WorldSnapshot { epoch: global_epoch, items };
+                                snap_clone.store(Arc::new(merged));
+                                let _ = epoch_tx.send(global_epoch);
+                                gauge!("ingest_epoch", global_epoch as f64);
+                                let snap_loaded = snap_clone.load();
+                                gauge!("snapshot_items", snap_loaded.items.len() as f64);
+                                let approx = approx_snapshot_bytes(&snap_loaded);
+                                gauge!("snapshot_bytes", approx as f64);
+                            }
+                            break;
+                        }
+                    }
+                }
+                _ = ticker.tick() => {
+                    let mut any = false;
+                    for (i, sh) in shard_workers.iter_mut().enumerate() {
+                        let batch = sh.coalescer.drain_ready();
+                        if !batch.is_empty() {
+                            let drained = batch.len();
+                            let dropped = sh.coalescer.dropped();
+                            sh.builder.apply(batch);
+                            any = true;
+                            debug!(shard = i, drained, dropped, "ingest applied batch");
+                            histogram!("ingest_batch_size", drained as f64);
+                        }
+                    }
+                    if any {
+                        global_epoch = global_epoch.saturating_add(1);
+                        let mut items: Vec<LiteObj> = Vec::new();
+                        for sh in shard_workers.iter() {
+                            items.extend(sh.builder.items.clone());
+                        }
+                        let merged = WorldSnapshot { epoch: global_epoch, items };
+                        snap_clone.store(Arc::new(merged));
+                        let _ = epoch_tx.send(global_epoch);
+                        gauge!("ingest_epoch", global_epoch as f64);
+                        let snap_loaded = snap_clone.load();
+                        gauge!("snapshot_items", snap_loaded.items.len() as f64);
+                        let approx = approx_snapshot_bytes(&snap_loaded);
+                        gauge!("snapshot_bytes", approx as f64);
+                    }
+                }
+            }
+        }
+        info!("ingest loop stopped");
+    });
+
+    (tx, BackendHandle { snap, epoch_rx })
+}
+
+fn approx_snapshot_bytes(snap: &WorldSnapshot) -> usize {
+    let mut total: usize = std::mem::size_of::<WorldSnapshot>();
+    for o in &snap.items {
+        total += std::mem::size_of::<LiteObj>();
+        total += o.name.len();
+        if let Some(ns) = &o.namespace { total += ns.len(); }
+        for (_id, v) in &o.projected { total += v.len(); }
+        for (k, v) in &o.labels { total += k.len() + v.len(); }
+        for (k, v) in &o.annotations { total += k.len() + v.len(); }
+    }
+    total
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use orka_core::{DeltaKind, Uid};
+
+    fn uid(n: u8) -> Uid {
+        let mut u = [0u8; 16];
+        u[0] = n;
+        u
+    }
+
+    fn obj(name: &str, ns: Option<&str>) -> serde_json::Value {
+        let mut meta = serde_json::json!({
+            "name": name,
+            "uid": format!("00000000-0000-0000-0000-{:012}", 1),
+            "creationTimestamp": "2020-01-01T00:00:00Z",
+        });
+        if let Some(ns) = ns { meta["namespace"] = serde_json::Value::String(ns.to_string()); }
+        serde_json::json!({ "metadata": meta })
+    }
+
+    #[test]
+    fn coalescer_capacity_and_drop() {
+        let mut c = Coalescer::with_capacity(2);
+        // push 3 unique uids -> 1 drop expected
+        for i in 0..3u8 {
+            c.push(Delta { uid: uid(i), kind: DeltaKind::Applied, raw: serde_json::json!({}) });
+        }
+        assert_eq!(c.len(), 2);
+        assert_eq!(c.dropped(), 1);
+
+        let drained = c.drain_ready();
+        assert_eq!(drained.len(), 2);
+        assert_eq!(c.len(), 0);
+    }
+
+    #[test]
+    fn coalescer_overwrite_same_uid() {
+        let mut c = Coalescer::with_capacity(4);
+        let u = uid(42);
+        c.push(Delta { uid: u, kind: DeltaKind::Applied, raw: serde_json::json!({"a":1}) });
+        c.push(Delta { uid: u, kind: DeltaKind::Applied, raw: serde_json::json!({"a":2}) });
+        let drained = c.drain_ready();
+        assert_eq!(drained.len(), 1);
+        assert_eq!(drained[0].raw["a"], 2);
+    }
+
+    #[test]
+    fn worldbuilder_apply_add_update_delete() {
+        let mut wb = WorldBuilder::new();
+        let u1 = uid(1);
+        let u2 = uid(2);
+
+        // add two
+        wb.apply(vec![
+            Delta { uid: u1, kind: DeltaKind::Applied, raw: obj("a", Some("ns")) },
+            Delta { uid: u2, kind: DeltaKind::Applied, raw: obj("b", None) },
+        ]);
+        assert_eq!(wb.items.len(), 2);
+
+        // update one (rename)
+        let mut o = obj("a2", Some("ns"));
+        o["metadata"]["uid"] = serde_json::Value::String("00000000-0000-0000-0000-000000000001".to_string());
+        wb.apply(vec![Delta { uid: u1, kind: DeltaKind::Applied, raw: o }]);
+        assert_eq!(wb.items.iter().find(|x| x.uid == u1).unwrap().name, "a2");
+
+        // delete one
+        wb.apply(vec![Delta { uid: u2, kind: DeltaKind::Deleted, raw: serde_json::json!({}) }]);
+        assert_eq!(wb.items.len(), 1);
+        assert_eq!(wb.items[0].name, "a2");
+    }
+}
+</file>
+
+<file path="crates/store/Cargo.toml">
+[package]
+name = "orka-store"
+version = "0.0.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+description = "Orka in-RAM store (Milestone 0)"
+
+[dependencies]
+orka-core = { path = "../core" }
+arc-swap = { workspace = true }
+rustc-hash = { workspace = true }
+anyhow = { workspace = true }
+tracing = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tokio = { workspace = true }
+chrono = { workspace = true }
+metrics = { workspace = true }
+smallvec = { workspace = true }
+</file>
+
+<file path="crates/cli/Cargo.toml">
+[package]
+name = "orkactl"
+version = "0.0.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+description = "Orka CLI (Milestone 0)"
+
+[dependencies]
+orka-core = { path = "../core" }
+orka-store = { path = "../store" }
+orka-kubehub = { path = "../kubehub" }
+orka-schema = { path = "../schema" }
+orka-search = { path = "../search" }
+orka-apply = { path = "../apply" }
+orka-persist = { path = "../persist" }
+anyhow = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+clap = { workspace = true }
+tokio = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+serde_yaml = "0.9"
+metrics = { workspace = true }
+metrics-exporter-prometheus = { workspace = true }
+kube = { workspace = true }
+uuid = { workspace = true }
+
+[[bin]]
+name = "orkactl"
+path = "src/main.rs"
+
+[features]
+default = []
+# Enable CRD JSONSchema validation path in CLI via orka-schema feature
+validate = ["orka-schema/jsonschema-validate"]
+</file>
+
+<file path="crates/kubehub/src/lib.rs">
+//! Orka kubehub (Milestone 0) – discovery and watcher wiring
+
+#![forbid(unsafe_code)]
+
+use anyhow::{anyhow, Context, Result};
+use serde::{Deserialize, Serialize};
+use tracing::{debug, info, warn};
+use metrics::{counter, histogram};
+
+use futures::TryStreamExt;
+use kube::{
+    api::Api,
+    core::{DynamicObject, GroupVersionKind},
+    discovery::{Discovery, Scope},
+    runtime::watcher::{self, Event},
+    Client,
+};
+use orka_core::{Delta, DeltaKind};
+use tokio::sync::mpsc;
+use uuid::Uuid;
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DiscoveredResource {
+    pub group: String,
+    pub version: String,
+    pub kind: String,
+    pub namespaced: bool,
+}
+
+impl DiscoveredResource {
+    pub fn gvk_key(&self) -> String {
+        if self.group.is_empty() {
+            format!("{}/{}", self.version, self.kind)
+        } else {
+            format!("{}/{}/{}", self.group, self.version, self.kind)
+        }
+    }
+}
+
+/// Discover served resources (incl. CRDs) using kube Discovery.
+pub async fn discover(_prefer_crd: bool) -> Result<Vec<DiscoveredResource>> {
+    let client = Client::try_default().await?;
+    let discovery = Discovery::new(client).run().await?;
+    let mut out = Vec::new();
+    for group in discovery.groups() {
+        for (ar, caps) in group.recommended_resources() {
+            let namespaced = matches!(caps.scope, Scope::Namespaced);
+            out.push(DiscoveredResource {
+                group: ar.group.clone(),
+                version: ar.version.clone(),
+                kind: ar.kind.clone(),
+                namespaced,
+            });
+        }
+    }
+    // Stable-ish order
+    out.sort_by(|a, b| a.group.cmp(&b.group).then(a.version.cmp(&b.version)).then(a.kind.cmp(&b.kind)));
+    Ok(out)
+}
+
+fn parse_gvk_key(key: &str) -> Result<GroupVersionKind> {
+    let parts: Vec<_> = key.split('/').collect();
+    match parts.as_slice() {
+        [version, kind] => Ok(GroupVersionKind { group: String::new(), version: version.to_string(), kind: kind.to_string() }),
+        [group, version, kind] => Ok(GroupVersionKind { group: (*group).to_string(), version: (*version).to_string(), kind: (*kind).to_string() }),
+        _ => Err(anyhow!("invalid gvk key: {} (expect v1/Kind or group/v1/Kind)", key)),
+    }
+}
+
+async fn find_api_resource(client: Client, gvk: &GroupVersionKind) -> Result<(kube::core::ApiResource, bool)> {
+    let discovery = Discovery::new(client).run().await?;
+    for group in discovery.groups() {
+        for (ar, caps) in group.recommended_resources() {
+            if ar.group == gvk.group && ar.version == gvk.version && ar.kind == gvk.kind {
+                let namespaced = matches!(caps.scope, Scope::Namespaced);
+                return Ok((ar.clone(), namespaced));
+            }
+        }
+    }
+    Err(anyhow!("GVK not found: {}/{}/{}", gvk.group, gvk.version, gvk.kind))
+}
+
+fn strip_managed_fields(v: &mut serde_json::Value) {
+    if let Some(meta) = v.get_mut("metadata") {
+        if let Some(obj) = meta.as_object_mut() {
+            obj.remove("managedFields");
+        }
+    }
+}
+
+fn to_uid(uid_str: &str) -> Result<orka_core::Uid> {
+    let u = Uuid::parse_str(uid_str).context("parsing metadata.uid as uuid")?;
+    let bytes = *u.as_bytes();
+    Ok(bytes)
+}
+
+fn delta_from(obj: &DynamicObject, kind: DeltaKind) -> Result<Delta> {
+    let uid_str = obj
+        .metadata
+        .uid
+        .as_deref()
+        .ok_or_else(|| anyhow!("object missing metadata.uid"))?;
+    let uid = to_uid(uid_str)?;
+    let mut raw = serde_json::to_value(obj).context("serializing DynamicObject")?;
+    strip_managed_fields(&mut raw);
+    Ok(Delta { uid, kind, raw })
+}
+
+/// Start list+watch for a given GVK key and send coalesced deltas into provided channel.
+pub async fn start_watcher(gvk_key: &str, namespace: Option<&str>, delta_tx: mpsc::Sender<Delta>) -> Result<()> {
+    let client = Client::try_default().await?;
+    let gvk = parse_gvk_key(gvk_key)?;
+    let (ar, namespaced) = find_api_resource(client.clone(), &gvk).await?;
+
+    // Periodic relist interval (seconds)
+    let relist_secs: u64 = std::env::var("ORKA_RELIST_SECS")
+        .ok()
+        .and_then(|s| s.parse::<u64>().ok())
+        .unwrap_or(300);
+    // Backoff max (seconds) for watch errors
+    let backoff_max: u64 = std::env::var("ORKA_WATCH_BACKOFF_MAX_SECS")
+        .ok()
+        .and_then(|s| s.parse::<u64>().ok())
+        .unwrap_or(30);
+
+    info!(gvk = %gvk_key, ns = ?namespace, relist_secs, "watcher starting");
+
+    let mut backoff: u64 = 1;
+    loop {
+        let api: Api<DynamicObject> = if namespaced {
+            match namespace {
+                Some(ns) => Api::namespaced_with(client.clone(), ns, &ar),
+                None => Api::all_with(client.clone(), &ar),
+            }
+        } else {
+            Api::all_with(client.clone(), &ar)
+        };
+
+        let cfg = watcher::Config::default();
+        let stream = watcher::watcher(api, cfg);
+        futures::pin_mut!(stream);
+        // Jittered relist: ±10%
+        let jitter = ((relist_secs as f64) * 0.1) as i64;
+        let jval = if jitter > 0 {
+            // Fast, dependency-free pseudo-random using time
+            let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().subsec_nanos() as i64;
+            let sign = if (now & 1) == 0 { 1 } else { -1 };
+            (now % (jitter as i64 + 1)) * sign
+        } else { 0 };
+        let relist_actual = (relist_secs as i64 + jval).max(1) as u64;
+        let relist_timer = tokio::time::sleep(std::time::Duration::from_secs(relist_actual));
+        tokio::pin!(relist_timer);
+        info!(relist_actual, "watch stream opened");
+
+        // Read until stream ends or relist timer fires
+        let ended = loop {
+            tokio::select! {
+                maybe_ev = stream.try_next() => {
+                    match maybe_ev {
+                        Ok(Some(Event::Applied(o))) => {
+                            let d = delta_from(&o, DeltaKind::Applied)?;
+                            if delta_tx.send(d).await.is_err() {
+                                info!("delta channel closed; stopping watcher");
+                                return Ok(());
+                            }
+                        }
+                        Ok(Some(Event::Deleted(o))) => {
+                            let d = delta_from(&o, DeltaKind::Deleted)?;
+                            if delta_tx.send(d).await.is_err() {
+                                info!("delta channel closed; stopping watcher");
+                                return Ok(());
+                            }
+                        }
+                        Ok(Some(Event::Restarted(list))) => {
+                            debug!(count = list.len(), "watch restart");
+                            for o in list.iter() {
+                                let d = delta_from(o, DeltaKind::Applied)?;
+                                if delta_tx.send(d).await.is_err() {
+                                    info!("delta channel closed; stopping watcher");
+                                    return Ok(());
+                                }
+                            }
+                        }
+                        Ok(None) => break true, // stream ended
+                        Err(e) => {
+                            warn!(error = %e, "watch stream error; will backoff and restart");
+                            counter!("watch_errors_total", 1u64);
+                            break true;
+                        }
+                    }
+                }
+                _ = &mut relist_timer => {
+                    info!("periodic relist interval reached; restarting watch");
+                    counter!("relist_total", 1u64);
+                    break false;
+                }
+            }
+        };
+
+        if ended {
+            warn!("watcher stream ended");
+            // Backoff before restart
+            let dur = std::time::Duration::from_secs(backoff.min(backoff_max));
+            histogram!("watch_backoff_ms", dur.as_millis() as f64);
+            tokio::time::sleep(dur).await;
+            backoff = (backoff * 2).min(backoff_max).max(1);
+            counter!("watch_restarts_total", 1u64);
+            continue;
+        }
+        // else: fallthrough and recreate stream (periodic relist)
+        backoff = 1;
+        counter!("watch_restarts_total", 1u64);
+    }
+    Ok(())
+}
+
+/// Perform an initial list for the given GVK and namespace and push Applied deltas.
+/// Useful to prime the ingest snapshot before starting a long-running watch.
+pub async fn prime_list(gvk_key: &str, namespace: Option<&str>, delta_tx: &mpsc::Sender<Delta>) -> Result<usize> {
+    let client = Client::try_default().await?;
+    let gvk = parse_gvk_key(gvk_key)?;
+    let (ar, namespaced) = find_api_resource(client.clone(), &gvk).await?;
+
+    let api: Api<DynamicObject> = if namespaced {
+        match namespace {
+            Some(ns) => Api::namespaced_with(client.clone(), ns, &ar),
+            None => Api::all_with(client.clone(), &ar),
+        }
+    } else {
+        Api::all_with(client.clone(), &ar)
+    };
+
+    let mut sent = 0usize;
+    let list = api.list(&Default::default()).await?;
+    for o in list {
+        let d = delta_from(&o, DeltaKind::Applied)?;
+        if delta_tx.send(d).await.is_ok() { sent += 1; }
+    }
+    Ok(sent)
+}
+</file>
+
+<file path="Cargo.toml">
+[workspace]
+members = [
+    "crates/core",
+    "crates/kubehub",
+    "crates/store",
+    "crates/cli",
+    "crates/schema",
+    "crates/search",
+    "crates/persist",
+    "crates/apply",
+]
+resolver = "2"
+
+[workspace.dependencies]
+anyhow = "1"
+thiserror = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+arc-swap = "1"
+rustc-hash = "1"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal", "sync", "time"] }
+clap = { version = "4", features = ["derive", "env"] }
+futures = "0.3"
+uuid = { version = "1", features = ["v4"] }
+chrono = { version = "0.4", default-features = false, features = ["std", "clock"] }
+smallvec = { version = "1", features = ["serde"] }
+fuzzy-matcher = "0.3"
+
+# Kube stack (exact version can be adjusted later)
+kube = { version = "0.90", features = ["runtime", "client", "derive"] }
+k8s-openapi = { version = "0.21", features = ["latest"] }
+metrics = "0.21"
+metrics-exporter-prometheus = "0.14"
+</file>
+
+<file path="MILESTONE-1.md">
+# Orka — Milestone 1 (Schema & Search)
+
+Status: Closed — 2025-09-07
+
+> Goal: treat CRDs as first‑class: normalize schema, pick a few high‑signal fields for listing/search, validate edits, and make search feel instant with typed filters and fuzzy scoring.
+
+---
+
+## Scope (M1)
+
+- Schema engine: read `openAPIV3Schema`, capture `additionalPrinterColumns`, derive projected scalar paths, and expose flags/quirks.
+- Validation: YAML → JSON → JSON Schema validation with friendly errors; feature‑gated.
+- Search: in‑RAM index built from metadata + projected fields; typed filters + fuzzy matcher for ranking.
+- CLI: `schema` to inspect a GVK; `search` to query across resources.
+
+Non‑goals (M1): apply/SSA, diffs, persistence/SQLite, RPC surface, tantivy/FST acceleration, UI.
+
+Success = `schema` and `search` work against real and replayed data with predictable latency and memory bounds.
+
+---
+
+## Architecture Slice
+
+```
+Discovery ──► Schema Engine ──► Projection (fields)
+                          │
+Watchers/Coalescer ───────┴────► Ingest/WorldBuilder ──► ArcSwap<WorldSnapshot>
+                                                    │                 │
+                                                    └──► RAM Search ◄─┘
+                                                              ▲
+                                                        orkactl search
+```
+
+Rules:
+
+- Projection chooses 3–6 stable, scalar paths per GVK; avoid churny/status where possible unless explicitly useful.
+- Index updates are incremental from deltas; deletes remove docs fully.
+- Reads are lock‑free; search intersects typed filters first, then applies fuzzy ranking to the candidate set.
+
+---
+
+## Workspace Additions (M1)
+
+- `crates/schema`: normalize CRD schemas, printer columns, projection, validation glue.
+- `crates/search`: RAM index, typed filter parsing, fuzzy scoring.
+- Extend `crates/kubehub` to fetch CRD objects for schema; keep watchers unchanged.
+- Extend `crates/store` to expose projected fields in `LiteObj`.
+- Extend `crates/cli` with `schema` and `search` commands.
+
+---
+
+## Detailed Tasks
+
+1) Schema Engine
+- Parse CRDs; pick served version; normalize `openAPIV3Schema` (resolve `oneOf/anyOf/allOf` conservatively, mark YAML‑only where needed).
+- Extract `additionalPrinterColumns` when present; sort/stabilize.
+- Derive projected scalar paths when columns are missing or poor; prefer fields that differentiate rows (heuristics, depth cap, skip ephemeral/status by default).
+- Shape outputs into `CrdSchema { served_version, printer_cols, projected_paths, flags }` and cache keyed by `{cluster, group, plural, version}`.
+
+2) Validation
+- YAML → `serde_json::Value` → `jsonschema` validate (feature `jsonschema-validate`).
+- Human‑friendly error rendering with path, reason, and a short suggestion.
+
+3) Store Integration
+- Enrich `LiteObj` with `projected: SmallVec<(PathId, String)>` populated using `CrdSchema` renderers.
+- Keep raw bytes optional; drop when memory pressure is high (unchanged from M0 policy).
+
+4) Search Index
+- Build per‑GVK shards: metadata (ns, name), labels/annotations, projected fields.
+- Maintain typed postings for filters (`k:`, `g:`, `ns:`, `label:`, `anno:`, `field:`).
+- Candidate set = intersection of typed postings; rank with `fuzzy-matcher` on concatenated display text.
+- Support `limit` and stable tiebreaking (name/uid).
+
+5) CLI
+- `orkactl schema group/version/kind`: print served version, printer columns, projected paths, flags. `-o json` for machine use.
+- `orkactl search "query" --limit N`: typed filters + fuzzy text; print `KIND NS/NAME SCORE`. `-o json` supported.
+
+6) Tests & Benches
+- Unit tests: schema normalization, projection picker, validator edges, filter parser.
+- Replay test: feed recorded deltas; assert deterministic candidates and top‑k order for fixed seeds.
+- Bench: 100k synthetic docs → ingest cost, index memory, search p50/p99.
+
+7) Observability & Limits
+- Metrics: `index_docs`, `index_bytes`, `search_candidates`, `search_eval`, `search_p50_ms`, `search_p99_ms`.
+- Env knobs: `ORKA_SEARCH_LIMIT`, `ORKA_SEARCH_MAX_CANDIDATES`, `ORKA_SEARCH_MIN_SCORE`.
+
+---
+
+## Minimal Types (M1)
+
+```rust
+// crates/schema
+pub struct PrinterCol { pub name: String, pub json_path: String };
+pub struct PathSpec { pub id: u32, pub json_path: String, pub renderer: Renderer };
+pub struct SchemaFlags { pub yaml_only_nodes: bool, pub preserves_unknown: bool }
+pub struct CrdSchema {
+    pub served_version: String,
+    pub printer_cols: Vec<PrinterCol>,
+    pub projected_paths: Vec<PathSpec>,
+    pub flags: SchemaFlags,
+}
+
+// crates/search
+pub type DocId = u32;
+pub struct Hit { pub doc: DocId, pub score: f32 }
+```
+
+---
+
+## Index Sketch
+
+```rust
+pub struct Shard {
+    // typed postings
+    by_kind: FxHashMap<String, Vec<DocId>>,
+    by_group: FxHashMap<String, Vec<DocId>>,
+    by_ns: FxHashMap<String, Vec<DocId>>,
+    labels: FxHashMap<(String,String), Vec<DocId>>,
+    annos: FxHashMap<(String,String), Vec<DocId>>,
+    fields: FxHashMap<(u32,String), Vec<DocId>>, // (PathId, rendered)
+
+    // display text for fuzzy
+    text: Vec<String>, // index by DocId
+}
+```
+
+Update: on add/update → refresh postings and `text[doc]`; on delete → remove doc from all postings and clear text.
+
+---
+
+## Validator Path
+
+- Input: YAML from CLI/editor.
+- Transform: YAML → JSON → validate against `CrdSchema` with `jsonschema`.
+- Output: ok or list of `(path, error, hint)`; never panics on user data.
+
+---
+
+## CLI Specs (M1)
+
+- `orkactl schema group/version/kind`
+  - Output: served version, printer columns, projected paths, flags.
+  - Flags: `-o json`.
+
+- `orkactl search "k:Application ns:prod payments" --limit 20`
+  - Output: `KIND   NAMESPACE/NAME         SCORE`
+  - Flags: `--cluster`, `--limit`, `-o json`.
+
+Examples:
+
+```
+$ orkactl schema cert-manager.io/v1/Certificate
+served: v1
+printer-cols: Ready, Age, SecretName
+projected: spec.dnsNames[0], status.conditions[?type==Ready].status, ...
+
+$ orkactl search "k:Certificate ns:prod payments"
+Certificate  prod/payments-cert         0.86
+```
+
+---
+
+## Performance Targets (M1)
+
+- Search: ≤ 10 ms p99 @ 100k docs (single thread) with `limit=50`.
+- Index build on steady ingest: ≤ 15% overhead over M0 ingest time.
+- Schema load and projection planning: ≤ 50 ms per GVK cold; cached afterwards.
+- Memory: default cap ≤ 800 MB on large clusters; index size tracked.
+
+---
+
+## Risks & Mitigations
+
+- CRD schema variance → tolerant normalizer; YAML fallback for complex nodes.
+- Large label cardinality → cap postings per key; fall back to text search.
+- Fuzzy false positives → threshold and tiebreakers; expose `--limit` and score.
+- Index rebuild cost → incremental updates; avoid full rebuilds.
+
+---
+
+## Definition of Done (M1)
+
+- `orkactl schema` prints accurate info for several CRDs across operators.
+- `orkactl search` returns relevant hits with typed filters and stable ranking.
+- Unit + replay tests green; basic bench meets p99 budget on CI hardware.
+- Metrics visible; knobs documented; no panics on malformed input.
+
+---
+
+## Implementation Order (Checklist)
+
+- [x] Add `crates/schema` crate with `CrdSchema`, `PrinterCol`, `PathSpec`, `SchemaFlags`.
+- [x] Load CRDs and parse versions; extract `additionalPrinterColumns` (JSON traversal; basic normalization).
+- [x] Implement projection selection and renderers; derive from `openAPIV3Schema` when columns absent.
+- [x] Add YAML→JSON→JSON Schema validation (feature `jsonschema-validate`).
+- [x] Extend `LiteObj` to carry `projected` values (plus labels/annotations) using schema renderers.
+- [x] Add `crates/search` crate: postings + text store (built from snapshot); label/anno postings.
+- [x] Implement typed filter parser: `ns:`, `label:`, `anno:`, `field:` (+ free text), plus `k:`/`g:` (exact match; wildcards optional).
+- [x] Integrate `fuzzy-matcher` for ranking; `limit` and stable name/uid tiebreaker done.
+- [x] Expose a search API returning `(doc, score)` and mapped `LiteObj` (+ debug counters).
+- [x] CLI: `schema gvk [-o json]` with human/json output.
+- [x] CLI: `search "query" [--limit N] [--explain] [-o json]`; watcher scopes from `--ns` or `ns:` token; primed List for fast first snapshot.
+- [~] Unit tests: filter parser + scoring/ranking and basic schema/projection tests added; deeper normalization tests pending.
+- [x] Replay test: synthetic deltas → deterministic candidates and ordering.
+- [x] Bench: 100k docs; record p50/p99. Basic release build on dev hardware hits p99 target; memory tracking approximated via metrics.
+- [x] Docs: grammar and examples in `crates/cli/README.md`.
+
+> If it adds latency or complexity without clear payoff, skip it. The point of M1 is fast insight, not perfect semantics.
+
+---
+
+## Status & Next Steps (M1)
+
+Done
+- Schema discovery (served/storage version), printer-cols extraction, and projection derivation from OpenAPI.
+- Projector wired into ingest; `LiteObj` now includes projected fields, labels, and annotations.
+- Search index with typed filters (`ns:`, `label:` key/value and existence, `anno:` key/value and existence, `field:`, `k:`, `g:`), fuzzy ranking, stable name/uid tiebreaker, and debug/explain.
+- CLI: `schema` and `search` implemented; watcher scopes from namespace; initial List primes snapshot. Search table prints KIND.
+
+Next Steps
+- Unit tests: expand schema normalization and projection picker edge cases; projector path extraction for complex nodes.
+- Observability: consider adding p50/p99 summaries on `search_eval_ms`; ensure Prometheus exporter visibility.
+- Baseline bench at ~100k docs (simple harness acceptable for now).
+- Optional: JSON Schema validation behind `jsonschema-validate`; simple wildcards for `k:`/`g:`.
+- Optional: JSON Schema validation behind `jsonschema-validate`; simple wildcards for `k:`/`g:`.
+</file>
+
+<file path="crates/cli/src/main.rs">
+use std::str::FromStr;
+
+use anyhow::Result;
+use clap::{ArgAction, Parser, Subcommand, ValueEnum};
+use tracing::{error, info, warn};
+use orka_store::spawn_ingest_with_projector;
+use tokio::sync::mpsc;
+use std::collections::HashMap;
+use tokio::signal;
+use std::time::{Duration, Instant};
+use orka_persist::Store;
+
+#[derive(Parser, Debug)]
+#[command(name = "orkactl", version, about = "Orka CLI (M2)")]
+struct Cli {
+    /// Output format
+    #[arg(short = 'o', long = "output", value_enum, global = true, default_value_t = Output::Human)]
+    output: Output,
+
+    /// Kubernetes namespace (default: current context)
+    #[arg(long = "ns", global = true)]
+    namespace: Option<String>,
+
+    #[command(subcommand)]
+    command: Commands,
+}
+
+#[derive(Copy, Clone, Debug, Eq, PartialEq, ValueEnum)]
+enum Output { Human, Json }
+
+#[derive(Subcommand, Debug)]
+enum Commands {
+    /// Discover served resources (incl. CRDs)
+    Discover {
+        /// Prefer selecting a CRD (for demos)
+        #[arg(long = "prefer-crd", action = ArgAction::SetTrue)]
+        prefer_crd: bool,
+    },
+    /// List objects for a given group/version/kind key
+    Ls {
+        /// GVK key, e.g. "v1/ConfigMap" or "cert-manager.io/v1/Certificate"
+        gvk: String,
+    },
+    /// Watch objects for a GVK and print +/- events
+    Watch {
+        /// GVK key, e.g. "v1/ConfigMap" or "cert-manager.io/v1/Certificate"
+        gvk: String,
+    },
+    /// Inspect schema details for a GVK (CRDs only)
+    Schema {
+        /// GVK key, e.g. "cert-manager.io/v1/Certificate"
+        gvk: String,
+    },
+    /// Search current snapshot (simple RAM index)
+    Search {
+        /// GVK key to watch while indexing
+        gvk: String,
+        /// Query string (supports free text + typed filters)
+        query: String,
+        /// Limit results
+        #[arg(long = "limit", default_value_t = 20, env = "ORKA_SEARCH_LIMIT")]
+        limit: usize,
+        /// Maximum candidates after typed filters
+        #[arg(long = "max-candidates", env = "ORKA_SEARCH_MAX_CANDIDATES")]
+        max_candidates: Option<usize>,
+        /// Minimum fuzzy score to include hit
+        #[arg(long = "min-score", env = "ORKA_SEARCH_MIN_SCORE")]
+        min_score: Option<f32>,
+        /// Explain filter stages and counts
+        #[arg(long = "explain", action = ArgAction::SetTrue)]
+        explain: bool,
+    },
+    /// Edit a resource from a YAML file (dry-run or apply)
+    Edit {
+        /// YAML path or '-' for stdin
+        #[arg(short = 'f', long = "file")]
+        file: String,
+        /// Validate against CRD JSONSchema (feature-gated)
+        #[arg(long = "validate", action = ArgAction::SetTrue)]
+        validate: bool,
+        /// Perform a server-side dry-run
+        #[arg(long = "dry-run", action = ArgAction::SetTrue)]
+        dry_run: bool,
+        /// Apply with SSA (fieldManager=orka)
+        #[arg(long = "apply", action = ArgAction::SetTrue)]
+        apply: bool,
+    },
+    /// Show minimal diffs vs live and last-applied
+    Diff {
+        /// YAML path or '-' for stdin
+        #[arg(short = 'f', long = "file")]
+        file: String,
+    },
+    /// Inspect last-applied snapshots for a resource
+    #[command(name = "last-applied")]
+    LastApplied {
+        #[command(subcommand)]
+        sub: LastAppliedCmd,
+    },
+    /// Show runtime configuration and metrics endpoint
+    Stats {},
+}
+
+#[derive(Subcommand, Debug)]
+enum LastAppliedCmd {
+    /// Get last-applied snapshots for a resource
+    Get {
+        /// GVK key, e.g. "v1/ConfigMap" or "group/v1/Foo"
+        gvk: String,
+        /// Resource name
+        name: String,
+        /// Limit number of entries
+        #[arg(long = "limit", default_value_t = 3)]
+        limit: usize,
+        /// Output YAML payloads as JSON array
+        #[arg(short = 'o', long = "output", value_enum)]
+        output: Option<Output>,
+    },
+}
+
+fn init_tracing() {
+    let env = std::env::var("ORKA_LOG").unwrap_or_else(|_| "info".to_string());
+    let filter = tracing_subscriber::EnvFilter::from_str(&env).unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
+    tracing_subscriber::fmt().with_env_filter(filter).with_target(true).init();
+}
+
+fn init_metrics() {
+    if let Ok(addr) = std::env::var("ORKA_METRICS_ADDR") {
+        if let Ok(sock) = addr.parse::<std::net::SocketAddr>() {
+            let builder = metrics_exporter_prometheus::PrometheusBuilder::new();
+            match builder.with_http_listener(sock).install() {
+                Ok(_) => tracing::info!(addr = %addr, "Prometheus metrics exporter listening"),
+                Err(e) => tracing::warn!(error = %e, "failed to install metrics exporter"),
+            }
+        } else {
+            tracing::warn!(addr = %addr, "invalid ORKA_METRICS_ADDR; expected host:port");
+        }
+    }
+}
+
+fn parse_gvk(key: &str) -> Option<(String, String, String)> {
+    let parts: Vec<&str> = key.split('/').collect();
+    match parts.as_slice() {
+        [version, kind] => Some((String::new(), (*version).to_string(), (*kind).to_string())),
+        [group, version, kind] => Some(((*group).to_string(), (*version).to_string(), (*kind).to_string())),
+        _ => None,
+    }
+}
+
+#[tokio::main]
+async fn main() -> Result<()> {
+    init_tracing();
+    init_metrics();
+    let cli = Cli::parse();
+
+    match cli.command {
+        Commands::Discover { prefer_crd } => {
+            info!(prefer_crd, "discover invoked");
+            match orka_kubehub::discover(prefer_crd).await {
+                Ok(resources) => match cli.output {
+                    Output::Human => {
+                        for r in resources {
+                            let scope = if r.namespaced { "namespaced" } else { "cluster" };
+                            let gv = if r.group.is_empty() { r.version.clone() } else { format!("{}/{}", r.group, r.version) };
+                            println!("{} • {} • {}", gv, r.kind, scope);
+                        }
+                    }
+                    Output::Json => println!("{}", serde_json::to_string_pretty(&resources)?),
+                },
+                Err(e) => {
+                    error!(error = ?e, "discover failed");
+                    eprintln!("discover error: {}", e);
+                }
+            }
+        }
+        Commands::Ls { gvk } => {
+            let ns = cli.namespace.as_deref();
+            info!(gvk = %gvk, ns = ?ns, "ls invoked");
+            let cap = std::env::var("ORKA_QUEUE_CAP").ok().and_then(|s| s.parse::<usize>().ok()).unwrap_or(2048);
+            let projector = match orka_schema::fetch_crd_schema(&gvk).await {
+                Ok(Some(schema)) => Some(std::sync::Arc::new(schema.projector()) as std::sync::Arc<dyn orka_core::Projector + Send + Sync>),
+                _ => None,
+            };
+            let (ingest_tx, backend) = spawn_ingest_with_projector(cap, projector);
+            // Start watcher
+            let watcher_handle = tokio::spawn({
+                let gvk = gvk.clone();
+                let ns = ns.map(|s| s.to_string());
+                let tx = ingest_tx.clone();
+                async move {
+                    if let Err(e) = orka_kubehub::start_watcher(&gvk, ns.as_deref(), tx).await {
+                        error!(error = ?e, "watcher failed");
+                    }
+                }
+            });
+            // Prime initial list for faster first snapshot
+            let _ = orka_kubehub::prime_list(&gvk, ns, &ingest_tx).await;
+
+            // Wait for first epoch (configurable)
+            let wait_secs = std::env::var("ORKA_WAIT_SECS").ok().and_then(|s| s.parse::<u64>().ok()).unwrap_or(8);
+            let mut rx = backend.subscribe_epoch();
+            let deadline = Instant::now() + Duration::from_secs(wait_secs);
+            while *rx.borrow() == 0 {
+                let now = Instant::now();
+                if now >= deadline { break; }
+                let rem = deadline.duration_since(now).min(Duration::from_secs(2));
+                if tokio::time::timeout(rem, rx.changed()).await.is_err() { break; }
+            }
+            let snap = backend.current();
+
+            match cli.output {
+                Output::Human => {
+                    println!("NAMESPACE   NAME                 AGE");
+                    for item in snap.items.iter().filter(|o| ns.map(|n| o.namespace.as_deref() == Some(n)).unwrap_or(true)) {
+                        let ns_col = item.namespace.clone().unwrap_or_else(|| "-".to_string());
+                        let age = render_age(item.creation_ts);
+                        println!("{:<11} {:<20} {}", ns_col, item.name, age);
+                    }
+                }
+                Output::Json => {
+                    // Filter by namespace if provided
+                    let items: Vec<_> = snap.items
+                        .iter()
+                        .filter(|o| ns.map(|n| o.namespace.as_deref() == Some(n)).unwrap_or(true))
+                        .cloned()
+                        .collect();
+                    println!("{}", serde_json::to_string_pretty(&items)?);
+                }
+            }
+            // Graceful shutdown: drop last sender and abort watcher to close ingest and flush
+            drop(ingest_tx);
+            watcher_handle.abort();
+        }
+        Commands::Watch { gvk } => {
+            let ns = cli.namespace.as_deref();
+            info!(gvk = %gvk, ns = ?ns, "watch invoked");
+            let cap = std::env::var("ORKA_QUEUE_CAP").ok().and_then(|s| s.parse::<usize>().ok()).unwrap_or(2048);
+            let projector = match orka_schema::fetch_crd_schema(&gvk).await {
+                Ok(Some(schema)) => Some(std::sync::Arc::new(schema.projector()) as std::sync::Arc<dyn orka_core::Projector + Send + Sync>),
+                _ => None,
+            };
+            let (ingest_tx, _backend) = spawn_ingest_with_projector(cap, projector);
+            let (tap_tx, mut tap_rx) = mpsc::channel::<orka_core::Delta>(cap);
+
+            // Start watcher writing into our tap
+            let watcher_handle = tokio::spawn({
+                let gvk = gvk.clone();
+                let ns = ns.map(|s| s.to_string());
+                let tap_tx = tap_tx.clone();
+                async move {
+                    if let Err(e) = orka_kubehub::start_watcher(&gvk, ns.as_deref(), tap_tx).await {
+                        error!(error = ?e, "watcher failed");
+                    }
+                }
+            });
+
+            // Pump deltas into ingest and print lines directly
+            let mut seen_rv: HashMap<orka_core::Uid, String> = HashMap::new();
+            loop {
+                tokio::select! {
+                    maybe = tap_rx.recv() => {
+                        match maybe {
+                            Some(d) => {
+                                // forward to ingest (best-effort)
+                                let _ = ingest_tx.send(d.clone()).await;
+
+                                // filter by ns if provided
+                                if let Some(ns_filter) = ns {
+                                    if let Some(mns) = d.raw.get("metadata").and_then(|m| m.get("namespace")).and_then(|v| v.as_str()) {
+                                        if mns != ns_filter { continue; }
+                                    } else {
+                                        // cluster-scoped won't match a namespaced filter
+                                        continue;
+                                    }
+                                }
+                                let key = json_key(&d.raw);
+                                let rv = d
+                                    .raw
+                                    .get("metadata")
+                                    .and_then(|m| m.get("resourceVersion"))
+                                    .and_then(|v| v.as_str())
+                                    .unwrap_or("")
+                                    .to_string();
+                                match d.kind {
+                                    orka_core::DeltaKind::Applied => {
+                                        match seen_rv.get_mut(&d.uid) {
+                                            None => {
+                                                seen_rv.insert(d.uid, rv);
+                                                println!("+ {}", key);
+                                            }
+                                            Some(prev_rv) => {
+                                                if *prev_rv != rv {
+                                                    *prev_rv = rv;
+                                                    println!("+ {}", key);
+                                                } // else duplicate; ignore
+                                            }
+                                        }
+                                    }
+                                    orka_core::DeltaKind::Deleted => {
+                                        let _ = seen_rv.remove(&d.uid);
+                                        println!("- {}", key);
+                                    }
+                                }
+                            }
+                            None => {
+                                warn!("tap channel closed; exiting watch loop");
+                                break;
+                            }
+                        }
+                    }
+                    _ = signal::ctrl_c() => {
+                        info!("Ctrl-C received; shutting down watch loop");
+                        break;
+                    }
+                }
+            }
+
+            // Graceful shutdown: close ingest and abort watcher to stop kube stream, allowing final snapshot flush
+            drop(ingest_tx);
+            watcher_handle.abort();
+            warn!("watch loop ended (graceful shutdown)");
+        }
+        Commands::Schema { gvk } => {
+            info!(gvk = %gvk, "schema invoked");
+            match orka_schema::fetch_crd_schema(&gvk).await {
+                Ok(Some(schema)) => match cli.output {
+                    Output::Human => {
+                        println!("served: {}", schema.served_version);
+                        if schema.printer_cols.is_empty() {
+                            println!("printer-cols: (none)");
+                        } else {
+                            let cols: Vec<_> = schema.printer_cols.iter().map(|c| c.name.as_str()).collect();
+                            println!("printer-cols: {}", cols.join(", "));
+                        }
+                        if schema.projected_paths.is_empty() {
+                            println!("projected: (heuristic defaults)");
+                        } else {
+                            let proj: Vec<_> = schema.projected_paths.iter().map(|p| p.json_path.as_str()).collect();
+                            println!("projected: {}", proj.join(", "));
+                        }
+                    }
+                    Output::Json => {
+                        println!("{}", serde_json::to_string_pretty(&schema)?);
+                    }
+                },
+                Ok(None) => {
+                    eprintln!("no CRD schema for builtin kind (or not found)");
+                }
+                Err(e) => {
+                    eprintln!("schema error: {}", e);
+                }
+            }
+        }
+        Commands::Search { gvk, query, limit, max_candidates, min_score, explain } => {
+            // Choose watcher namespace: CLI --ns overrides, else extract from query ns:token
+            let ns_from_query = query.split_whitespace().find_map(|t| t.strip_prefix("ns:")).map(|s| s.to_string());
+            let effective_ns = cli.namespace.clone().or(ns_from_query);
+            let ns = effective_ns.as_deref();
+            info!(gvk = %gvk, ns = ?ns, query = %query, limit, "search invoked");
+            let cap = std::env::var("ORKA_QUEUE_CAP").ok().and_then(|s| s.parse::<usize>().ok()).unwrap_or(2048);
+            let projector = match orka_schema::fetch_crd_schema(&gvk).await {
+                Ok(Some(schema)) => Some(std::sync::Arc::new(schema.projector()) as std::sync::Arc<dyn orka_core::Projector + Send + Sync>),
+                _ => None,
+            };
+            let (ingest_tx, backend) = spawn_ingest_with_projector(cap, projector);
+            // Start watcher
+            let watcher_handle = tokio::spawn({
+                let gvk = gvk.clone();
+                let ns = ns.map(|s| s.to_string());
+                let tx = ingest_tx.clone();
+                async move {
+                    if let Err(e) = orka_kubehub::start_watcher(&gvk, ns.as_deref(), tx).await {
+                        error!(error = ?e, "watcher failed");
+                    }
+                }
+            });
+            // Prime initial list so snapshot has data before waiting
+            let _ = orka_kubehub::prime_list(&gvk, ns, &ingest_tx).await;
+
+            // Wait for first epoch (configurable)
+            let wait_secs = std::env::var("ORKA_WAIT_SECS").ok().and_then(|s| s.parse::<u64>().ok()).unwrap_or(8);
+            let mut rx = backend.subscribe_epoch();
+            let deadline = Instant::now() + Duration::from_secs(wait_secs);
+            while *rx.borrow() == 0 {
+                let now = Instant::now();
+                if now >= deadline { break; }
+                let rem = deadline.duration_since(now).min(Duration::from_secs(2));
+                if tokio::time::timeout(rem, rx.changed()).await.is_err() { break; }
+            }
+            let snap = backend.current();
+            // Build index with field mapping (if schema known)
+            let field_pairs: Option<Vec<(String, u32)>> = match orka_schema::fetch_crd_schema(&gvk).await {
+                Ok(Some(schema)) => Some(schema.projected_paths.iter().map(|p| (p.json_path.clone(), p.id)).collect()),
+                _ => None,
+            };
+            let (group_str, _version_str, kind_str) = parse_gvk(&gvk).unwrap_or((String::new(), String::new(), String::new()));
+            let index = match field_pairs {
+                Some(pairs) => orka_search::Index::build_from_snapshot_with_meta(&snap, Some(&pairs), Some(&kind_str), Some(&group_str)),
+                None => orka_search::Index::build_from_snapshot_with_meta(&snap, None, Some(&kind_str), Some(&group_str)),
+            };
+            let opts = orka_search::SearchOpts { max_candidates, min_score };
+            let (hits, dbg) = index.search_with_debug_opts(&query, limit, opts);
+
+            match cli.output {
+                Output::Human => {
+                    println!("KIND   NAMESPACE/NAME                SCORE");
+                    for h in hits {
+                        if let Some(obj) = snap.items.get(h.doc as usize) {
+                            let ns_col = obj.namespace.clone().unwrap_or_else(|| "-".to_string());
+                            println!("{:<6} {:<22} {:<20} {:.2}", kind_str, format!("{}/{}", ns_col, obj.name), "", h.score);
+                        }
+                    }
+                }
+                Output::Json => {
+                    #[derive(serde::Serialize)]
+                    struct Row<'a> { ns: &'a str, name: &'a str, score: f32 }
+                    let rows: Vec<_> = hits
+                        .into_iter()
+                        .filter_map(|h| {
+                            snap.items.get(h.doc as usize).map(|o| Row { ns: o.namespace.as_deref().unwrap_or("") , name: &o.name, score: h.score })
+                        })
+                        .collect();
+                    if explain {
+                        #[derive(serde::Serialize)]
+                        struct Explain<'a, T> { hits: T, debug: &'a orka_search::SearchDebugInfo }
+                        println!("{}", serde_json::to_string_pretty(&Explain { hits: rows, debug: &dbg })?);
+                    } else {
+                        println!("{}", serde_json::to_string_pretty(&rows)?);
+                    }
+                }
+            }
+            if explain && matches!(cli.output, Output::Human) {
+                eprintln!("debug: total={} after_ns={} after_label_keys={} after_labels={} after_anno_keys={} after_annos={} after_fields={}", dbg.total, dbg.after_ns, dbg.after_label_keys, dbg.after_labels, dbg.after_anno_keys, dbg.after_annos, dbg.after_fields);
+            }
+
+            // Shutdown
+            drop(ingest_tx);
+            watcher_handle.abort();
+        }
+        Commands::Edit { file, validate, dry_run, apply } => {
+            let ns = cli.namespace.as_deref();
+            let yaml = read_input(&file)?;
+            if validate {
+                #[cfg(feature = "validate")]
+                {
+                    // Detect GVK from YAML for schema lookup
+                    let j: serde_yaml::Value = serde_yaml::from_str(&yaml)?;
+                    let api_ver = j.get("apiVersion").and_then(|v| v.as_str()).unwrap_or("");
+                    let kind = j.get("kind").and_then(|v| v.as_str()).unwrap_or("");
+                    let gvk_key = if api_ver.contains('/') { format!("{}/{}", api_ver, kind) } else { format!("{}/{}", api_ver, kind) };
+                    let issues = orka_schema::validate::validate_yaml_for_gvk(&gvk_key, &yaml).await?;
+                    if !issues.is_empty() {
+                        eprintln!("validation issues ({}):", issues.len());
+                        for it in issues { eprintln!("- {}: {}{}", it.path, it.error, it.hint.as_deref().map(|h| format!(" ({})", h)).unwrap_or_default()); }
+                    }
+                }
+                #[cfg(not(feature = "validate"))]
+                {
+                    warn!("validate flag set but CLI built without 'validate' feature");
+                }
+            }
+            let do_apply = if apply { true } else { !dry_run };
+            match orka_apply::edit_from_yaml(&yaml, ns, validate, do_apply).await {
+                Ok(res) => match cli.output {
+                    Output::Human => {
+                        if res.dry_run {
+                            println!("dry-run: +{} ~{} -{}", res.summary.adds, res.summary.updates, res.summary.removes);
+                        } else if res.applied {
+                            println!("applied rv={}", res.new_rv.unwrap_or_default());
+                        } else {
+                            println!("no-op");
+                        }
+                    }
+                    Output::Json => println!("{}", serde_json::to_string_pretty(&res)?),
+                },
+                Err(e) => { eprintln!("edit error: {}", e); }
+            }
+        }
+        Commands::Diff { file } => {
+            let ns = cli.namespace.as_deref();
+            let yaml = read_input(&file)?;
+            match orka_apply::diff_from_yaml(&yaml, ns).await {
+                Ok((live, last)) => match cli.output {
+                    Output::Human => {
+                        println!("vs live: +{} ~{} -{}", live.adds, live.updates, live.removes);
+                        if let Some(ls) = last { println!("vs last: +{} ~{} -{}", ls.adds, ls.updates, ls.removes); }
+                    }
+                    Output::Json => {
+                        #[derive(serde::Serialize)]
+                        struct D { live: orka_apply::DiffSummary, last: Option<orka_apply::DiffSummary> }
+                        println!("{}", serde_json::to_string_pretty(&D { live, last })?);
+                    }
+                },
+                Err(e) => eprintln!("diff error: {}", e),
+            }
+        }
+        Commands::LastApplied { sub } => {
+            match sub {
+                LastAppliedCmd::Get { gvk, name, limit, output } => {
+                    // Resolve UID by fetching live object
+                    let ns = cli.namespace.as_deref();
+                    let uid_hex = fetch_uid_for(&gvk, &name, ns).await?;
+                    let uid = parse_uid(&uid_hex)?;
+                    let store = match orka_persist::SqliteStore::open_default() { Ok(s) => s, Err(e) => { eprintln!("open db error: {}", e); return Ok(()); } };
+                    let rows = store.get_last(uid, Some(limit)).unwrap_or_default();
+                    match output.unwrap_or(cli.output) {
+                        Output::Human => {
+                            for r in rows.iter() {
+                                let ts = r.ts;
+                                println!("ts={} rv={}", ts, r.rv);
+                            }
+                        }
+                        Output::Json => {
+                            #[derive(serde::Serialize)]
+                            struct Row { ts: i64, rv: String, yaml: String }
+                            let out: Vec<Row> = rows.into_iter().map(|r| Row { ts: r.ts, rv: r.rv, yaml: orka_persist::maybe_decompress(&r.yaml_zstd) }).collect();
+                            println!("{}", serde_json::to_string_pretty(&out)?);
+                        }
+                    }
+                }
+            }
+        }
+        Commands::Stats {} => {
+            // Gather config from env
+            #[derive(serde::Serialize)]
+            struct StatsOut {
+                shards: usize,
+                relist_secs: u64,
+                watch_backoff_max_secs: u64,
+                max_labels_per_obj: Option<usize>,
+                max_annos_per_obj: Option<usize>,
+                max_postings_per_key: Option<usize>,
+                metrics_addr: Option<String>,
+            }
+            let shards = std::env::var("ORKA_SHARDS").ok().and_then(|s| s.parse().ok()).unwrap_or(1);
+            let relist_secs = std::env::var("ORKA_RELIST_SECS").ok().and_then(|s| s.parse().ok()).unwrap_or(300);
+            let watch_backoff_max_secs = std::env::var("ORKA_WATCH_BACKOFF_MAX_SECS").ok().and_then(|s| s.parse().ok()).unwrap_or(30);
+            let max_labels_per_obj = std::env::var("ORKA_MAX_LABELS_PER_OBJ").ok().and_then(|s| s.parse().ok());
+            let max_annos_per_obj = std::env::var("ORKA_MAX_ANNOS_PER_OBJ").ok().and_then(|s| s.parse().ok());
+            let max_postings_per_key = std::env::var("ORKA_MAX_POSTINGS_PER_KEY").ok().and_then(|s| s.parse().ok());
+            let metrics_addr = std::env::var("ORKA_METRICS_ADDR").ok();
+
+            let out = StatsOut { shards, relist_secs, watch_backoff_max_secs, max_labels_per_obj, max_annos_per_obj, max_postings_per_key, metrics_addr };
+            match cli.output {
+                Output::Human => {
+                    println!("shards: {}", out.shards);
+                    println!("relist_secs: {}", out.relist_secs);
+                    println!("watch_backoff_max_secs: {}", out.watch_backoff_max_secs);
+                    println!("max_labels_per_obj: {}", out.max_labels_per_obj.map(|v| v.to_string()).unwrap_or_else(|| "(none)".into()));
+                    println!("max_annos_per_obj: {}", out.max_annos_per_obj.map(|v| v.to_string()).unwrap_or_else(|| "(none)".into()));
+                    println!("max_postings_per_key: {}", out.max_postings_per_key.map(|v| v.to_string()).unwrap_or_else(|| "(none)".into()));
+                    if let Some(addr) = out.metrics_addr { println!("metrics_addr: {} (exposes Prometheus /metrics)", addr); } else { println!("metrics_addr: (not set)"); }
+                }
+                Output::Json => println!("{}", serde_json::to_string_pretty(&out)?),
+            }
+        }
+    }
+
+    Ok(())
+}
+
+fn render_age(creation_ts: i64) -> String {
+    if creation_ts <= 0 { return "-".to_string(); }
+    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs() as i64;
+    let mut secs = (now - creation_ts).max(0) as u64;
+    let days = secs / 86_400; secs %= 86_400;
+    let hours = secs / 3600; secs %= 3600;
+    let mins = secs / 60; secs %= 60;
+    if days > 0 { format!("{}d{}h", days, hours) }
+    else if hours > 0 { format!("{}h{}m", hours, mins) }
+    else if mins > 0 { format!("{}m", mins) }
+    else { format!("{}s", secs) }
+}
+
+fn json_key(v: &serde_json::Value) -> String {
+    let meta = v.get("metadata");
+    let name = meta.and_then(|m| m.get("name")).and_then(|v| v.as_str()).unwrap_or("");
+    if let Some(ns) = meta.and_then(|m| m.get("namespace")).and_then(|v| v.as_str()) {
+        format!("{}/{}", ns, name)
+    } else {
+        name.to_string()
+    }
+}
+
+fn read_input(path: &str) -> Result<String> {
+    if path == "-" {
+        use std::io::Read;
+        let mut s = String::new();
+        std::io::stdin().read_to_string(&mut s)?;
+        Ok(s)
+    } else {
+        Ok(std::fs::read_to_string(path)?)
+    }
+}
+
+async fn fetch_uid_for(gvk_key: &str, name: &str, namespace: Option<&str>) -> Result<String> {
+    use kube::{discovery::{Discovery, Scope}, api::Api, core::{DynamicObject, GroupVersionKind}};
+    let client = kube::Client::try_default().await?;
+    // Parse key
+    let (group, version, kind) = parse_gvk(gvk_key).ok_or_else(|| anyhow::anyhow!("invalid gvk: {}", gvk_key))?;
+    let gvk = GroupVersionKind { group, version, kind };
+    // Find ApiResource
+    let discovery = Discovery::new(client.clone()).run().await?;
+    let mut ar_opt: Option<(kube::core::ApiResource, bool)> = None;
+    for group in discovery.groups() {
+        for (ar, caps) in group.recommended_resources() {
+            if ar.group == gvk.group && ar.version == gvk.version && ar.kind == gvk.kind {
+                ar_opt = Some((ar.clone(), matches!(caps.scope, Scope::Namespaced)));
+                break;
+            }
+        }
+    }
+    let (ar, namespaced) = ar_opt.ok_or_else(|| anyhow::anyhow!("GVK not found: {}/{}/{}", gvk.group, gvk.version, gvk.kind))?;
+    let api: Api<DynamicObject> = if namespaced {
+        match namespace {
+            Some(ns) => Api::namespaced_with(client.clone(), ns, &ar),
+            None => return Err(anyhow::anyhow!("namespace required for namespaced kind")),
+        }
+    } else { Api::all_with(client.clone(), &ar) };
+    let obj = api.get(name).await?;
+    let uid = obj.metadata.uid.ok_or_else(|| anyhow::anyhow!("object missing metadata.uid"))?;
+    Ok(uid)
+}
+
+fn parse_uid(uid_str: &str) -> Result<orka_core::Uid> {
+    let u = uuid::Uuid::parse_str(uid_str).map_err(|e| anyhow::anyhow!("invalid uid: {}", e))?;
+    Ok(*u.as_bytes())
+}
+</file>
+
+</files>

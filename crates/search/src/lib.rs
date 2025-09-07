@@ -1,11 +1,14 @@
-//! Orka search (Milestone 1 stub): lightweight in-RAM index and query over LiteObj.
+//! Orka search (Milestones 1–3): lightweight in-RAM index and query over LiteObj.
+//! M3 adds internal sharding (by namespace bucket) to scale candidates and keep
+//! ranking stable across shards.
 
 #![forbid(unsafe_code)]
 
 use fuzzy_matcher::skim::SkimMatcherV2;
 use fuzzy_matcher::FuzzyMatcher;
-use orka_core::WorldSnapshot;
+use orka_core::{WorldSnapshot, ShardPlanner};
 use std::collections::HashMap;
+use tracing::warn;
 
 pub type DocId = u32;
 
@@ -23,17 +26,29 @@ pub struct SearchDebugInfo {
     pub after_fields: usize,
 }
 
-pub struct Index {
-    texts: Vec<String>,      // by DocId
-    namespaces: Vec<String>, // empty string for cluster-scoped
-    names: Vec<String>,      // object names by DocId
-    uids: Vec<[u8; 16]>,     // object UIDs by DocId
+struct IndexShard {
+    texts: Vec<String>,
+    namespaces: Vec<String>,
+    names: Vec<String>,
+    uids: Vec<[u8; 16]>,
     projected: Vec<Vec<(u32, String)>>,
-    field_ids: HashMap<String, u32>, // json_path -> id
-    label_post: HashMap<String, Vec<usize>>, // "key=value" -> doc ids (sorted)
-    anno_post: HashMap<String, Vec<usize>>,  // "key=value" -> doc ids (sorted)
-    label_key_post: HashMap<String, Vec<usize>>, // key -> doc ids
-    anno_key_post: HashMap<String, Vec<usize>>,  // key -> doc ids
+    // Map local doc index -> global doc index in the original snapshot
+    doc_ids: Vec<usize>,
+    label_post: HashMap<String, Vec<usize>>,    // key=value -> local doc indices
+    anno_post: HashMap<String, Vec<usize>>,     // key=value -> local doc indices
+    label_key_post: HashMap<String, Vec<usize>>,// key -> local doc indices
+    anno_key_post: HashMap<String, Vec<usize>>, // key -> local doc indices
+}
+
+pub struct Index {
+    // Global arrays used for tie-breaking and for mapping hits back to snapshot indices
+    g_names: Vec<String>,
+    g_namespaces: Vec<String>,
+    g_uids: Vec<[u8; 16]>,
+    // Field path ids shared across shards
+    field_ids: HashMap<String, u32>,
+    // Shards
+    shards: Vec<IndexShard>,
     // Single-GVK metadata useful for typed filters (k:, g:) in M1
     kind: Option<String>,  // lowercased kind
     group: Option<String>, // lowercased group (empty for core)
@@ -77,79 +92,236 @@ impl Index {
         kind: Option<&str>,
         group: Option<&str>,
     ) -> Self {
-        let mut texts = Vec::with_capacity(snap.items.len());
-        let mut namespaces = Vec::with_capacity(snap.items.len());
-        let mut names = Vec::with_capacity(snap.items.len());
-        let mut uids = Vec::with_capacity(snap.items.len());
-        let mut projected = Vec::with_capacity(snap.items.len());
+        // Determine shard count from env (default 1)
+        let shards_n: usize = std::env::var("ORKA_SHARDS").ok().and_then(|s| s.parse().ok()).unwrap_or(1).max(1);
+        let mut shards: Vec<IndexShard> = (0..shards_n).map(|_| IndexShard {
+            texts: Vec::new(),
+            namespaces: Vec::new(),
+            names: Vec::new(),
+            uids: Vec::new(),
+            projected: Vec::new(),
+            doc_ids: Vec::new(),
+            label_post: HashMap::new(),
+            anno_post: HashMap::new(),
+            label_key_post: HashMap::new(),
+            anno_key_post: HashMap::new(),
+        }).collect();
+
+        let mut g_namespaces = Vec::with_capacity(snap.items.len());
+        let mut g_names = Vec::with_capacity(snap.items.len());
+        let mut g_uids = Vec::with_capacity(snap.items.len());
         let mut field_ids: HashMap<String, u32> = HashMap::new();
-        let mut label_post: HashMap<String, Vec<usize>> = HashMap::new();
-        let mut anno_post: HashMap<String, Vec<usize>> = HashMap::new();
-        let mut label_key_post: HashMap<String, Vec<usize>> = HashMap::new();
-        let mut anno_key_post: HashMap<String, Vec<usize>> = HashMap::new();
-        if let Some(pairs) = fields {
-            for (k, v) in pairs.iter() { field_ids.insert(k.clone(), *v); }
+        if let Some(pairs) = fields { for (k, v) in pairs.iter() { field_ids.insert(k.clone(), *v); } }
+        let postings_cap: Option<usize> = std::env::var("ORKA_MAX_POSTINGS_PER_KEY").ok().and_then(|s| s.parse::<usize>().ok());
+        let mut truncated_keys_total: usize = 0;
+
+        fn ns_bucket(ns: &str, shards: usize) -> usize {
+            if shards <= 1 { return 0; }
+            let mut h: u64 = 0xcbf29ce484222325;
+            for b in ns.as_bytes() { h ^= *b as u64; h = h.wrapping_mul(0x100000001b3); }
+            (h as usize) % shards
         }
+
         for (i, o) in snap.items.iter().enumerate() {
             let ns = o.namespace.as_deref().unwrap_or("");
+            let sh = ns_bucket(ns, shards_n);
+
+            // Global mirrors
+            g_namespaces.push(ns.to_string());
+            g_names.push(o.name.clone());
+            g_uids.push(o.uid);
+
+            // Build display text
             let mut display = String::new();
             if !ns.is_empty() { display.push_str(ns); display.push('/'); }
             display.push_str(&o.name);
-            // Include projected values if any
             if !o.projected.is_empty() {
                 display.push(' ');
-                for (_id, val) in o.projected.iter() {
-                    display.push_str(val);
-                    display.push(' ');
-                }
+                for (_id, val) in o.projected.iter() { display.push_str(val); display.push(' '); }
             }
-            texts.push(display);
-            namespaces.push(ns.to_string());
-            names.push(o.name.clone());
-            uids.push(o.uid);
-            projected.push(o.projected.iter().map(|(id, val)| (*id, val.clone())).collect());
 
-            // labels/annotations postings
+            let shard = &mut shards[sh];
+            let local_idx = shard.texts.len();
+            shard.texts.push(display);
+            shard.namespaces.push(ns.to_string());
+            shard.names.push(o.name.clone());
+            shard.uids.push(o.uid);
+            shard.projected.push(o.projected.iter().map(|(id, val)| (*id, val.clone())).collect());
+            shard.doc_ids.push(i);
+
+            // labels/annotations postings (local indices)
             for (k, v) in o.labels.iter() {
                 let key = format!("{}={}", k, v);
-                label_post.entry(key).or_default().push(i);
-                label_key_post.entry(k.clone()).or_default().push(i);
+                let vec = shard.label_post.entry(key).or_default();
+                if let Some(cap) = postings_cap { if vec.len() >= cap { truncated_keys_total += 1; } else { vec.push(local_idx); } } else { vec.push(local_idx); }
+                let veck = shard.label_key_post.entry(k.clone()).or_default();
+                if let Some(cap) = postings_cap { if veck.len() < cap { veck.push(local_idx); } } else { veck.push(local_idx); }
             }
             for (k, v) in o.annotations.iter() {
                 let key = format!("{}={}", k, v);
-                anno_post.entry(key).or_default().push(i);
-                anno_key_post.entry(k.clone()).or_default().push(i);
+                let vec = shard.anno_post.entry(key).or_default();
+                if let Some(cap) = postings_cap { if vec.len() >= cap { truncated_keys_total += 1; } else { vec.push(local_idx); } } else { vec.push(local_idx); }
+                let veck = shard.anno_key_post.entry(k.clone()).or_default();
+                if let Some(cap) = postings_cap { if veck.len() < cap { veck.push(local_idx); } } else { veck.push(local_idx); }
             }
         }
-        // postings are naturally sorted by increasing i
+
+        // Aggregate gauges and enforce soft cap
         metrics::gauge!("index_docs", snap.items.len() as f64);
-        let me = Self {
-            texts,
-            namespaces,
-            names,
-            uids,
-            projected,
+        let mut approx_bytes: usize = 0;
+        for sh in shards.iter() {
+            approx_bytes += sh.texts.iter().map(|s| s.len()).sum::<usize>();
+            approx_bytes += sh.namespaces.iter().map(|s| s.len()).sum::<usize>();
+            approx_bytes += sh.names.iter().map(|s| s.len()).sum::<usize>();
+            approx_bytes += sh.projected.iter().map(|v| v.iter().map(|(_id, s)| s.len()).sum::<usize>()).sum::<usize>();
+            approx_bytes += sh.label_post.values().map(|v| v.len() * std::mem::size_of::<usize>()).sum::<usize>();
+            approx_bytes += sh.anno_post.values().map(|v| v.len() * std::mem::size_of::<usize>()).sum::<usize>();
+        }
+        if let Some(cap) = std::env::var("ORKA_MAX_INDEX_BYTES").ok().and_then(|s| s.parse::<usize>().ok()) {
+            if approx_bytes > cap {
+                warn!(approx_bytes, cap, "index_bytes exceeds ORKA_MAX_INDEX_BYTES; pruning value postings");
+                // Drop value postings (label_post, anno_post) to reduce memory footprint.
+                // Keep key existence postings so that label:app (key-only) filters still work.
+                let mut dropped_keys = 0usize;
+                for sh in shards.iter_mut() {
+                    dropped_keys += sh.label_post.len();
+                    dropped_keys += sh.anno_post.len();
+                    sh.label_post.clear();
+                    sh.anno_post.clear();
+                }
+                truncated_keys_total += dropped_keys;
+                // Recompute approx_bytes after pruning
+                approx_bytes = 0;
+                for sh in shards.iter() {
+                    approx_bytes += sh.texts.iter().map(|s| s.len()).sum::<usize>();
+                    approx_bytes += sh.namespaces.iter().map(|s| s.len()).sum::<usize>();
+                    approx_bytes += sh.names.iter().map(|s| s.len()).sum::<usize>();
+                    approx_bytes += sh.projected.iter().map(|v| v.iter().map(|(_id, s)| s.len()).sum::<usize>()).sum::<usize>();
+                    approx_bytes += sh.label_post.values().map(|v| v.len() * std::mem::size_of::<usize>()).sum::<usize>();
+                    approx_bytes += sh.anno_post.values().map(|v| v.len() * std::mem::size_of::<usize>()).sum::<usize>();
+                }
+            }
+        }
+        metrics::gauge!("index_bytes", approx_bytes as f64);
+        metrics::gauge!("index_postings_truncated_keys", truncated_keys_total as f64);
+
+        Self {
+            g_names,
+            g_namespaces,
+            g_uids,
             field_ids,
-            label_post,
-            anno_post,
-            label_key_post,
-            anno_key_post,
+            shards,
             kind: kind.map(|s| s.to_ascii_lowercase()),
             group: group.map(|s| s.to_ascii_lowercase()),
-        };
-        // Approximate index bytes: sum string lengths and posting sizes
-        let mut bytes: usize = 0;
-        bytes += me.texts.iter().map(|s| s.len()).sum::<usize>();
-        bytes += me.namespaces.iter().map(|s| s.len()).sum::<usize>();
-        bytes += me.names.iter().map(|s| s.len()).sum::<usize>();
-        bytes += me.projected.iter().map(|v| v.iter().map(|(_id, s)| s.len()).sum::<usize>()).sum::<usize>();
-        bytes += me.field_ids.iter().map(|(k, _)| k.len() + std::mem::size_of::<u32>()).sum::<usize>();
-        bytes += me.label_post.iter().map(|(k, v)| k.len() + v.len() * std::mem::size_of::<usize>()).sum::<usize>();
-        bytes += me.anno_post.iter().map(|(k, v)| k.len() + v.len() * std::mem::size_of::<usize>()).sum::<usize>();
-        bytes += me.label_key_post.iter().map(|(k, v)| k.len() + v.len() * std::mem::size_of::<usize>()).sum::<usize>();
-        bytes += me.anno_key_post.iter().map(|(k, v)| k.len() + v.len() * std::mem::size_of::<usize>()).sum::<usize>();
-        metrics::gauge!("index_bytes", bytes as f64);
-        me
+        }
+    }
+
+    /// Build index with an optional shard planner. If provided, the planner's namespace bucket
+    /// is used for partitioning; otherwise, modulo by namespace is applied. The `gvk_id` can
+    /// be supplied by the caller to allow planner policies that consider GVK.
+    pub fn build_from_snapshot_with_meta_planner(
+        snap: &WorldSnapshot,
+        fields: Option<&[(String, u32)]>,
+        kind: Option<&str>,
+        group: Option<&str>,
+        planner: Option<&dyn ShardPlanner>,
+        gvk_id: Option<u32>,
+    ) -> Self {
+        // Determine shard count from env (default 1)
+        let shards_n: usize = std::env::var("ORKA_SHARDS").ok().and_then(|s| s.parse().ok()).unwrap_or(1).max(1);
+        let mut shards: Vec<IndexShard> = (0..shards_n).map(|_| IndexShard {
+            texts: Vec::new(),
+            namespaces: Vec::new(),
+            names: Vec::new(),
+            uids: Vec::new(),
+            projected: Vec::new(),
+            doc_ids: Vec::new(),
+            label_post: HashMap::new(),
+            anno_post: HashMap::new(),
+            label_key_post: HashMap::new(),
+            anno_key_post: HashMap::new(),
+        }).collect();
+
+        let mut g_namespaces = Vec::with_capacity(snap.items.len());
+        let mut g_names = Vec::with_capacity(snap.items.len());
+        let mut g_uids = Vec::with_capacity(snap.items.len());
+        let mut field_ids: HashMap<String, u32> = HashMap::new();
+        if let Some(pairs) = fields { for (k, v) in pairs.iter() { field_ids.insert(k.clone(), *v); } }
+        let postings_cap: Option<usize> = std::env::var("ORKA_MAX_POSTINGS_PER_KEY").ok().and_then(|s| s.parse::<usize>().ok());
+        let mut truncated_keys_total: usize = 0;
+
+        fn ns_bucket(ns: &str, shards: usize) -> usize {
+            if shards <= 1 { return 0; }
+            let mut h: u64 = 0xcbf29ce484222325;
+            for b in ns.as_bytes() { h ^= *b as u64; h = h.wrapping_mul(0x100000001b3); }
+            (h as usize) % shards
+        }
+
+        for (i, o) in snap.items.iter().enumerate() {
+            let ns = o.namespace.as_deref().unwrap_or("");
+            let sh = if let Some(pl) = planner { (pl.plan(gvk_id.unwrap_or(0), if ns.is_empty() { None } else { Some(ns) }).ns_bucket as usize) % shards_n } else { ns_bucket(ns, shards_n) };
+
+            // Global mirrors
+            g_namespaces.push(ns.to_string());
+            g_names.push(o.name.clone());
+            g_uids.push(o.uid);
+
+            let shard = &mut shards[sh];
+            let local_idx = shard.texts.len();
+            // Doc text = name + labels + projected fields
+            let mut t = String::new();
+            t.push_str(&o.name);
+            for (k, v) in o.labels.iter() { t.push(' '); t.push_str(k); t.push(':'); t.push_str(v); }
+            for (_id, v) in o.projected.iter() { t.push(' '); t.push_str(v); }
+            shard.texts.push(t);
+            shard.namespaces.push(ns.to_string());
+            shard.names.push(o.name.clone());
+            shard.uids.push(o.uid);
+            shard.doc_ids.push(i);
+            shard.projected.push(o.projected.clone().into_iter().collect());
+
+            for (k, v) in o.labels.iter() {
+                let key = format!("{}={}", k, v);
+                let vec = shard.label_post.entry(key).or_default();
+                if let Some(cap) = postings_cap { if vec.len() >= cap { truncated_keys_total += 1; } else { vec.push(local_idx); } } else { vec.push(local_idx); }
+                let veck = shard.label_key_post.entry(k.clone()).or_default();
+                if let Some(cap) = postings_cap { if veck.len() < cap { veck.push(local_idx); } } else { veck.push(local_idx); }
+            }
+            for (k, v) in o.annotations.iter() {
+                let key = format!("{}={}", k, v);
+                let vec = shard.anno_post.entry(key).or_default();
+                if let Some(cap) = postings_cap { if vec.len() >= cap { truncated_keys_total += 1; } else { vec.push(local_idx); } } else { vec.push(local_idx); }
+                let veck = shard.anno_key_post.entry(k.clone()).or_default();
+                if let Some(cap) = postings_cap { if veck.len() < cap { veck.push(local_idx); } } else { veck.push(local_idx); }
+            }
+        }
+
+        // Aggregate gauges
+        metrics::gauge!("index_docs", snap.items.len() as f64);
+        let mut approx_bytes: usize = 0;
+        for sh in shards.iter() {
+            approx_bytes += sh.texts.iter().map(|s| s.len()).sum::<usize>();
+            approx_bytes += sh.namespaces.iter().map(|s| s.len()).sum::<usize>();
+            approx_bytes += sh.names.iter().map(|s| s.len()).sum::<usize>();
+            approx_bytes += sh.projected.iter().map(|v| v.iter().map(|(_id, s)| s.len()).sum::<usize>()).sum::<usize>();
+            approx_bytes += sh.label_post.values().map(|v| v.len() * std::mem::size_of::<usize>()).sum::<usize>();
+            approx_bytes += sh.anno_post.values().map(|v| v.len() * std::mem::size_of::<usize>()).sum::<usize>();
+        }
+        metrics::gauge!("index_bytes", approx_bytes as f64);
+        if let Some(cap) = std::env::var("ORKA_MAX_INDEX_BYTES").ok().and_then(|s| s.parse::<usize>().ok()) {
+            if approx_bytes > cap { warn!(approx_bytes, cap, "index_bytes exceeds ORKA_MAX_INDEX_BYTES; consider increasing shards or capping postings"); }
+        }
+        metrics::gauge!("index_postings_truncated_keys", truncated_keys_total as f64);
+
+        Self {
+            g_names,
+            g_namespaces,
+            g_uids,
+            field_ids,
+            shards,
+            kind: kind.map(|s| s.to_ascii_lowercase()),
+            group: group.map(|s| s.to_ascii_lowercase()),
+        }
     }
 
     pub fn search(&self, q: &str, limit: usize) -> Vec<Hit> {
@@ -204,109 +376,107 @@ impl Index {
         if !kind_filters.is_empty() {
             let cur = self.kind.as_deref().unwrap_or("");
             let ok = kind_filters.iter().any(|k| k.eq_ignore_ascii_case(cur));
-            if !ok { return (Vec::new(), SearchDebugInfo { total: self.texts.len(), after_ns: 0, after_label_keys: 0, after_labels: 0, after_anno_keys: 0, after_annos: 0, after_fields: 0 }); }
+            if !ok { return (Vec::new(), SearchDebugInfo { total: self.g_names.len(), after_ns: 0, after_label_keys: 0, after_labels: 0, after_anno_keys: 0, after_annos: 0, after_fields: 0 }); }
         }
         if !group_filters.is_empty() {
             let cur = self.group.as_deref().unwrap_or("");
             let ok = group_filters.iter().any(|g| g.eq_ignore_ascii_case(cur));
-            if !ok { return (Vec::new(), SearchDebugInfo { total: self.texts.len(), after_ns: 0, after_label_keys: 0, after_labels: 0, after_anno_keys: 0, after_annos: 0, after_fields: 0 }); }
+            if !ok { return (Vec::new(), SearchDebugInfo { total: self.g_names.len(), after_ns: 0, after_label_keys: 0, after_labels: 0, after_anno_keys: 0, after_annos: 0, after_fields: 0 }); }
         }
-        // Seed candidates
-        let mut candidates: Vec<usize> = if let Some(ns) = ns_filter {
-            (0..self.texts.len()).filter(|i| self.namespaces.get(*i).map(|s| s == ns).unwrap_or(false)).collect()
-        } else {
-            (0..self.texts.len()).collect()
-        };
-        let total = self.texts.len();
-        let after_ns = candidates.len();
-        metrics::histogram!("search_candidates_seed", after_ns as f64);
 
-        // Intersect label key existence filters
-        for key in label_key_filters {
-            if let Some(post) = self.label_key_post.get(&key) {
-                candidates = Self::intersect_sorted(&candidates, post);
+        let total = self.g_names.len();
+        let mut after_ns_sum = 0usize;
+        let mut after_label_keys_sum = 0usize;
+        let mut after_labels_sum = 0usize;
+        let mut after_anno_keys_sum = 0usize;
+        let mut after_annos_sum = 0usize;
+        let mut passed_fields_total = 0usize;
+
+        // Evaluate per shard
+        for sh in self.shards.iter() {
+            // Seed candidates (local indices)
+            let mut candidates: Vec<usize> = if let Some(ns) = ns_filter {
+                (0..sh.texts.len()).filter(|i| sh.namespaces.get(*i).map(|s| s == ns).unwrap_or(false)).collect()
             } else {
-                let dbg = SearchDebugInfo { total, after_ns, after_label_keys: 0, after_labels: 0, after_anno_keys: 0, after_annos: 0, after_fields: 0 };
-                return (Vec::new(), dbg);
-            }
-        }
-        let after_label_keys = candidates.len();
+                (0..sh.texts.len()).collect()
+            };
+            after_ns_sum += candidates.len();
 
-        // Intersect label value filters
-        for key in label_filters {
-            if let Some(post) = self.label_post.get(&key) {
-                candidates = Self::intersect_sorted(&candidates, post);
-            } else {
-                let dbg = SearchDebugInfo { total, after_ns, after_label_keys, after_labels: 0, after_anno_keys: 0, after_annos: 0, after_fields: 0 };
-                return (Vec::new(), dbg);
+            // Intersect label key existence filters
+            for key in label_key_filters.iter() {
+                if let Some(post) = sh.label_key_post.get(key) {
+                    candidates = Self::intersect_sorted(&candidates, post);
+                } else { candidates.clear(); break; }
             }
-        }
-        let after_labels = candidates.len();
+            after_label_keys_sum += candidates.len();
 
-        // Intersect anno key existence filters
-        for key in anno_key_filters {
-            if let Some(post) = self.anno_key_post.get(&key) {
-                candidates = Self::intersect_sorted(&candidates, post);
-            } else {
-                let dbg = SearchDebugInfo { total, after_ns, after_label_keys, after_labels, after_anno_keys: 0, after_annos: 0, after_fields: 0 };
-                return (Vec::new(), dbg);
+            // Intersect label value filters
+            for key in label_filters.iter() {
+                if let Some(post) = sh.label_post.get(key) {
+                    candidates = Self::intersect_sorted(&candidates, post);
+                } else { candidates.clear(); break; }
             }
-        }
-        let after_anno_keys = candidates.len();
+            after_labels_sum += candidates.len();
 
-        // Intersect anno value filters
-        for key in anno_filters {
-            if let Some(post) = self.anno_post.get(&key) {
-                candidates = Self::intersect_sorted(&candidates, post);
-            } else {
-                let dbg = SearchDebugInfo { total, after_ns, after_label_keys, after_labels, after_anno_keys, after_annos: 0, after_fields: 0 };
-                return (Vec::new(), dbg);
+            // Intersect anno key existence filters
+            for key in anno_key_filters.iter() {
+                if let Some(post) = sh.anno_key_post.get(key) {
+                    candidates = Self::intersect_sorted(&candidates, post);
+                } else { candidates.clear(); break; }
             }
-        }
-        let after_annos = candidates.len();
+            after_anno_keys_sum += candidates.len();
 
-        // Cap candidate set size if configured
-        if let Some(maxc) = opts.max_candidates {
-            if candidates.len() > maxc { candidates.truncate(maxc); }
-        }
-        metrics::histogram!("search_candidates", candidates.len() as f64);
-
-        // Apply field filters and optional fuzzy
-        let mut passed_fields: usize = 0;
-        'doc: for i in candidates.into_iter() {
-            for (pid, ref val) in field_filters.iter() {
-                let ok = self.projected.get(i).map(|vec| vec.iter().any(|(id, v)| id == pid && v == val)).unwrap_or(false);
-                if !ok { continue 'doc; }
+            // Intersect anno value filters
+            for key in anno_filters.iter() {
+                if let Some(post) = sh.anno_post.get(key) {
+                    candidates = Self::intersect_sorted(&candidates, post);
+                } else { candidates.clear(); break; }
             }
-            passed_fields += 1;
-            if free_q.is_empty() {
-                let score = 0.0f32;
-                if opts.min_score.map(|m| score >= m).unwrap_or(true) {
-                    hits.push(Hit { doc: i as u32, score });
+            after_annos_sum += candidates.len();
+
+            // Cap candidate set size per shard if configured
+            if let Some(maxc) = opts.max_candidates { if candidates.len() > maxc { candidates.truncate(maxc); } }
+            metrics::histogram!("search_candidates", candidates.len() as f64);
+
+            // Apply field filters and optional fuzzy
+            'doc: for li in candidates.into_iter() {
+                for (pid, ref val) in field_filters.iter() {
+                    let ok = sh.projected.get(li).map(|vec| vec.iter().any(|(id, v)| id == pid && v == val)).unwrap_or(false);
+                    if !ok { continue 'doc; }
                 }
-            } else if let Some(score_i) = matcher.fuzzy_match(&self.texts[i], &free_q) {
-                let score = score_i as f32;
-                if opts.min_score.map(|m| score >= m).unwrap_or(true) {
-                    hits.push(Hit { doc: i as u32, score });
+                passed_fields_total += 1;
+                let gidx = sh.doc_ids[li];
+                if free_q.is_empty() {
+                    let score = 0.0f32;
+                    if opts.min_score.map(|m| score >= m).unwrap_or(true) {
+                        hits.push(Hit { doc: gidx as u32, score });
+                    }
+                } else if let Some(score_i) = matcher.fuzzy_match(&sh.texts[li], &free_q) {
+                    let score = score_i as f32;
+                    if opts.min_score.map(|m| score >= m).unwrap_or(true) {
+                        hits.push(Hit { doc: gidx as u32, score });
+                    }
                 }
             }
         }
+
+        // Stable ranking across shards
         hits.sort_by(|a, b| {
             b.score
                 .total_cmp(&a.score)
                 .then_with(|| {
-                    let an = &self.names[a.doc as usize];
-                    let bn = &self.names[b.doc as usize];
+                    let an = &self.g_names[a.doc as usize];
+                    let bn = &self.g_names[b.doc as usize];
                     an.cmp(bn)
                 })
                 .then_with(|| {
-                    let au = &self.uids[a.doc as usize];
-                    let bu = &self.uids[b.doc as usize];
+                    let au = &self.g_uids[a.doc as usize];
+                    let bu = &self.g_uids[b.doc as usize];
                     au.cmp(bu)
                 })
         });
         hits.truncate(limit);
-        let dbg = SearchDebugInfo { total, after_ns, after_label_keys, after_labels, after_anno_keys, after_annos, after_fields: passed_fields };
+        let dbg = SearchDebugInfo { total, after_ns: after_ns_sum, after_label_keys: after_label_keys_sum, after_labels: after_labels_sum, after_anno_keys: after_anno_keys_sum, after_annos: after_annos_sum, after_fields: passed_fields_total };
         let elapsed = started.elapsed();
         metrics::histogram!("search_eval_ms", elapsed.as_secs_f64() * 1_000.0);
         (hits, dbg)
