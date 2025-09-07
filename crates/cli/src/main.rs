@@ -309,9 +309,13 @@ async fn main() -> Result<()> {
                 // Use API snapshot for single-GVK listing
                 let (group_str, version_str, kind_str) = parse_gvk(&gvk).unwrap_or((String::new(), String::new(), String::new()));
                 let sel = orka_api::Selector { gvk: orka_api::ResourceKind { group: group_str, version: version_str, kind: kind_str, namespaced: ns.is_some() }, namespace: ns.map(|s| s.to_string()) };
-                let snap = api.snapshot(sel).await?;
+                let resp = api.snapshot(sel).await?;
+                let snap = resp.data;
                 match cli.output {
                     Output::Human => {
+                        if resp.meta.partial {
+                            eprintln!("[!] Partial results — recovering from backlog/overflow");
+                        }
                         println!("NAMESPACE   NAME                 AGE");
                         for item in snap.items.iter().filter(|o| ns.map(|n| o.namespace.as_deref() == Some(n)).unwrap_or(true)) {
                             let ns_col = item.namespace.clone().unwrap_or_else(|| "-".to_string());
@@ -326,7 +330,9 @@ async fn main() -> Result<()> {
                             .filter(|o| ns.map(|n| o.namespace.as_deref() == Some(n)).unwrap_or(true))
                             .cloned()
                             .collect();
-                        println!("{}", serde_json::to_string_pretty(&items)?);
+                        #[derive(serde::Serialize)]
+                        struct Out<'a> { items: &'a Vec<orka_core::LiteObj>, partial: bool, pressure_events: orka_api::PressureEvents }
+                        println!("{}", serde_json::to_string_pretty(&Out { items: &items, partial: resp.meta.partial, pressure_events: resp.meta.pressure_events })?);
                     }
                 }
             } else {
@@ -559,11 +565,15 @@ async fn main() -> Result<()> {
             if let Some(api) = &api {
                 let (group_str, version_str, kind_str) = parse_gvk(&gvk).unwrap_or((String::new(), String::new(), String::new()));
                 let sel = orka_api::Selector { gvk: orka_api::ResourceKind { group: group_str.clone(), version: version_str, kind: kind_str.clone(), namespaced: ns.is_some() }, namespace: ns.map(|s| s.to_string()) };
-                let snap = api.snapshot(sel.clone()).await?;
-                let (hits, dbg) = api.search(sel, &query, limit).await?;
+                let resp = api.snapshot(sel.clone()).await?;
+                let snap = resp.data;
+                let sresp = api.search(sel, &query, limit).await?;
+                let hits = sresp.hits;
+                let dbg = sresp.debug;
 
                 match cli.output {
                     Output::Human => {
+                        if resp.meta.partial { eprintln!("[!] Partial results — recovering from backlog/overflow"); }
                         println!("KIND   NAMESPACE/NAME                SCORE");
                         for h in hits {
                             if let Some(obj) = snap.items.get(h.doc as usize) {
@@ -583,10 +593,12 @@ async fn main() -> Result<()> {
                             .collect();
                         if explain {
                             #[derive(serde::Serialize)]
-                            struct Explain<'a, T> { hits: T, debug: &'a orka_search::SearchDebugInfo }
-                            println!("{}", serde_json::to_string_pretty(&Explain { hits: rows, debug: &dbg })?);
+                            struct Explain<'a, T> { hits: T, debug: &'a orka_search::SearchDebugInfo, partial: bool, pressure_events: orka_api::PressureEvents }
+                            println!("{}", serde_json::to_string_pretty(&Explain { hits: rows, debug: &dbg, partial: resp.meta.partial, pressure_events: resp.meta.pressure_events })?);
                         } else {
-                            println!("{}", serde_json::to_string_pretty(&rows)?);
+                            #[derive(serde::Serialize)]
+                            struct Out<T> { hits: T, partial: bool, pressure_events: orka_api::PressureEvents }
+                            println!("{}", serde_json::to_string_pretty(&Out { hits: rows, partial: resp.meta.partial, pressure_events: resp.meta.pressure_events })?);
                         }
                     }
                 }

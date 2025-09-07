@@ -15,6 +15,17 @@ Imperative Ops integration (logs, exec, scale, etc).
 - `orka_api` façade (snapshot, search, apply, stats).  
 - `orka_ops` crate + CLI (Imperative Ops: logs, exec, pf, scale, rollout, delete, cordon, drain).  
 
+## Lbraries to consider
+
+Core UI: egui + eframe + wgpu
+Tables/Virtualization: egui_extras::TableBuilder (stable, simple)
+Docking/Layout: egui_dock
+Code editor: egui_code_editor (+ ropey buffer)
+Syntax highlight: syntect (viewport-only)
+Toasts/Modals: egui-toast, egui-modal
+Diff view: render with similar output (side-by-side or inline)
+Graphs (owner graph): egui_graphs (optional) or simple list/tree
+
 ---
 
 ## Scope
@@ -23,7 +34,8 @@ Imperative Ops integration (logs, exec, scale, etc).
    - `orka_gui` crate using `eframe` + `egui`.
    - Shared state model: query, results, detail, edit buffer, explain, stats, ops streams.
 
-2. **Core layout**
+2. **Core layout** 
+   - use `egui_dock`
    - **Top bar:** search input with grammar + autocomplete (`egui_autocomplete`), watch toggle, ns/kind dropdown.
    - **Results panel (left):**
      - Virtualized table of results (`egui_virtual_list`, fallback `egui_extras::TableBuilder`).
@@ -32,9 +44,9 @@ Imperative Ops integration (logs, exec, scale, etc).
      - **Details:** YAML view (`egui_code_editor`) + labels/annotations.
      - **Edit:** YAML editor (`egui_code_editor`) with Validate • Dry-run • Apply flow.
      - **Explain:** filter-stage counts from search.
-     - **Logs:** streaming pod logs with follow/tail/regex. (think if we should use virtual list here)
+     - **Logs:** streaming pod logs with follow/tail/regex
      - **Terminal:** interactive exec with PTY resize. (`egui_term`)
-   - **Bottom bar:** shard count, epoch, drops, memory cap banners, clickable to open Stats modal.
+   - **Bottom bar:** shard count, epoch, drops, memory cap banners, clickable to open Stats modal
 
 3. **Imperative Ops integration**
    - Contextual **Actions bar** and row right-click menu.

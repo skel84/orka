@@ -8,9 +8,9 @@ Goal: establish *hard, trustworthy contracts* so the UI does not need to be rede
 ## 1. World Builder Performance
 - **Problem:** Linear scans (O(n)) per delta in `WorldBuilder` lead to latency under churn.
 - **Action Items:**
-  - [ ] Add `FxHashMap<Uid, usize>` alongside the `Vec<LiteObj>`.
-  - [ ] Use map for O(1) insert/update/delete.
-  - [ ] Compact vector only on `freeze()`.
+  - [x] Add `FxHashMap<Uid, usize>` alongside the `Vec<LiteObj>`.
+  - [x] Use map for O(1) insert/update/delete.
+  - [x] Compact vector only on `freeze()`.
 - **Deliverable:** Stable snapshot construction with predictable latency.
 
 ---
@@ -29,9 +29,9 @@ Goal: establish *hard, trustworthy contracts* so the UI does not need to be rede
 ## 3. Coalescer Overflow Handling
 - **Problem:** On overflow, deltas are dropped silently, causing inconsistent views.
 - **Action Items:**
-  - [ ] On overflow, trigger auto-relist for the shard.
-  - [ ] Set a sticky “partial view” flag until relist completes.
-  - [ ] Increment and expose `coalescer_dropped_total` metric.
+  - [x] On overflow, trigger auto-relist for the shard.
+  - [x] Set a sticky “partial view” flag until relist completes.
+  - [x] Increment and expose `coalescer_dropped_total` metric.
 - **Deliverable:** Deterministic recovery path + explicit signal of partial results.
 
 ---

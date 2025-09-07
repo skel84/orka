@@ -7,6 +7,7 @@ description = "Orka in-RAM store (Milestone 0)"
 
 [dependencies]
 orka-core = { path = "../core" }
+orka-kubehub = { path = "../kubehub" }
 arc-swap = { workspace = true }
 rustc-hash = { workspace = true }
 anyhow = { workspace = true }

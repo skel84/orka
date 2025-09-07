@@ -166,39 +166,31 @@ impl Index {
             }
         }
 
-        // Aggregate gauges and enforce soft cap
+        // Aggregate gauges and enforce hard cap with deterministic pruning
         metrics::gauge!("index_docs", snap.items.len() as f64);
-        let mut approx_bytes: usize = 0;
-        for sh in shards.iter() {
-            approx_bytes += sh.texts.iter().map(|s| s.len()).sum::<usize>();
-            approx_bytes += sh.namespaces.iter().map(|s| s.len()).sum::<usize>();
-            approx_bytes += sh.names.iter().map(|s| s.len()).sum::<usize>();
-            approx_bytes += sh.projected.iter().map(|v| v.iter().map(|(_id, s)| s.len()).sum::<usize>()).sum::<usize>();
-            approx_bytes += sh.label_post.values().map(|v| v.len() * std::mem::size_of::<usize>()).sum::<usize>();
-            approx_bytes += sh.anno_post.values().map(|v| v.len() * std::mem::size_of::<usize>()).sum::<usize>();
-        }
+        let mut approx_bytes: usize = approx_index_bytes(&shards);
         if let Some(cap) = std::env::var("ORKA_MAX_INDEX_BYTES").ok().and_then(|s| s.parse::<usize>().ok()) {
             if approx_bytes > cap {
-                warn!(approx_bytes, cap, "index_bytes exceeds ORKA_MAX_INDEX_BYTES; pruning value postings");
-                // Drop value postings (label_post, anno_post) to reduce memory footprint.
-                // Keep key existence postings so that label:app (key-only) filters still work.
-                let mut dropped_keys = 0usize;
-                for sh in shards.iter_mut() {
-                    dropped_keys += sh.label_post.len();
-                    dropped_keys += sh.anno_post.len();
-                    sh.label_post.clear();
-                    sh.anno_post.clear();
-                }
-                truncated_keys_total += dropped_keys;
-                // Recompute approx_bytes after pruning
-                approx_bytes = 0;
-                for sh in shards.iter() {
-                    approx_bytes += sh.texts.iter().map(|s| s.len()).sum::<usize>();
-                    approx_bytes += sh.namespaces.iter().map(|s| s.len()).sum::<usize>();
-                    approx_bytes += sh.names.iter().map(|s| s.len()).sum::<usize>();
-                    approx_bytes += sh.projected.iter().map(|v| v.iter().map(|(_id, s)| s.len()).sum::<usize>()).sum::<usize>();
-                    approx_bytes += sh.label_post.values().map(|v| v.len() * std::mem::size_of::<usize>()).sum::<usize>();
-                    approx_bytes += sh.anno_post.values().map(|v| v.len() * std::mem::size_of::<usize>()).sum::<usize>();
+                let before = approx_bytes;
+                let (after, events) = enforce_index_cap(&mut shards, cap, approx_bytes);
+                approx_bytes = after;
+                for e in events {
+                    metrics::counter!(
+                        "index_pressure_events_total",
+                        1u64,
+                        "phase" => e.phase.to_string(),
+                    );
+                    metrics::counter!(
+                        "index_pruned_bytes_total",
+                        e.trimmed_bytes as u64,
+                        "phase" => e.phase.to_string(),
+                    );
+                    metrics::counter!(
+                        "index_pruned_items_total",
+                        e.dropped_keys as u64,
+                        "phase" => e.phase.to_string(),
+                    );
+                    warn!(phase = %e.phase, before = before, after = approx_bytes, trimmed_bytes = e.trimmed_bytes, dropped_keys = e.dropped_keys, "index pressure: prune");
                 }
             }
         }
@@ -481,6 +473,126 @@ impl Index {
         metrics::histogram!("search_eval_ms", elapsed.as_secs_f64() * 1_000.0);
         (hits, dbg)
     }
+}
+
+// ----------------- Memory accounting and pruning -----------------
+
+#[derive(Debug, Clone)]
+struct PressureEvent { phase: &'static str, trimmed_bytes: usize, dropped_keys: usize }
+
+fn approx_index_bytes(shards: &Vec<IndexShard>) -> usize {
+    let mut approx: usize = 0;
+    for sh in shards.iter() {
+        // Texts and names/namespaces
+        approx += sh.texts.iter().map(|s| s.len()).sum::<usize>();
+        approx += sh.names.iter().map(|s| s.len()).sum::<usize>();
+        approx += sh.namespaces.iter().map(|s| s.len()).sum::<usize>();
+        // Projected strings
+        approx += sh.projected.iter().map(|v| v.iter().map(|(_id, s)| s.len()).sum::<usize>()).sum::<usize>();
+        // Postings memory (estimate)
+        let slot = std::mem::size_of::<usize>();
+        approx += sh.label_post.values().map(|v| v.len() * slot).sum::<usize>();
+        approx += sh.anno_post.values().map(|v| v.len() * slot).sum::<usize>();
+        approx += sh.label_key_post.values().map(|v| v.len() * slot).sum::<usize>();
+        approx += sh.anno_key_post.values().map(|v| v.len() * slot).sum::<usize>();
+        // UIDs + doc_ids fixed-size estimates
+        approx += sh.uids.len() * 16;
+        approx += sh.doc_ids.len() * std::mem::size_of::<usize>();
+    }
+    approx
+}
+
+fn enforce_index_cap(shards: &mut Vec<IndexShard>, cap: usize, approx_before: usize) -> (usize, Vec<PressureEvent>) {
+    let mut approx = approx_before;
+    let mut events: Vec<PressureEvent> = Vec::new();
+
+    // Phase 1: drop value postings (label_post, anno_post)
+    if approx > cap {
+        let (trimmed, dropped) = prune_value_postings(shards);
+        if trimmed > 0 || dropped > 0 {
+            let after = approx_index_bytes(shards);
+            events.push(PressureEvent { phase: "value_postings", trimmed_bytes: approx.saturating_sub(after), dropped_keys: dropped });
+            approx = after;
+        }
+    }
+
+    // Phase 2: drop key-only postings if still above cap
+    if approx > cap {
+        let (trimmed, dropped) = prune_key_postings(shards);
+        if trimmed > 0 || dropped > 0 {
+            let after = approx_index_bytes(shards);
+            events.push(PressureEvent { phase: "key_postings", trimmed_bytes: approx.saturating_sub(after), dropped_keys: dropped });
+            approx = after;
+        }
+    }
+
+    // Phase 3: shrink texts to names only (keep name for free-text)
+    if approx > cap {
+        let trimmed = shrink_texts_to_name(shards);
+        if trimmed > 0 {
+            let after = approx_index_bytes(shards);
+            events.push(PressureEvent { phase: "texts_to_name", trimmed_bytes: approx.saturating_sub(after), dropped_keys: 0 });
+            approx = after;
+        }
+    }
+
+    // Phase 4: drop projected values entirely as last resort
+    if approx > cap {
+        let trimmed = prune_projected(shards);
+        if trimmed > 0 {
+            let after = approx_index_bytes(shards);
+            events.push(PressureEvent { phase: "projected_values", trimmed_bytes: approx.saturating_sub(after), dropped_keys: 0 });
+            approx = after;
+        }
+    }
+
+    (approx, events)
+}
+
+fn prune_value_postings(shards: &mut Vec<IndexShard>) -> (usize, usize) {
+    let slot = std::mem::size_of::<usize>();
+    let mut bytes = 0usize;
+    let mut keys = 0usize;
+    for sh in shards.iter_mut() {
+        for (_k, v) in sh.label_post.drain() { bytes += v.len() * slot; keys += 1; }
+        for (_k, v) in sh.anno_post.drain() { bytes += v.len() * slot; keys += 1; }
+    }
+    (bytes, keys)
+}
+
+fn prune_key_postings(shards: &mut Vec<IndexShard>) -> (usize, usize) {
+    let slot = std::mem::size_of::<usize>();
+    let mut bytes = 0usize;
+    let mut keys = 0usize;
+    for sh in shards.iter_mut() {
+        for (_k, v) in sh.label_key_post.drain() { bytes += v.len() * slot; keys += 1; }
+        for (_k, v) in sh.anno_key_post.drain() { bytes += v.len() * slot; keys += 1; }
+    }
+    (bytes, keys)
+}
+
+fn shrink_texts_to_name(shards: &mut Vec<IndexShard>) -> usize {
+    let mut trimmed = 0usize;
+    for sh in shards.iter_mut() {
+        for i in 0..sh.texts.len() {
+            let old = std::mem::take(&mut sh.texts[i]);
+            let new = sh.names.get(i).cloned().unwrap_or_default();
+            if old.len() > new.len() { trimmed += old.len() - new.len(); }
+            sh.texts[i] = new;
+        }
+    }
+    trimmed
+}
+
+fn prune_projected(shards: &mut Vec<IndexShard>) -> usize {
+    let mut trimmed = 0usize;
+    for sh in shards.iter_mut() {
+        for v in sh.projected.iter_mut() {
+            trimmed += v.iter().map(|(_id, s)| s.len()).sum::<usize>();
+            v.clear();
+        }
+    }
+    trimmed
 }
 
 #[cfg(test)]

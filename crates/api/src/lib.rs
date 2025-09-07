@@ -59,6 +59,18 @@ pub struct Stats {
     pub metrics_addr: Option<String>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct PressureEvents { pub dropped: u64, pub trimmed_bytes: u64 }
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct ResponseMeta { pub partial: bool, pub pressure_events: PressureEvents, pub explain_available: bool }
+
+#[derive(Debug, Clone)]
+pub struct SnapshotResponse { pub data: orka_core::WorldSnapshot, pub meta: ResponseMeta }
+
+#[derive(Debug, Clone)]
+pub struct SearchResponse { pub hits: Vec<orka_search::Hit>, pub debug: orka_search::SearchDebugInfo, pub meta: ResponseMeta }
+
 /// API errors suitable for transport over RPC later.
 #[derive(Debug, thiserror::Error, Serialize, Deserialize)]
 pub enum OrkaError {
@@ -88,8 +100,9 @@ pub enum LiteEvent {
 pub trait OrkaApi: Send + Sync {
     async fn discover(&self) -> OrkaResult<Vec<ResourceKind>>;
 
-    /// Return a consistent snapshot for the given selector (single-GVK, optional ns).
-    async fn snapshot(&self, selector: Selector) -> OrkaResult<orka_core::WorldSnapshot>;
+    /// Return a consistent snapshot for the given selector (single-GVK, optional ns),
+    /// along with runtime metadata for UI (partial/pressure/explain).
+    async fn snapshot(&self, selector: Selector) -> OrkaResult<SnapshotResponse>;
 
     /// Search within the selector scope.
     async fn search(
@@ -97,7 +110,7 @@ pub trait OrkaApi: Send + Sync {
         selector: Selector,
         query: &str,
         limit: usize,
-    ) -> OrkaResult<(Vec<orka_search::Hit>, orka_search::SearchDebugInfo)>;
+    ) -> OrkaResult<SearchResponse>;
 
     /// Fetch raw JSON bytes for a given object reference.
     async fn get_raw(&self, reference: ResourceRef) -> OrkaResult<Vec<u8>>;
@@ -207,14 +220,14 @@ impl OrkaApi for InProcApi {
         Ok(v.into_iter().map(|r| r.into()).collect())
     }
 
-    async fn snapshot(&self, selector: Selector) -> OrkaResult<orka_core::WorldSnapshot> {
+    async fn snapshot(&self, selector: Selector) -> OrkaResult<SnapshotResponse> {
         use std::sync::Arc;
         use tokio::sync::mpsc;
         let gvk_key = Self::gvk_key(&selector.gvk);
         // Projector from CRD schema if available
-        let projector = match orka_schema::fetch_crd_schema(&gvk_key).await {
-            Ok(Some(schema)) => Some(Arc::new(schema.projector()) as Arc<dyn orka_core::Projector + Send + Sync>),
-            _ => None,
+        let (projector, explain_available) = match orka_schema::fetch_crd_schema(&gvk_key).await {
+            Ok(Some(schema)) => (Some(Arc::new(schema.projector()) as Arc<dyn orka_core::Projector + Send + Sync>), true),
+            _ => (None, false),
         };
         let cap = std::env::var("ORKA_QUEUE_CAP").ok().and_then(|s| s.parse::<usize>().ok()).unwrap_or(2048);
         let (tx, mut rx) = mpsc::channel::<orka_core::Delta>(cap);
@@ -228,7 +241,10 @@ impl OrkaApi for InProcApi {
         let mut builder = orka_store::WorldBuilder::with_projector(projector);
         builder.apply(deltas);
         let snap = builder.freeze();
-        Ok((*snap).clone())
+        Ok(SnapshotResponse {
+            data: (*snap).clone(),
+            meta: ResponseMeta { partial: false, pressure_events: PressureEvents { dropped: 0, trimmed_bytes: 0 }, explain_available },
+        })
     }
 
     async fn search(
@@ -236,8 +252,9 @@ impl OrkaApi for InProcApi {
         selector: Selector,
         query: &str,
         limit: usize,
-    ) -> OrkaResult<(Vec<orka_search::Hit>, orka_search::SearchDebugInfo)> {
-        let snap = self.snapshot(selector.clone()).await?;
+    ) -> OrkaResult<SearchResponse> {
+        let resp = self.snapshot(selector.clone()).await?;
+        let snap = resp.data.clone();
         // Field mapping and metadata
         let gvk_key = Self::gvk_key(&selector.gvk);
         let (group, kind) = (selector.gvk.group.clone(), selector.gvk.kind.clone());
@@ -250,7 +267,7 @@ impl OrkaApi for InProcApi {
             None => orka_search::Index::build_from_snapshot_with_meta(&snap, None, Some(&kind), Some(&group)),
         };
         let (hits, dbg) = index.search_with_debug_opts(query, limit, Default::default());
-        Ok((hits, dbg))
+        Ok(SearchResponse { hits, debug: dbg, meta: ResponseMeta { partial: resp.meta.partial, pressure_events: resp.meta.pressure_events, explain_available: resp.meta.explain_available } })
     }
 
     async fn get_raw(&self, reference: ResourceRef) -> OrkaResult<Vec<u8>> {
@@ -494,8 +511,9 @@ pub struct StreamHandle<T> { pub rx: tokio::sync::mpsc::Receiver<T>, pub cancel:
 impl OrkaApi for MockApi {
     async fn discover(&self) -> OrkaResult<Vec<ResourceKind>> { Ok(self.kinds.clone()) }
 
-    async fn snapshot(&self, _selector: Selector) -> OrkaResult<orka_core::WorldSnapshot> {
-        self.snapshot.clone().ok_or_else(|| OrkaError::NotFound("no snapshot".into()))
+    async fn snapshot(&self, _selector: Selector) -> OrkaResult<SnapshotResponse> {
+        let snap = self.snapshot.clone().ok_or_else(|| OrkaError::NotFound("no snapshot".into()))?;
+        Ok(SnapshotResponse { data: snap, meta: ResponseMeta::default() })
     }
 
     async fn search(
@@ -503,8 +521,8 @@ impl OrkaApi for MockApi {
         _selector: Selector,
         _query: &str,
         _limit: usize,
-    ) -> OrkaResult<(Vec<orka_search::Hit>, orka_search::SearchDebugInfo)> {
-        Ok((self.hits.clone(), self.debug.clone()))
+    ) -> OrkaResult<SearchResponse> {
+        Ok(SearchResponse { hits: self.hits.clone(), debug: self.debug.clone(), meta: ResponseMeta::default() })
     }
 
     async fn get_raw(&self, _reference: ResourceRef) -> OrkaResult<Vec<u8>> {

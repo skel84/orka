@@ -1896,6 +1896,7 @@ dependencies = [
  "chrono",
  "metrics 0.21.1",
  "orka-core",
+ "orka-kubehub",
  "rustc-hash",
  "serde",
  "serde_json",
