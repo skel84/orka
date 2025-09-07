@@ -11,6 +11,8 @@ use std::collections::HashMap;
 use tokio::signal;
 use std::time::{Duration, Instant};
 use orka_persist::Store;
+use orka_ops::{KubeOps, OrkaOps, LogOptions};
+use regex::Regex;
 
 #[derive(Parser, Debug)]
 #[command(name = "orkactl", version, about = "Orka CLI (M2)")]
@@ -101,6 +103,98 @@ enum Commands {
     },
     /// Show runtime configuration and metrics endpoint
     Stats {},
+    /// Imperative operations against Kubernetes resources
+    Ops {
+        #[command(subcommand)]
+        sub: OpsCmd,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+enum OpsCmd {
+    /// Stream logs from a pod/container
+    Logs {
+        /// Pod name
+        pod: String,
+        /// Container name (optional)
+        #[arg(short = 'c', long = "container")]
+        container: Vec<String>,
+        /// Follow the log stream
+        #[arg(long = "follow", default_value_t = true)]
+        follow: bool,
+        /// Tail the last N lines
+        #[arg(long = "tail")] 
+        tail_lines: Option<i64>,
+        /// Since seconds filter
+        #[arg(long = "since")] 
+        since_seconds: Option<i64>,
+        /// Regex filter (applied client-side)
+        #[arg(long = "grep")]
+        grep: Option<String>,
+    },
+    /// Execute a command in a pod (non-PTY by default)
+    Exec {
+        /// Pod name
+        pod: String,
+        /// Command and args (use -- to separate)
+        #[arg(required=true)]
+        cmd: Vec<String>,
+        /// Container name
+        #[arg(short = 'c', long = "container")]
+        container: Option<String>,
+        /// Allocate a TTY
+        #[arg(long = "tty", default_value_t = false)]
+        tty: bool,
+    },
+    /// Port-forward a remote pod port to local
+    Pf {
+        /// Pod name
+        pod: String,
+        /// Ports mapping: LOCAL:REMOTE (or single PORT for same)
+        mapping: String,
+    },
+    /// Scale a resource to N replicas (supports subresource when available)
+    Scale {
+        /// GVK key, e.g. "apps/v1/Deployment"
+        gvk: String,
+        /// Resource name
+        name: String,
+        /// Replicas
+        replicas: i32,
+        /// Use Scale subresource (fallback to spec.replicas on failure)
+        #[arg(long = "subresource", default_value_t = true)]
+        subresource: bool,
+    },
+    /// Rollout restart (patch template annotation)
+    #[command(name = "rr")]
+    RolloutRestart {
+        /// GVK key, e.g. "apps/v1/Deployment"
+        gvk: String,
+        /// Resource name
+        name: String,
+    },
+    /// Delete a pod
+    Delete {
+        /// Pod name
+        pod: String,
+        /// Grace period seconds
+        #[arg(long = "grace")] grace: Option<i64>,
+    },
+    /// Cordon/uncordon a node
+    Cordon {
+        /// Node name
+        node: String,
+        /// On/off (default: on)
+        #[arg(long = "off", action = ArgAction::SetTrue)] off: bool,
+    },
+    /// Drain a node (basic eviction)
+    Drain { node: String },
+    /// Discover ops capabilities (RBAC + subresources)
+    Caps {
+        /// Optional GVK to probe Scale subresource (e.g. apps/v1/Deployment)
+        #[arg(long = "gvk")]
+        gvk: Option<String>,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -568,6 +662,229 @@ async fn main() -> Result<()> {
                 Output::Json => println!("{}", serde_json::to_string_pretty(&out)?),
             }
         }
+        Commands::Ops { sub } => {
+            match sub {
+                OpsCmd::Logs { pod, container, follow, tail_lines, since_seconds, grep } => {
+                    let ns = cli.namespace.as_deref();
+                    if ns.is_none() { eprintln!("--ns is required for pod logs"); return Ok(()); }
+                    let ops = KubeOps::new();
+                    let opts = LogOptions { follow, tail_lines, since_seconds };
+                    let re = match grep { Some(pat) => match Regex::new(&pat) { Ok(r) => Some(r), Err(e) => { eprintln!("invalid regex: {}", e); return Ok(()); } }, None => None };
+                    if container.len() <= 1 {
+                        let single = container.get(0).map(|s| s.as_str());
+                        match ops.logs(ns, &pod, single, opts).await {
+                            Ok(mut handle) => {
+                                loop {
+                                    tokio::select! {
+                                        _ = signal::ctrl_c() => { handle.cancel.cancel(); break; }
+                                        maybe = handle.rx.recv() => {
+                                            match maybe {
+                                                Some(chunk) => {
+                                                    if let Some(ref r) = re { if !r.is_match(&chunk.line) { continue; } }
+                                                    match cli.output {
+                                                        Output::Human => println!("{}", chunk.line),
+                                                        Output::Json => println!("{}", serde_json::to_string(&chunk).unwrap_or_else(|_| "{}".into())),
+                                                    }
+                                                }
+                                                None => break,
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                            Err(e) => {
+                                if let Some(ae) = e.downcast_ref::<kube::Error>() { if let kube::Error::Api(api_err) = ae { if api_err.code == 403 { eprintln!("forbidden: missing get on pods/log in ns"); } else { eprintln!("logs error: {}", e); } } else { eprintln!("logs error: {}", e); } } else { eprintln!("logs error: {}", e); }
+                            }
+                        }
+                    } else {
+                        // Multi-container: spawn one stream per container and merge
+                        use tokio::sync::mpsc;
+                        #[derive(serde::Serialize)]
+                        struct MultiLine<'a> { container: &'a str, line: &'a str }
+                        let (tx, mut rx) = mpsc::channel::<(String, String)>(1024);
+                        let mut handles = Vec::new();
+                        let ns_owned = cli.namespace.clone();
+                        for c in container.iter().cloned() {
+                            let pod = pod.clone();
+                            let opts = LogOptions { follow, tail_lines, since_seconds };
+                            let ops = KubeOps::new();
+                            let txc = tx.clone();
+                            let re = re.as_ref().map(|r| r.as_str().to_string());
+                            let ns_owned = ns_owned.clone();
+                            let h = tokio::spawn(async move {
+                                match ops.logs(ns_owned.as_deref(), &pod, Some(&c), opts).await {
+                                    Ok(mut handle) => {
+                                        while let Some(chunk) = handle.rx.recv().await {
+                                            if let Some(ref pat) = re { if let Ok(r) = Regex::new(pat) { if !r.is_match(&chunk.line) { continue; } } }
+                                            let _ = txc.send((c.clone(), chunk.line)).await;
+                                        }
+                                    }
+                                    Err(_) => { /* ignore individual errors; main thread will report */ }
+                                }
+                            });
+                            handles.push(h);
+                        }
+                        drop(tx);
+                        loop {
+                            tokio::select! {
+                                _ = signal::ctrl_c() => { break; }
+                                maybe = rx.recv() => {
+                                    match maybe {
+                                        Some((c, line)) => match cli.output {
+                                            Output::Human => println!("[{}] {}", c, line),
+                                            Output::Json => println!("{}", serde_json::to_string(&MultiLine { container: &c, line: &line }).unwrap_or_else(|_| "{}".into())),
+                                        },
+                                        None => break,
+                                    }
+                                }
+                            }
+                        }
+                        for h in handles { h.abort(); }
+                    }
+                }
+                OpsCmd::Exec { pod, cmd, container, tty } => {
+                    let ns = cli.namespace.as_deref();
+                    if ns.is_none() { eprintln!("--ns is required for exec"); return Ok(()); }
+                    let ops = KubeOps::new();
+                    if let Err(e) = ops.exec(ns, &pod, container.as_deref(), &cmd, tty).await {
+                        if let Some(ae) = e.downcast_ref::<kube::Error>() { if let kube::Error::Api(api_err) = ae { if api_err.code == 403 { eprintln!("forbidden: missing create on pods/exec in ns"); } else { eprintln!("exec error: {}", e); } } else { eprintln!("exec error: {}", e); } } else { eprintln!("exec error: {}", e); }
+                    }
+                }
+                OpsCmd::Pf { pod, mapping } => {
+                    let ns = cli.namespace.as_deref();
+                    if ns.is_none() { eprintln!("--ns is required for pf"); return Ok(()); }
+                    let (local, remote) = parse_port_mapping(&mapping)?;
+                    let ops = KubeOps::new();
+                    match ops.port_forward(ns, &pod, local, remote).await {
+                        Ok(mut handle) => {
+                            // Wait for events; exit on Ctrl-C
+                            loop {
+                                tokio::select! {
+                                    _ = signal::ctrl_c() => { handle.cancel.cancel(); break; }
+                                    maybe = handle.rx.recv() => {
+                                        match maybe {
+                                            Some(e) => match cli.output {
+                                                Output::Human => render_pf_event(&e),
+                                                Output::Json => println!("{}", serde_json::to_string(&e).unwrap_or_else(|_| "{}".into())),
+                                            },
+                                            None => break,
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            if let Some(ae) = e.downcast_ref::<kube::Error>() { if let kube::Error::Api(api_err) = ae { if api_err.code == 403 { eprintln!("forbidden: missing create on pods/portforward in ns"); } else { eprintln!("pf error: {}", e); } } else { eprintln!("pf error: {}", e); } } else { eprintln!("pf error: {}", e); }
+                        }
+                    }
+                }
+                OpsCmd::Scale { gvk, name, replicas, subresource } => {
+                    let ns = cli.namespace.as_deref();
+                    let ops = KubeOps::new();
+                    match ops.scale(&gvk, ns, &name, replicas, subresource).await {
+                        Ok(_) => match cli.output {
+                            Output::Human => println!("scaled {} to {}", name, replicas),
+                            Output::Json => {
+                                #[derive(serde::Serialize)]
+                                struct Out<'a> { op: &'a str, gvk: &'a str, name: &'a str, replicas: i32, used_subresource: bool, status: &'a str }
+                                println!("{}", serde_json::to_string_pretty(&Out { op: "scale", gvk: &gvk, name: &name, replicas, used_subresource: subresource, status: "ok" })?);
+                            }
+                        },
+                        Err(e) => {
+                            if let Some(ae) = e.downcast_ref::<kube::Error>() { if let kube::Error::Api(api_err) = ae { if api_err.code == 403 { eprintln!("forbidden: missing patch on {}/scale or {} in ns", gvk, gvk); } else { eprintln!("scale error: {}", e); } } else { eprintln!("scale error: {}", e); } } else { eprintln!("scale error: {}", e); }
+                        }
+                    }
+                }
+                OpsCmd::RolloutRestart { gvk, name } => {
+                    let ns = cli.namespace.as_deref();
+                    let ops = KubeOps::new();
+                    match ops.rollout_restart(&gvk, ns, &name).await {
+                        Ok(_) => match cli.output {
+                            Output::Human => println!("restarted {}", name),
+                            Output::Json => {
+                                #[derive(serde::Serialize)]
+                                struct Out<'a> { op: &'a str, gvk: &'a str, name: &'a str, status: &'a str }
+                                println!("{}", serde_json::to_string_pretty(&Out { op: "rollout_restart", gvk: &gvk, name: &name, status: "ok" })?);
+                            }
+                        },
+                        Err(e) => {
+                            if let Some(ae) = e.downcast_ref::<kube::Error>() { if let kube::Error::Api(api_err) = ae { if api_err.code == 403 { eprintln!("forbidden: missing patch on {} in ns", gvk); } else { eprintln!("rollout-restart error: {}", e); } } else { eprintln!("rollout-restart error: {}", e); } } else { eprintln!("rollout-restart error: {}", e); }
+                        }
+                    }
+                }
+                OpsCmd::Delete { pod, grace } => {
+                    let ns = cli.namespace.as_deref().ok_or_else(|| anyhow::anyhow!("--ns required for delete"))?;
+                    let ops = KubeOps::new();
+                    match ops.delete_pod(ns, &pod, grace).await {
+                        Ok(_) => match cli.output {
+                            Output::Human => println!("deleted {}", pod),
+                            Output::Json => {
+                                #[derive(serde::Serialize)]
+                                struct Out<'a> { op: &'a str, namespace: &'a str, pod: &'a str, grace: Option<i64>, status: &'a str }
+                                println!("{}", serde_json::to_string_pretty(&Out { op: "delete_pod", namespace: ns, pod: &pod, grace, status: "ok" })?);
+                            }
+                        },
+                        Err(e) => {
+                            if let Some(ae) = e.downcast_ref::<kube::Error>() { if let kube::Error::Api(api_err) = ae { if api_err.code == 403 { eprintln!("forbidden: missing delete on pods in ns"); } else { eprintln!("delete error: {}", e); } } else { eprintln!("delete error: {}", e); } } else { eprintln!("delete error: {}", e); }
+                        }
+                    }
+                }
+                OpsCmd::Cordon { node, off } => {
+                    let ops = KubeOps::new();
+                    match ops.cordon(&node, !off).await {
+                        Ok(_) => match cli.output {
+                            Output::Human => println!("{} {}", if off {"uncordoned"} else {"cordoned"}, node),
+                            Output::Json => {
+                                #[derive(serde::Serialize)]
+                                struct Out<'a> { op: &'a str, node: &'a str, on: bool, status: &'a str }
+                                println!("{}", serde_json::to_string_pretty(&Out { op: "cordon", node: &node, on: !off, status: "ok" })?);
+                            }
+                        },
+                        Err(e) => {
+                            if let Some(ae) = e.downcast_ref::<kube::Error>() { if let kube::Error::Api(api_err) = ae { if api_err.code == 403 { eprintln!("forbidden: missing patch on nodes"); } else { eprintln!("cordon error: {}", e); } } else { eprintln!("cordon error: {}", e); } } else { eprintln!("cordon error: {}", e); }
+                        }
+                    }
+                }
+                OpsCmd::Drain { node } => {
+                    let ops = KubeOps::new();
+                    match ops.drain(&node).await {
+                        Ok(_) => match cli.output {
+                            Output::Human => println!("drain initiated for {}", node),
+                            Output::Json => {
+                                #[derive(serde::Serialize)]
+                                struct Out<'a> { op: &'a str, node: &'a str, status: &'a str }
+                                println!("{}", serde_json::to_string_pretty(&Out { op: "drain", node: &node, status: "ok" })?);
+                            }
+                        },
+                        Err(e) => {
+                            if let Some(ae) = e.downcast_ref::<kube::Error>() { if let kube::Error::Api(api_err) = ae { if api_err.code == 403 { eprintln!("forbidden: missing create on pods/eviction and/or delete on pods across namespaces"); } else { eprintln!("drain error: {}", e); } } else { eprintln!("drain error: {}", e); } } else { eprintln!("drain error: {}", e); }
+                        }
+                    }
+                }
+                OpsCmd::Caps { gvk } => {
+                    let ns = cli.namespace.as_deref();
+                    match KubeOps::discover_caps(ns, gvk.as_deref()).await {
+                        Ok(caps) => match cli.output {
+                            Output::Human => {
+                                println!("namespace: {}", caps.namespace.as_deref().unwrap_or("(none)"));
+                                println!("pods/log get: {}", if caps.pods_log_get { "yes" } else { "no" });
+                                println!("pods/exec create: {}", if caps.pods_exec_create { "yes" } else { "no" });
+                                println!("pods/portforward create: {}", if caps.pods_portforward_create { "yes" } else { "no" });
+                                println!("nodes patch: {}", if caps.nodes_patch { "yes" } else { "no" });
+                                match caps.pods_eviction_create { Some(b) => println!("pods/eviction create: {}", if b { "yes" } else { "no" }), None => println!("pods/eviction create: (ns not set)") }
+                                if let Some(sc) = caps.scale {
+                                    println!("scale for {} ({}): subresource patch: {}, spec.replicas patch: {}", sc.gvk, sc.resource, if sc.subresource_patch {"yes"} else {"no"}, if sc.spec_replicas_patch {"yes"} else {"no"});
+                                } else {
+                                    println!("scale: (no gvk provided)");
+                                }
+                            }
+                            Output::Json => println!("{}", serde_json::to_string_pretty(&caps)?),
+                        },
+                        Err(e) => eprintln!("caps error: {}", e),
+                    }
+                }
+            }
+        }
     }
 
     Ok(())
@@ -639,4 +956,63 @@ async fn fetch_uid_for(gvk_key: &str, name: &str, namespace: Option<&str>) -> Re
 fn parse_uid(uid_str: &str) -> Result<orka_core::Uid> {
     let u = uuid::Uuid::parse_str(uid_str).map_err(|e| anyhow::anyhow!("invalid uid: {}", e))?;
     Ok(*u.as_bytes())
+}
+
+fn parse_port_mapping(s: &str) -> Result<(u16, u16)> {
+    if let Some((l, r)) = s.split_once(':') {
+        let lp: u16 = l.parse().map_err(|_| anyhow::anyhow!("invalid local port: {}", l))?;
+        let rp: u16 = r.parse().map_err(|_| anyhow::anyhow!("invalid remote port: {}", r))?;
+        Ok((lp, rp))
+    } else {
+        let p: u16 = s.parse().map_err(|_| anyhow::anyhow!("invalid port: {}", s))?;
+        Ok((p, p))
+    }
+}
+
+fn render_pf_event(e: &orka_ops::ForwardEvent) {
+    match e {
+        orka_ops::ForwardEvent::Ready(addr) => println!("ready on {}", addr),
+        orka_ops::ForwardEvent::Connected(peer) => println!("connected: {}", peer),
+        orka_ops::ForwardEvent::Closed => println!("closed"),
+        orka_ops::ForwardEvent::Error(err) => eprintln!("error: {}", err),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_gvk_core_and_group() {
+        let core = parse_gvk("v1/Pod").expect("ok");
+        assert_eq!(core, ("".into(), "v1".into(), "Pod".into()));
+        let grp = parse_gvk("apps/v1/Deployment").expect("ok");
+        assert_eq!(grp, ("apps".into(), "v1".into(), "Deployment".into()));
+        assert!(parse_gvk("bad").is_none());
+    }
+
+    #[test]
+    fn parse_port_mapping_variants() {
+        assert_eq!(parse_port_mapping("8080").unwrap(), (8080, 8080));
+        assert_eq!(parse_port_mapping("9999:80").unwrap(), (9999, 80));
+        assert!(parse_port_mapping("notaport").is_err());
+        assert!(parse_port_mapping("12:not").is_err());
+    }
+
+    #[test]
+    fn parse_uid_valid_and_invalid() {
+        // 16-byte UUID
+        let u = uuid::Uuid::new_v4();
+        let uid = parse_uid(&u.to_string()).expect("ok");
+        assert_eq!(uid, *u.as_bytes());
+        assert!(parse_uid("not-a-uuid").is_err());
+    }
+
+    #[test]
+    fn json_key_with_and_without_ns() {
+        let v1: serde_json::Value = serde_json::json!({"metadata": {"name": "n"}});
+        assert_eq!(json_key(&v1), "n");
+        let v2: serde_json::Value = serde_json::json!({"metadata": {"namespace": "ns", "name": "n"}});
+        assert_eq!(json_key(&v2), "ns/n");
+    }
 }

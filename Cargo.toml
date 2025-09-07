@@ -8,6 +8,7 @@ members = [
     "crates/search",
     "crates/persist",
     "crates/apply",
+    "crates/ops",
 ]
 resolver = "2"
 
@@ -27,9 +28,10 @@ uuid = { version = "1", features = ["v4"] }
 chrono = { version = "0.4", default-features = false, features = ["std", "clock"] }
 smallvec = { version = "1", features = ["serde"] }
 fuzzy-matcher = "0.3"
+regex = "1"
 
 # Kube stack (exact version can be adjusted later)
-kube = { version = "0.90", features = ["runtime", "client", "derive"] }
+kube = { version = "0.90", features = ["runtime", "client", "derive", "ws"] }
 k8s-openapi = { version = "0.21", features = ["latest"] }
 metrics = "0.21"
 metrics-exporter-prometheus = "0.14"

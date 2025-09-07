@@ -1,0 +1,27 @@
+[package]
+name = "orka_ops"
+version = "0.0.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+description = "Orka Ops: imperative Kubernetes operations (Milestone OPS 3.1)"
+
+[dependencies]
+anyhow = { workspace = true }
+tracing = { workspace = true }
+tokio = { workspace = true }
+futures = { workspace = true }
+serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true }
+kube = { workspace = true }
+k8s-openapi = { workspace = true }
+async-trait = "0.1"
+bytes = "1"
+tokio-util = { version = "0.7", features = ["io", "compat"] }
+crossterm = "0.27"
+chrono = { workspace = true }
+
+[dev-dependencies]
+async-stream = "0.3"
+
+[features]
+default = []

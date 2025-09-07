@@ -32,8 +32,8 @@ Imperative Ops integration (logs, exec, scale, etc).
      - **Details:** YAML view (`egui_code_editor`) + labels/annotations.
      - **Edit:** YAML editor (`egui_code_editor`) with Validate • Dry-run • Apply flow.
      - **Explain:** filter-stage counts from search.
-     - **Logs:** streaming pod logs with follow/tail/regex.
-     - **Terminal:** interactive exec with PTY resize.
+     - **Logs:** streaming pod logs with follow/tail/regex. (think if we should use virtual list here)
+     - **Terminal:** interactive exec with PTY resize. (`egui_term`)
    - **Bottom bar:** shard count, epoch, drops, memory cap banners, clickable to open Stats modal.
 
 3. **Imperative Ops integration**

@@ -1,0 +1,37 @@
+name: ops-smoke
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  kind-smoke:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: Setup kubectl
+        uses: azure/setup-kubectl@v4
+        with:
+          version: v1.30.2
+
+      - name: Setup kind
+        uses: helm/kind-action@v1.10.0
+        with:
+          cluster_name: orka-ops-smoke
+
+      - name: Ops smoke test
+        env:
+          RUSTFLAGS: -D warnings
+        run: |
+          bash scripts/kind-ops-smoke.sh
+

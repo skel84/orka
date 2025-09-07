@@ -13,6 +13,7 @@ orka-schema = { path = "../schema" }
 orka-search = { path = "../search" }
 orka-apply = { path = "../apply" }
 orka-persist = { path = "../persist" }
+orka_ops = { path = "../ops" }
 anyhow = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
@@ -25,6 +26,7 @@ metrics = { workspace = true }
 metrics-exporter-prometheus = { workspace = true }
 kube = { workspace = true }
 uuid = { workspace = true }
+regex = { workspace = true }
 
 [[bin]]
 name = "orkactl"
