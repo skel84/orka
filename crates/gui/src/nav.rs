@@ -72,7 +72,7 @@ impl OrkaGuiApp {
     }
 
     fn ui_single_item(&mut self, ui: &mut egui::Ui, idx: usize, label: &str) {
-        let selected = self.selected_idx == Some(idx);
+        let selected = self.selection.selected_idx == Some(idx);
         let resp = ui.selectable_label(selected, label);
         if resp.clicked() { self.on_select_idx(idx); }
     }
@@ -102,7 +102,7 @@ impl OrkaGuiApp {
         use std::collections::BTreeMap;
         // group -> Vec<(idx, kind)>
         let mut groups: BTreeMap<String, Vec<(usize, String)>> = BTreeMap::new();
-        for (idx, k) in self.kinds.iter().enumerate() {
+        for (idx, k) in self.discovery.kinds.iter().enumerate() {
             if Self::is_builtin_group(&k.group) { continue; }
             let entry = groups.entry(k.group.clone()).or_default();
             entry.push((idx, k.kind.clone()));
@@ -117,7 +117,7 @@ impl OrkaGuiApp {
                         .default_open(false)
                         .show(ui, |ui| {
                             for (idx, name) in kinds.into_iter() {
-                                let selected = self.selected_idx == Some(idx);
+                                let selected = self.selection.selected_idx == Some(idx);
                                 let resp = ui.selectable_label(selected, name);
                                 if resp.clicked() { self.on_select_idx(idx); }
                             }
@@ -129,7 +129,7 @@ impl OrkaGuiApp {
     fn find_kind_index(&self, group: &str, kind: &str) -> Option<usize> {
         // Prefer v1 when multiple versions exist
         let mut candidate: Option<usize> = None;
-        for (idx, k) in self.kinds.iter().enumerate() {
+        for (idx, k) in self.discovery.kinds.iter().enumerate() {
             if k.kind == kind && ((group.is_empty() && k.group.is_empty()) || k.group == group) {
                 if k.version == "v1" { return Some(idx); }
                 candidate = Some(idx);
@@ -139,24 +139,23 @@ impl OrkaGuiApp {
     }
 
     fn on_select_idx(&mut self, idx: usize) {
-        if let Some(k) = self.kinds.get(idx).cloned() {
+        if let Some(k) = self.discovery.kinds.get(idx).cloned() {
             tracing::info!(gvk = %gvk_label(&k), "ui: kind clicked");
-            self.selected_kind = Some(k);
-            self.selected_idx = Some(idx);
+            self.selection.selected_kind = Some(k);
+            self.selection.selected_idx = Some(idx);
         }
     }
 
     fn on_select_gvk(&mut self, rk: ResourceKind) {
         tracing::info!(gvk = %gvk_label(&rk), "ui: kind clicked");
-        self.selected_kind = Some(rk);
-        self.selected_idx = None;
+        self.selection.selected_kind = Some(rk);
+        self.selection.selected_idx = None;
     }
 
     pub(crate) fn current_selected_kind(&self) -> Option<&ResourceKind> {
-        match self.selected_kind.as_ref() {
+        match self.selection.selected_kind.as_ref() {
             Some(k) => Some(k),
-            None => self.selected_idx.and_then(|i| self.kinds.get(i)),
+            None => self.selection.selected_idx.and_then(|i| self.discovery.kinds.get(i)),
         }
     }
 }
-

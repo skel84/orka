@@ -12,16 +12,16 @@ use super::{OrkaGuiApp, UiUpdate};
 
 impl OrkaGuiApp {
     pub(crate) fn ui_explain(&mut self, ui: &mut egui::Ui) {
-        let has = self.search_explain.is_some();
+        let has = self.search.explain.is_some();
         egui::CollapsingHeader::new("Explain (Search)")
             .default_open(false)
             .show(ui, |ui| {
-                if let Some(ex) = &self.search_explain {
+                if let Some(ex) = &self.search.explain {
                     ui.label(format!(
                         "total={} ns={} label_keys={} labels={} anno_keys={} annos={} fields={}",
                         ex.total, ex.after_ns, ex.after_label_keys, ex.after_labels, ex.after_anno_keys, ex.after_annos, ex.after_fields
                     ));
-                    if self.search_partial {
+                    if self.search.partial {
                         ui.label(egui::RichText::new("partial results — recovering from backlog/overflow").color(ui.visuals().warn_fg_color));
                     }
                 } else {
@@ -37,10 +37,10 @@ impl OrkaGuiApp {
             .show(ui, |ui| {
                 // Explain section (collapsed by default)
                 self.ui_explain(ui);
-                if self.detail_buffer.is_empty() {
+                if self.details.buffer.is_empty() {
                     ui.label("Select a row to view details");
                 } else {
-                    let te = egui::TextEdit::multiline(&mut self.detail_buffer)
+                    let te = egui::TextEdit::multiline(&mut self.details.buffer)
                         .font(egui::TextStyle::Monospace)
                         .desired_rows(24)
                         .desired_width(f32::INFINITY)
@@ -52,10 +52,10 @@ impl OrkaGuiApp {
 
     pub(crate) fn select_row(&mut self, it: LiteObj) {
         info!(uid = ?it.uid, name = %it.name, ns = %it.namespace.as_deref().unwrap_or("-"), "details: selecting row");
-        self.selected = Some(it.uid);
-        self.detail_buffer.clear();
+        self.details.selected = Some(it.uid);
+        self.details.buffer.clear();
         // cancel previous detail task if any
-        if let Some(stop) = self.detail_stop.take() {
+        if let Some(stop) = self.details.stop.take() {
             info!("details: cancelling previous task");
             let _ = stop.send(());
         }
@@ -64,11 +64,11 @@ impl OrkaGuiApp {
         // build reference
         let reference = ResourceRef { cluster: None, gvk: kind, namespace: it.namespace.clone(), name: it.name.clone() };
         let api = self.api.clone();
-        let tx_opt = self.updates_tx.clone();
+        let tx_opt = self.watch.updates_tx.clone();
         let (stop_tx, mut stop_rx) = tokio::sync::oneshot::channel::<()>();
-        self.detail_stop = Some(stop_tx);
+        self.details.stop = Some(stop_tx);
         // spawn fetch task
-        self.detail_task = Some(tokio::spawn(async move {
+        self.details.task = Some(tokio::spawn(async move {
             let t0 = Instant::now();
             info!(gvk = %gvk_label(&reference.gvk), name = %reference.name, ns = %reference.namespace.as_deref().unwrap_or("-"), "details: fetch start");
             let fetch = async {
