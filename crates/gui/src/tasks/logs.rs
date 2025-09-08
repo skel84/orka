@@ -5,7 +5,7 @@ use orka_api::{OpsLogOptions as LogOptions, api_ops};
 use tracing::info;
 
 impl OrkaGuiApp {
-    fn current_pod_selection(&self) -> Option<(String, String)> {
+    pub(crate) fn current_pod_selection(&self) -> Option<(String, String)> {
         let Some(uid) = self.details.selected else { return None; };
         let Some(kind) = self.current_selected_kind() else { return None; };
         // Only pods are supported for logs for now
@@ -16,7 +16,10 @@ impl OrkaGuiApp {
     }
 
     pub(crate) fn stop_logs_task(&mut self) {
-        if let Some(cancel) = self.logs.cancel.take() { cancel.cancel(); }
+        if let Some(cancel) = self.logs.cancel.take() {
+            tracing::info!("logs: stop requested");
+            cancel.cancel();
+        }
         if let Some(task) = self.logs.task.take() { task.abort(); }
         self.logs.running = false;
     }
@@ -32,6 +35,7 @@ impl OrkaGuiApp {
         let follow = self.logs.follow;
         let tail = self.logs.tail_lines;
         let since = self.logs.since_seconds;
+        tracing::info!(ns = %ns, pod = %pod, container = ?container, follow, tail = ?tail, since = ?since, "logs: start requested");
         let api = self.api.clone();
         let tx_opt = self.watch.updates_tx.clone();
         self.logs.running = true;
@@ -40,6 +44,7 @@ impl OrkaGuiApp {
             let ops = api_ops(api.as_ref());
             match ops.logs(Some(&ns), &pod, container.as_deref(), opts).await {
                 Ok(handle) => {
+                    info!(ns = %ns, pod = %pod, container = ?container, "logs: stream open");
                     if let Some(tx) = &tx_opt { let _ = tx.send(UiUpdate::LogStarted(handle.cancel)); }
                     let mut rx = handle.rx;
                     // Bridge loop

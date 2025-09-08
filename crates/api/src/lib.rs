@@ -16,6 +16,8 @@ pub use orka_ops::CancelHandle as OpsCancelHandle;
 pub use orka_ops::LogChunk as OpsLogChunk;
 pub use orka_ops::StreamHandle as OpsStreamHandle;
 pub use orka_ops::ForwardEvent as OpsForwardEvent;
+pub use orka_ops::OpsCaps as OpsCaps;
+pub use orka_ops::ScaleCaps as OpsScaleCaps;
 pub use orka_schema::CrdSchema; // Re-export schema type
 pub use orka_persist::LastApplied; // Re-export last-applied row
 use std::collections::HashMap;
@@ -631,6 +633,45 @@ impl ApiOps {
             }
         });
         Ok(StreamHandle { rx, cancel: CancelHandle { task: Some(task) } })
+    }
+
+    /// Discover ops capabilities (RBAC + subresources).
+    pub async fn caps(&self, namespace: Option<&str>, scale_gvk: Option<&str>) -> OrkaResult<OpsCaps> {
+        self.inner.caps(namespace, scale_gvk).await.map_err(|e| OrkaError::Internal(e.to_string()))
+    }
+
+    /// Scale a workload to the specified replicas.
+    pub async fn scale(&self, gvk_key: &str, namespace: Option<&str>, name: &str, replicas: i32, use_subresource: bool) -> OrkaResult<()> {
+        self.inner
+            .scale(gvk_key, namespace, name, replicas, use_subresource)
+            .await
+            .map_err(|e| OrkaError::Internal(e.to_string()))
+    }
+
+    /// Trigger a rollout restart for a workload.
+    pub async fn rollout_restart(&self, gvk_key: &str, namespace: Option<&str>, name: &str) -> OrkaResult<()> {
+        self.inner
+            .rollout_restart(gvk_key, namespace, name)
+            .await
+            .map_err(|e| OrkaError::Internal(e.to_string()))
+    }
+
+    /// Delete a pod with optional grace period.
+    pub async fn delete_pod(&self, namespace: &str, pod: &str, grace_seconds: Option<i64>) -> OrkaResult<()> {
+        self.inner
+            .delete_pod(namespace, pod, grace_seconds)
+            .await
+            .map_err(|e| OrkaError::Internal(e.to_string()))
+    }
+
+    /// Cordon or uncordon a node.
+    pub async fn cordon(&self, node: &str, on: bool) -> OrkaResult<()> {
+        self.inner.cordon(node, on).await.map_err(|e| OrkaError::Internal(e.to_string()))
+    }
+
+    /// Drain a node (best-effort).
+    pub async fn drain(&self, node: &str) -> OrkaResult<()> {
+        self.inner.drain(node).await.map_err(|e| OrkaError::Internal(e.to_string()))
     }
 }
 

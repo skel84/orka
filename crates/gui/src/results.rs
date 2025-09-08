@@ -135,7 +135,7 @@ impl OrkaGuiApp {
                 let is_sorted = self.results.sort_col == Some(col_idx);
                 let mut text = label.to_string();
                 if is_sorted { text.push_str(if self.results.sort_asc { " ↑" } else { " ↓" }); }
-                let resp = ui.add_sized([spec.width, row_h], egui::SelectableLabel::new(is_sorted, egui::RichText::new(text).strong()));
+                let resp = ui.add_sized([spec.width, row_h], egui::Button::new(egui::RichText::new(text).strong()).selected(is_sorted));
                 if resp.clicked() {
                     if is_sorted { self.results.sort_asc = !self.results.sort_asc; } else { self.results.sort_col = Some(col_idx); self.results.sort_asc = true; }
                     self.results.sort_dirty = true;
@@ -170,8 +170,51 @@ impl OrkaGuiApp {
                             }
                             match spec.kind {
                                 ColumnKind::Name | ColumnKind::Namespace => {
-                                    let resp = ui.add_sized([spec.width, row_h], egui::SelectableLabel::new(is_sel, egui::RichText::new(text).monospace()));
+                                    let resp = ui.add_sized([spec.width, row_h], egui::Button::new(egui::RichText::new(text).monospace()).selected(is_sel));
                                     if resp.clicked() { self.select_row(it.clone()); }
+                                    // Context menu on right-click
+                                    resp.context_menu(|ui| {
+                                        if ui.button("Open Details").clicked() {
+                                            self.select_row(it.clone());
+                                            ui.close();
+                                        }
+                                        let logs_enabled = self.selected_is_pod() && self.ops.caps.as_ref().map(|c| c.pods_log_get).unwrap_or(false);
+                                        if logs_enabled {
+                                            if ui.button("Logs").clicked() {
+                                                self.select_row(it.clone());
+                                                self.start_logs_task();
+                                                ui.close();
+                                            }
+                                        } else {
+                                            ui.add_enabled(false, egui::Button::new("Logs")).on_hover_text("Logs available for Pods only");
+                                        }
+                                        // Workload ops: Rollout / Scale
+                                        let scalable = self.ops.caps.as_ref().and_then(|c| c.scale.as_ref()).is_some();
+                                        if scalable {
+                                            if ui.button("Rollout Restart").clicked() {
+                                                tracing::info!(name = %it.name, ns = %it.namespace.as_deref().unwrap_or("-"), "ui: rollout restart click (row menu)");
+                                                self.select_row(it.clone());
+                                                self.start_rollout_restart_task();
+                                                ui.close();
+                                            }
+                                            if ui.button("Scale…").clicked() {
+                                                tracing::info!(name = %it.name, ns = %it.namespace.as_deref().unwrap_or("-"), "ui: scale prompt open (row menu)");
+                                                self.select_row(it.clone());
+                                                self.ops.scale_prompt_open = true;
+                                                ui.close();
+                                            }
+                                        }
+                                        // Delete Pod (Pods only)
+                                        if self.selected_is_pod() {
+                                            if ui.button("Delete…").clicked() {
+                                                self.select_row(it.clone());
+                                                if let Some((ns, pod)) = self.current_pod_selection() {
+                                                    self.ops.confirm_delete = Some((ns, pod));
+                                                }
+                                                ui.close();
+                                            }
+                                        }
+                                    });
                                 }
                                 _ => {
                                     ui.add_sized([spec.width, row_h], egui::Label::new(egui::RichText::new(text).monospace()));
@@ -248,8 +291,51 @@ impl<'a> TableDelegate for ResultsDelegate<'a> {
                 if is_hit && matches!(spec.kind, ColumnKind::Name) { text = format!("★ {}", text); }
                 match spec.kind {
                     ColumnKind::Name | ColumnKind::Namespace => {
-                        let resp = ui.selectable_label(is_sel, egui::RichText::new(text).monospace());
-                        if resp.clicked() { self.app.select_row(it); }
+                        let resp = ui.add(egui::Button::new(egui::RichText::new(text).monospace()).selected(is_sel));
+                        if resp.clicked() { self.app.select_row(it.clone()); }
+                        // Row context menu
+                        resp.context_menu(|ui| {
+                            if ui.button("Open Details").clicked() {
+                                self.app.select_row(it.clone());
+                                ui.close();
+                            }
+                            let logs_enabled = self.app.selected_is_pod() && self.app.ops.caps.as_ref().map(|c| c.pods_log_get).unwrap_or(false);
+                            if logs_enabled {
+                                if ui.button("Logs").clicked() {
+                                    self.app.select_row(it.clone());
+                                    self.app.start_logs_task();
+                                    ui.close();
+                                }
+                            } else {
+                                ui.add_enabled(false, egui::Button::new("Logs")).on_hover_text("Logs available for Pods only");
+                            }
+                            // Workload ops: Rollout / Scale
+                            let scalable = self.app.ops.caps.as_ref().and_then(|c| c.scale.as_ref()).is_some();
+                            if scalable {
+                                if ui.button("Rollout Restart").clicked() {
+                                    tracing::info!(name = %it.name, ns = %it.namespace.as_deref().unwrap_or("-"), "ui: rollout restart click (row menu)");
+                                    self.app.select_row(it.clone());
+                                    self.app.start_rollout_restart_task();
+                                    ui.close();
+                                }
+                                if ui.button("Scale…").clicked() {
+                                    tracing::info!(name = %it.name, ns = %it.namespace.as_deref().unwrap_or("-"), "ui: scale prompt open (row menu)");
+                                    self.app.select_row(it.clone());
+                                    self.app.ops.scale_prompt_open = true;
+                                    ui.close();
+                                }
+                            }
+                            // Delete Pod (Pods only)
+                            if self.app.selected_is_pod() {
+                                if ui.button("Delete…").clicked() {
+                                    self.app.select_row(it.clone());
+                                    if let Some((ns, pod)) = self.app.current_pod_selection() {
+                                        self.app.ops.confirm_delete = Some((ns, pod));
+                                    }
+                                    ui.close();
+                                }
+                            }
+                        });
                     }
                     _ => {
                         ui.label(egui::RichText::new(text).monospace());

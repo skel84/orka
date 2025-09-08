@@ -11,9 +11,6 @@ use crate::util::gvk_label;
 use super::{OrkaGuiApp, UiUpdate};
 
 impl OrkaGuiApp {
-    fn is_selected_kind_pod(&self) -> bool {
-        if let Some(k) = self.current_selected_kind() { k.group.is_empty() && k.version == "v1" && k.kind == "Pod" } else { false }
-    }
     fn ui_edit(&mut self, ui: &mut egui::Ui) {
         egui::CollapsingHeader::new("Edit")
             .default_open(false)
@@ -48,7 +45,7 @@ impl OrkaGuiApp {
                 let mono = egui::TextStyle::Monospace;
                 let row_h = ui.text_style_height(&mono);
                 let gutter_w = 8.0 + digits as f32 * 8.0;
-                egui::ScrollArea::horizontal().id_source("edit_scroll_h").show(ui, |ui| {
+                egui::ScrollArea::horizontal().id_salt("edit_scroll_h").show(ui, |ui| {
                     ui.horizontal(|ui| {
                         // Left gutter with line numbers
                         let mut nums = String::with_capacity(digits * lines_count + lines_count);
@@ -110,7 +107,7 @@ impl OrkaGuiApp {
     }
 
     fn ui_logs(&mut self, ui: &mut egui::Ui) {
-        if !self.is_selected_kind_pod() { return; }
+        if !self.selected_is_pod() { return; }
         egui::CollapsingHeader::new("Logs (Pod)")
             .default_open(false)
             .show(ui, |ui| {
@@ -128,7 +125,7 @@ impl OrkaGuiApp {
                     } else {
                         let current = self.logs.container.clone().unwrap_or_else(|| self.logs.containers.get(0).cloned().unwrap_or_default());
                         let mut selected = current.clone();
-                        egui::ComboBox::from_id_source("logs_container_select")
+                        egui::ComboBox::from_id_salt("logs_container_select")
                             .selected_text(selected.clone())
                             .show_ui(ui, |ui| {
                                 for name in &self.logs.containers {
@@ -194,6 +191,9 @@ impl OrkaGuiApp {
         egui::ScrollArea::vertical()
             .id_salt("details_scroll")
             .show(ui, |ui| {
+                // Contextual actions bar (logs, exec, pf, scale, etc.)
+                crate::ui::actions::ui_actions_bar(self, ui);
+                ui.separator();
                 // Explain section (collapsed by default)
                 self.ui_explain(ui);
                 // Edit section

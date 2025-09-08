@@ -7,6 +7,7 @@ use orka_core::{LiteObj, Uid};
 use std::collections::HashMap;
 use orka_core::columns::ColumnSpec;
 use orka_api::ResourceKind;
+use orka_api::{OpsCaps, PortForwardEvent};
 
 use tokio::task::JoinHandle;
 use std::sync::mpsc;
@@ -20,6 +21,8 @@ pub enum UiUpdate {
     Detail(String),
     DetailError(String),
     Namespaces(Vec<String>),
+    Epoch(u64),
+    MetricsReady { index_bytes: Option<u64>, index_docs: Option<u64> },
     SearchResults { hits: Vec<(Uid, f32)>, explain: SearchExplain, partial: bool },
     SearchError(String),
     // Logs streaming updates
@@ -34,6 +37,14 @@ pub enum UiUpdate {
     EditDryRunDone { summary: String },
     EditDiffDone { live: String, last: Option<String> },
     EditApplyDone { message: String },
+    // Ops updates
+    OpsCaps(OpsCaps),
+    OpsStatus(String),
+    PfStarted(orka_api::CancelHandle),
+    PfEvent(PortForwardEvent),
+    PfEnded,
+    // Stats updates
+    StatsReady(orka_api::Stats),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -96,6 +107,7 @@ pub struct SearchState {
     pub changed_at: Option<Instant>,
     pub debounce_ms: u64,
     pub preview_sel: Option<usize>,
+    pub need_focus: bool,
 }
 
 pub struct ResultsState {
@@ -110,6 +122,7 @@ pub struct ResultsState {
     pub display_cache: HashMap<Uid, Vec<String>>,
     pub virtual_mode: super::VirtualMode,
     pub filter: String,
+    pub epoch: Option<u64>,
 }
 
 #[derive(Default)]
@@ -149,6 +162,28 @@ pub struct LogsState {
 }
 
 #[derive(Default)]
+pub struct OpsState {
+    pub caps: Option<OpsCaps>,
+    pub caps_task: Option<tokio::task::JoinHandle<()>>,
+    pub caps_ns: Option<String>,
+    pub caps_gvk: Option<String>,
+    // Simple controls/state for actions bar
+    pub scale_replicas: i32,
+    pub pf_local: u16,
+    pub pf_remote: u16,
+    pub pf_running: bool,
+    pub pf_cancel: Option<orka_api::CancelHandle>,
+    pub pf_info: Option<PfInfo>,
+    pub pf_panel_open: bool,
+    pub confirm_delete: Option<(String, String)>, // (ns, pod)
+    pub confirm_drain: Option<String>,            // node name
+    pub scale_prompt_open: bool,
+}
+
+#[derive(Clone, Debug)]
+pub struct PfInfo { pub namespace: String, pub pod: String, pub local: u16, pub remote: u16 }
+
+#[derive(Default)]
 pub struct SelectionState {
     pub selected_idx: Option<usize>,
     pub selected_kind: Option<ResourceKind>,
@@ -180,4 +215,35 @@ pub struct WatchState {
     pub prewarm_started: bool,
     pub select_t0: Option<Instant>,
     pub ttfr_logged: bool,
+}
+
+// --------- Toasts ---------
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ToastKind { Info, Success, Error, Warn }
+
+#[derive(Clone, Debug)]
+pub struct Toast {
+    pub text: String,
+    pub kind: ToastKind,
+    pub created: Instant,
+    pub duration_ms: u64,
+}
+
+// --------- Stats ---------
+
+#[derive(Default)]
+pub struct StatsState {
+    pub open: bool,
+    pub loading: bool,
+    pub last_error: Option<String>,
+    pub data: Option<orka_api::Stats>,
+    pub task: Option<tokio::task::JoinHandle<()>>,
+    pub last_fetched: Option<Instant>,
+    pub refresh_open_ms: u64,
+    pub refresh_closed_ms: u64,
+    pub warn_pct: f32,
+    pub err_pct: f32,
+    pub index_bytes: Option<u64>,
+    pub index_docs: Option<u64>,
 }

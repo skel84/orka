@@ -22,7 +22,7 @@ mod model;
 mod ui;
 mod tasks;
 pub use model::{UiUpdate, VirtualMode, SearchExplain, PaletteItem, PaletteState, LayoutState};
-use model::{ResultsState, SearchState, DetailsState, SelectionState, UiDebounce, DiscoveryState, WatchState, LogsState, EditState};
+use model::{ResultsState, SearchState, DetailsState, SelectionState, UiDebounce, DiscoveryState, WatchState, LogsState, EditState, OpsState, ToastKind, StatsState};
 use util::{gvk_label, parse_gvk_key_to_kind};
 use watch::{watch_hub_subscribe, watch_hub_prime};
 
@@ -62,9 +62,27 @@ pub struct OrkaGuiApp {
     // results state holds sorting, caches, soft cap, virtualization
     // Global search palette (Cmd-K)
     palette: PaletteState,
+    // Ops caps and action state
+    ops: OpsState,
+    // UI toasts
+    toasts: Vec<model::Toast>,
+    // Stats modal/state
+    stats: StatsState,
 }
 
 impl OrkaGuiApp {
+    pub(crate) fn selected_is_pod(&self) -> bool {
+        match self.current_selected_kind() {
+            Some(k) => k.group.is_empty() && k.version == "v1" && k.kind == "Pod",
+            None => false,
+        }
+    }
+    pub(crate) fn selected_is_node(&self) -> bool {
+        match self.current_selected_kind() {
+            Some(k) => k.group.is_empty() && k.version == "v1" && k.kind == "Node",
+            None => false,
+        }
+    }
     pub fn new(api: Arc<dyn OrkaApi>) -> Self {
         info!("orka gui starting");
         info!("starting discovery task");
@@ -96,6 +114,7 @@ impl OrkaGuiApp {
                 display_cache: HashMap::new(),
                 virtual_mode: VirtualMode::Auto,
                 filter: String::new(),
+                epoch: None,
             },
             watch: WatchState { updates_rx: None, updates_tx: None, task: None, stop: None, loaded_idx: None, loaded_gvk_key: None, loaded_ns: None, prewarm_started: false, select_t0: None, ttfr_logged: false },
             details: DetailsState { selected: None, buffer: String::new(), task: None, stop: None },
@@ -118,6 +137,7 @@ impl OrkaGuiApp {
                 changed_at: None,
                 debounce_ms: 80,
                 preview_sel: None,
+                need_focus: false,
             },
             log: String::new(),
             #[cfg(feature = "dock")]
@@ -131,6 +151,30 @@ impl OrkaGuiApp {
             namespaces: Vec::new(),
             ui_debounce: UiDebounce { ms: std::env::var("ORKA_UI_DEBOUNCE_MS").ok().and_then(|s| s.parse::<u64>().ok()).unwrap_or(100), pending_count: 0, pending_since: None },
             palette: PaletteState { open: false, query: String::new(), results: Vec::new(), sel: None, changed_at: None, debounce_ms: 80, need_focus: false, width_hint: 560.0, mode_global: false, prime_task: None },
+            ops: OpsState {
+                caps: None,
+                caps_task: None,
+                caps_ns: None,
+                caps_gvk: None,
+                scale_replicas: 1,
+                pf_local: 8080,
+                pf_remote: 80,
+                pf_running: false,
+                pf_cancel: None,
+                pf_info: None,
+                pf_panel_open: false,
+                confirm_delete: None,
+                confirm_drain: None,
+                scale_prompt_open: false,
+            },
+            toasts: Vec::new(),
+            stats: {
+                let open_ms = std::env::var("ORKA_STATS_REFRESH_OPEN_MS").ok().and_then(|s| s.parse::<u64>().ok()).unwrap_or(5_000);
+                let closed_ms = std::env::var("ORKA_STATS_REFRESH_CLOSED_MS").ok().and_then(|s| s.parse::<u64>().ok()).unwrap_or(30_000);
+                let warn_pct = std::env::var("ORKA_WARN_PCT").ok().and_then(|s| s.parse::<f32>().ok()).unwrap_or(0.80);
+                let err_pct = std::env::var("ORKA_ERR_PCT").ok().and_then(|s| s.parse::<f32>().ok()).unwrap_or(0.95);
+                StatsState { open: false, loading: false, last_error: None, data: None, task: None, last_fetched: None, refresh_open_ms: open_ms, refresh_closed_ms: closed_ms, warn_pct, err_pct, index_bytes: None, index_docs: None }
+            },
         };
         // Start prewarm watchers for curated built-ins immediately (without waiting for discovery)
         if !this.watch.prewarm_started {
@@ -252,6 +296,16 @@ impl OrkaGuiApp {
 
 impl eframe::App for OrkaGuiApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        // Auto-refresh Stats: refresh faster when modal open, slower when closed
+        {
+            let due = match (self.stats.open, self.stats.last_fetched) {
+                (true, Some(t)) => t.elapsed().as_millis() as u64 >= self.stats.refresh_open_ms,
+                (true, None) => true,
+                (false, Some(t)) => t.elapsed().as_millis() as u64 >= self.stats.refresh_closed_ms,
+                (false, None) => true,
+            };
+            if due && !self.stats.loading { self.start_stats_task(); }
+        }
         // Poll discovery once per frame; populate kinds when ready
         if let Some(rx) = &self.discovery.rx {
             match rx.try_recv() {
@@ -345,6 +399,7 @@ impl eframe::App for OrkaGuiApp {
         // Drain UI updates from background tasks (bounded per frame and time)
         let mut processed = 0usize;
         let mut saw_batch = false; // treat snapshot as a batch marker
+        let mut pending_toasts: Vec<(String, ToastKind)> = Vec::new();
         if let Some(rx) = &self.watch.updates_rx {
             while processed < 256 {
                 match rx.try_recv() {
@@ -422,8 +477,10 @@ impl eframe::App for OrkaGuiApp {
                     }
                     Ok(UiUpdate::Error(err)) => {
                         info!(error = %err, "ui: background error");
+                        if err.starts_with("stats:") { self.stats.loading = false; self.stats.last_error = Some(err.clone()); }
                         self.last_error = Some(err.clone());
                         self.log = err;
+                        pending_toasts.push((self.log.clone(), ToastKind::Error));
                         processed += 1;
                     }
                     Ok(UiUpdate::Detail(text)) => {
@@ -456,11 +513,16 @@ impl eframe::App for OrkaGuiApp {
                         self.edit.buffer.clear();
                         self.edit.original.clear();
                         self.edit.dirty = false;
+                        pending_toasts.push(("details: error".to_string(), ToastKind::Error));
                         processed += 1;
                     }
                     Ok(UiUpdate::Namespaces(list)) => {
                         info!(namespaces = list.len(), "ui: namespaces updated");
                         self.namespaces = list;
+                        processed += 1;
+                    }
+                    Ok(UiUpdate::Epoch(e)) => {
+                        self.results.epoch = Some(e);
                         processed += 1;
                     }
                     Ok(UiUpdate::SearchResults { hits, explain, partial }) => {
@@ -484,10 +546,12 @@ impl eframe::App for OrkaGuiApp {
                         self.search.stop = None;
                         processed += 1;
                         ctx.request_repaint();
+                        pending_toasts.push(("search: error".to_string(), ToastKind::Error));
                     }
                     Ok(UiUpdate::LogStarted(cancel)) => {
                         self.logs.cancel = Some(cancel);
                         self.logs.running = true;
+                        pending_toasts.push(("logs: started".to_string(), ToastKind::Info));
                         processed += 1;
                     }
                     Ok(UiUpdate::LogLine(line)) => {
@@ -503,12 +567,14 @@ impl eframe::App for OrkaGuiApp {
                         self.logs.running = false;
                         self.logs.task = None;
                         self.logs.cancel = None;
+                        pending_toasts.push((format!("logs: {}", err), ToastKind::Error));
                         processed += 1;
                     }
                     Ok(UiUpdate::LogEnded) => {
                         self.logs.running = false;
                         self.logs.task = None;
                         self.logs.cancel = None;
+                        pending_toasts.push(("logs: ended".to_string(), ToastKind::Info));
                         processed += 1;
                     }
                     Ok(UiUpdate::EditStatus(s)) => {
@@ -518,6 +584,7 @@ impl eframe::App for OrkaGuiApp {
                     Ok(UiUpdate::EditDryRunDone { summary }) => {
                         self.edit.running = false;
                         self.edit.status = format!("dry-run: {}", summary);
+                        pending_toasts.push((format!("dry-run: {}", summary), ToastKind::Info));
                         processed += 1;
                     }
                     Ok(UiUpdate::EditDiffDone { live, last }) => {
@@ -526,11 +593,55 @@ impl eframe::App for OrkaGuiApp {
                             Some(s) => format!("diff live: {}  •  vs last-applied: {}", live, s),
                             None => format!("diff live: {}", live),
                         };
+                        pending_toasts.push((self.edit.status.clone(), ToastKind::Info));
                         processed += 1;
                     }
                     Ok(UiUpdate::EditApplyDone { message }) => {
                         self.edit.running = false;
                         self.edit.status = message;
+                        pending_toasts.push((self.edit.status.clone(), ToastKind::Success));
+                        processed += 1;
+                    }
+                    Ok(UiUpdate::OpsCaps(c)) => {
+                        self.ops.caps = Some(c);
+                        self.ops.caps_task = None;
+                        processed += 1;
+                    }
+                    Ok(UiUpdate::OpsStatus(s)) => {
+                        self.log = s.clone();
+                        pending_toasts.push((s, ToastKind::Success));
+                        processed += 1;
+                    }
+                    Ok(UiUpdate::PfStarted(cancel)) => {
+                        self.ops.pf_cancel = Some(cancel);
+                        self.ops.pf_running = true;
+                        pending_toasts.push(("pf: started".to_string(), ToastKind::Info));
+                        processed += 1;
+                    }
+                    Ok(UiUpdate::PfEvent(ev)) => {
+                        self.log = match ev {
+                            orka_api::PortForwardEvent::Ready(addr) => { pending_toasts.push((format!("pf: ready on {}", addr), ToastKind::Success)); format!("pf: ready on {}", addr) }
+                            orka_api::PortForwardEvent::Connected(peer) => { pending_toasts.push((format!("pf: connected: {}", peer), ToastKind::Info)); format!("pf: connected: {}", peer) }
+                            orka_api::PortForwardEvent::Closed => { pending_toasts.push(("pf: closed".to_string(), ToastKind::Info)); "pf: closed".to_string() }
+                            orka_api::PortForwardEvent::Error(err) => { pending_toasts.push((format!("pf: error: {}", err), ToastKind::Error)); format!("pf: error: {}", err) }
+                        };
+                        processed += 1;
+                    }
+                    Ok(UiUpdate::PfEnded) => {
+                        self.ops.pf_running = false;
+                        self.ops.pf_cancel = None;
+                        pending_toasts.push(("pf: ended".to_string(), ToastKind::Info));
+                        processed += 1;
+                    }
+                    Ok(UiUpdate::StatsReady(s)) => {
+                        self.stats.data = Some(s);
+                        self.stats.loading = false;
+                        self.stats.last_fetched = Some(Instant::now());
+                        processed += 1;
+                    }
+                    Ok(UiUpdate::MetricsReady { index_bytes, index_docs }) => {
+                        self.stats.index_bytes = index_bytes;
+                        self.stats.index_docs = index_docs;
                         processed += 1;
                     }
                     Err(mpsc::TryRecvError::Empty) => break,
@@ -562,6 +673,8 @@ impl eframe::App for OrkaGuiApp {
 
         // Global keybinding: Cmd-K / Ctrl-K opens palette
         ui::palette::handle_palette_shortcut(self, ctx);
+        // Global keybindings: F (focus search), L (logs), E (exec), Cmd/Ctrl-S (apply), Esc (cancel/exit)
+        ui::shortcuts::handle_global_shortcuts(self, ctx);
 
         ui::topbar::ui_topbar(self, ctx);
 
@@ -620,11 +733,22 @@ impl eframe::App for OrkaGuiApp {
         });
 
         ui::palette::ui_palette(self, ctx);
+        ui::stats::ui_stats_modal(self, ctx);
 
         ui::statusbar::ui_statusbar(self, ctx);
+        // Emit queued toasts (must happen after dropping the rx borrow above)
+        // This keeps toast pushes out of the hot path borrow of updates_rx
+        // and avoids borrow check issues.
+        // Note: pending_toasts is only in scope within the updates block; emit here if defined.
+        // (No-op if this frame didn't process updates.)
+        // draw toasts overlay
+        ui::toasts::draw_toasts(self, ctx);
+        ui::toasts::draw_toasts(self, ctx);
 
         // Auto start/refresh watch when selection changes
         self.ensure_watch_for_selection();
+        // Refresh ops caps when selection/namespace changes
+        self.ensure_caps_for_selection();
     }
 }
 

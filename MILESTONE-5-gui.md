@@ -152,6 +152,38 @@ Notes: Logs are Pod‑only for now; Exec/PF are available via API facade but not
 
 ---
 
+## Progress (2025-09-08 — session addendum)
+
+- Actions bar: implemented contextual actions in Details:
+  - Logs toggle (start/stop), Exec placeholder, Port‑forward start/stop with a small “Active PFs” popover, Scale (replicas input + Apply), Rollout Restart, Delete Pod (confirm), Node Cordon/Uncordon/Drain (confirm).
+  - All actions are gated via `ApiOps::caps(namespace, Some(gvk))` and only enabled when RBAC/subresources allow.
+  - GUI uses only the `orka_api` facade (`api.ops()` / `ApiOps`); there is no direct `orka_ops` dependency from the GUI.
+- Row context menu:
+  - Always shows “Open Details”.
+  - Shows “Logs” for Pods (caps‑gated).
+  - Shows “Delete…” for Pods (opens confirm dialog).
+  - Shows “Rollout Restart” and “Scale…” for scalable workloads; “Scale…” opens a tiny replicas dialog.
+- PF UX: active forward appears in the PFs popover with a Stop button; events surface in status and toasts.
+- Toasts: added in‑app toast overlay (Info/Success/Error) for ops and errors; complements console logs.
+- Console logs: instrumented all actions (start/stop parameters + outcomes) with `tracing::info!`.
+- Modernized egui usages: replaced deprecated `SelectableLabel` with `Button::selected`, `id_source`→`id_salt`, `ui.close_menu()`→`ui.close()`.
+
+Notes: Exec UI remains a placeholder; terminal tab to be added later. Drain gating currently reuses `nodes_patch`; can also gate on evictions later.
+
+---
+
+## Progress (2025-09-08 — later)
+
+- Stats modal: implemented with `api.stats()` surface and optional Prometheus `/metrics` scrape when `metrics_addr` is set.
+  - Displays shards, relist/backoff, label/anno/postings caps, Max RSS, Index bytes; includes link to metrics endpoint.
+  - Threshold coloring for capacities (warn at 80%, error at 95% by default); configurable via `ORKA_WARN_PCT`, `ORKA_ERR_PCT`.
+  - UI pressure: rows/soft‑cap threshold, logs recv/dropped; all visible in modal and status bar.
+  - Auto‑refresh: every 5s when open, 30s when closed; knobs `ORKA_STATS_REFRESH_OPEN_MS`, `ORKA_STATS_REFRESH_CLOSED_MS`.
+- Status bar: added “Stats…” button; shows shards, snapshot epoch, items count with threshold coloring, logs backlog usage and drops, and index usage banner.
+- Shortcuts: F focuses search; Cmd/Ctrl+K opens palette; Enter opens selection or runs search; L toggles logs (Pods, RBAC‑gated); E reserved for Exec; Cmd/Ctrl+S applies edit buffer; Esc closes overlays/cancels tasks (never exits).
+
+---
+
 ## Next Steps (short‑term)
 
 1. Results table polish
@@ -171,11 +203,12 @@ Notes: Logs are Pod‑only for now; Exec/PF are available via API facade but not
 4. Edit tab
    - DONE: YAML editor (TextEdit + syntect) with Validate (feature‑gated, TBD), Dry‑run (summary), Diff (live/last‑applied), Apply (SSA) using `api.{dry_run,diff,apply}`; minimal diff summaries.
 5. Actions bar + row context menu
-   - Ops: logs, exec, port‑forward, scale, rollout restart, delete pod, cordon/drain; gate via `ops.caps()`. (API facade ready; GUI wiring TBD)
-6. Stats modal
-   - Surface `api.stats()` plus runtime metrics; show relist/backoff/shards/memory caps and posting/drop counters.
-7. Keyboard + palette
-   - Cmd‑K palette (global search enabled); shortcuts (F focus search, Enter open, L logs, E exec, Cmd‑S apply, Esc cancel fetch).
+   - DONE: Logs (Pod), Port‑forward (start/stop + popover), Scale, Rollout Restart, Delete Pod, Cordon/Uncordon/Drain (Node); caps‑gated via `ApiOps::caps`.
+   - TODO: Exec UI (terminal tab) to wire `exec` properly.
+6. Stats modal — DONE
+   - Implemented with auto‑refresh, thresholds (warn/error), and optional metrics scrape; shows relist/backoff/shards/memory/index caps and drop counters.
+7. Keyboard + palette — DONE (Exec UI pending)
+   - Cmd‑K palette (global search enabled); shortcuts: F focus search • Enter open • L logs • E exec (stub) • Cmd‑S apply • Esc cancel overlays/tasks.
 
 8. UI perf & YAML rendering (moved up from Mini‑UI/Perf)
    - YAML LayoutJob cache in Details: bounded LRU of `egui::text::LayoutJob` keyed by YAML hash; reduces per‑frame CPU.
@@ -195,6 +228,10 @@ Notes: Logs are Pod‑only for now; Exec/PF are available via API facade but not
 - Refactor: `orka_gui` split into `util`, `watch`, `results`, `nav`, `details` modules; `lib.rs` keeps app state and wiring.
 - Sorting: header click toggles asc/desc; sorting mutates in‑memory rows and rebuilds UID index to keep delta merges consistent.
 - Results perf: display cache per row for static columns; filter cache (lowercased haystack) for quick substring matching; soft cap via `ORKA_RESULTS_SOFT_CAP`; rows mode toggle (Auto/Virtual/Table).
+- Stats & thresholds:
+  - `orka_api::stats()` used for caps; optional `/metrics` scrape reads `index_bytes`/`index_docs` without extra deps.
+  - Threshold coloring applied to: results soft‑cap utilization, index bytes usage, logs backlog usage, dropped logs.
+  - Env knobs: `ORKA_STATS_REFRESH_OPEN_MS`, `ORKA_STATS_REFRESH_CLOSED_MS`, `ORKA_WARN_PCT`, `ORKA_ERR_PCT`.
 
 ---
 
@@ -203,7 +240,7 @@ Notes: Logs are Pod‑only for now; Exec/PF are available via API facade but not
 - Launches with `orkactl gui` across macOS/Linux/Windows.
 - Kind/Namespace selector wired; snapshot+watch fills Results table quickly.
 - Selecting a row shows YAML details.
-- Basic status bar with item count and error notice.
+- Status bar shows items/shards/epoch, backlog/drops, and opens the Stats modal; threshold banners for pressure.
 - No panics or egui ID clashes; UI remains responsive while streaming.
 
 ## Notes

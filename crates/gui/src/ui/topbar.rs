@@ -60,6 +60,7 @@ pub(crate) fn ui_topbar(app: &mut OrkaGuiApp, ctx: &egui::Context) {
                 .hint_text("Search: ns:prod label:app=api k:Pod payments …")
                 .desired_width(360.0);
             let re = ui.add(te);
+            if app.search.need_focus { re.request_focus(); app.search.need_focus = false; }
             if re.changed() {
                 app.search.changed_at = Some(Instant::now());
             }

@@ -127,7 +127,9 @@ impl OrkaGuiApp {
                 match snap_api.snapshot(snap_sel).await {
                     Ok(resp) => {
                         info!(items = resp.data.items.len(), took_ms = %t0.elapsed().as_millis(), "snapshot: response ok");
+                        let epoch = resp.data.epoch;
                         let _ = snap_tx.send(UiUpdate::Snapshot(resp.data.items));
+                        let _ = snap_tx.send(UiUpdate::Epoch(epoch));
                     }
                     Err(e) => {
                         let _ = snap_tx.send(UiUpdate::Error(format!("snapshot({}) error: {}", snap_label, e)));
