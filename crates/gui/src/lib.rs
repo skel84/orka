@@ -11,6 +11,8 @@ use egui_table::{CellInfo, Column, HeaderCellInfo, HeaderRow, Table, TableDelega
 use orka_api::{LiteEvent, OrkaApi, ResourceKind, ResourceRef, Selector};
 use orka_core::{LiteObj, Uid};
 use tracing::info;
+use tokio::sync::broadcast;
+use tokio::sync::Semaphore;
 
 /// Entry point used by the CLI to launch the GUI.
 pub fn run_native(api: Arc<dyn OrkaApi>) -> eframe::Result<()> {
@@ -35,9 +37,11 @@ pub struct OrkaGuiApp {
     watch_stop: Option<tokio::sync::oneshot::Sender<()>>,
     // track loaded selection to auto-refresh when changed
     loaded_idx: Option<usize>,
+    loaded_gvk_key: Option<String>,
     loaded_ns: Option<String>,
     // selection + details
     selected: Option<Uid>,
+    selected_kind: Option<ResourceKind>,
     detail_buffer: String,
     detail_task: Option<tokio::task::JoinHandle<()>>,
     detail_stop: Option<tokio::sync::oneshot::Sender<()>>,
@@ -54,6 +58,15 @@ pub struct OrkaGuiApp {
     show_log: bool,
     // cached namespaces for dropdown
     namespaces: Vec<String>,
+    // perf: debounce repaint requests
+    ui_debounce_ms: u64,
+    pending_count: usize,
+    pending_since: Option<Instant>,
+    // prewarm watchers once after discovery
+    prewarm_started: bool,
+    // metrics: selection start time for TTFR
+    select_t0: Option<Instant>,
+    ttfr_logged: bool,
 }
 
 impl OrkaGuiApp {
@@ -85,8 +98,10 @@ impl OrkaGuiApp {
             watch_task: None,
             watch_stop: None,
             loaded_idx: None,
+            loaded_gvk_key: None,
             loaded_ns: None,
             selected: None,
+            selected_kind: None,
             detail_buffer: String::new(),
             detail_task: None,
             detail_stop: None,
@@ -104,7 +119,35 @@ impl OrkaGuiApp {
             show_details: true,
             show_log: true,
             namespaces: Vec::new(),
+            ui_debounce_ms: std::env::var("ORKA_UI_DEBOUNCE_MS").ok().and_then(|s| s.parse::<u64>().ok()).unwrap_or(100),
+            pending_count: 0,
+            pending_since: None,
+            prewarm_started: false,
+            select_t0: None,
+            ttfr_logged: false,
         };
+        // Start prewarm watchers for curated built-ins immediately (without waiting for discovery)
+        if !this.prewarm_started {
+            this.prewarm_started = true;
+            let api_pw = this.api.clone();
+            let keys = std::env::var("ORKA_PREWARM_KINDS").unwrap_or_else(|_| "v1/Pod,apps/v1/Deployment,v1/Service,v1/Namespace,v1/Node,v1/ConfigMap,v1/Secret".into());
+            for key in keys.split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()) {
+                let api_clone = api_pw.clone();
+                tokio::spawn(async move {
+                    let gvk = parse_gvk_key_to_kind(&key);
+                    let sel = Selector { gvk, namespace: None };
+                    let t0 = Instant::now();
+                    match watch_hub_subscribe(api_clone, sel).await {
+                        Ok(mut rx) => {
+                            info!(gvk = %key, took_ms = %t0.elapsed().as_millis(), "prewarm: stream opened");
+                            let _ = tokio::time::timeout(std::time::Duration::from_millis(800), async { let _ = rx.recv().await; }).await;
+                            info!(gvk = %key, total_ms = %t0.elapsed().as_millis(), "prewarm: done");
+                        }
+                        Err(e) => { info!(gvk = %key, error = %e, "prewarm: failed"); }
+                    }
+                });
+            }
+        }
         this
     }
 
@@ -137,48 +180,155 @@ impl OrkaGuiApp {
     }
 
     fn ui_kind_tree(&mut self, ui: &mut egui::Ui) {
-        // Build nested map: group/version -> kinds
-        use std::collections::BTreeMap;
-        let mut tree: BTreeMap<String, BTreeMap<String, Vec<(usize, String)>>> = BTreeMap::new();
-        for (idx, k) in self.kinds.iter().enumerate() {
-            let group = if k.group.is_empty() {
-                "core".to_string()
-            } else {
-                k.group.clone()
-            };
-            let ver_map = tree.entry(group).or_default();
-            ver_map
-                .entry(k.version.clone())
-                .or_default()
-                .push((idx, k.kind.clone()));
-        }
         egui::ScrollArea::vertical()
             .id_salt("kind_tree_scroll")
             .show(ui, |ui| {
-                for (group, versions) in tree.into_iter() {
-                    egui::CollapsingHeader::new(group.clone())
-                        .default_open(true)
+                // Curated built-in categories (collapsed by default)
+                self.ui_curated_category(ui, "Workloads", &[
+                    ("", "Pod", "Pods", true),
+                    ("apps", "Deployment", "Deployments", true),
+                    ("apps", "DaemonSet", "Daemon Sets", true),
+                    ("apps", "StatefulSet", "Stateful Sets", true),
+                    ("apps", "ReplicaSet", "Replica Sets", true),
+                    ("", "ReplicationController", "Replication Controllers", true),
+                    ("batch", "Job", "Jobs", true),
+                    ("batch", "CronJob", "Cron Jobs", true),
+                ]);
+                self.ui_curated_category(ui, "Config", &[
+                    ("", "ConfigMap", "Config Maps", true),
+                    ("", "Secret", "Secrets", true),
+                    ("", "ResourceQuota", "Resource Quotas", true),
+                    ("", "LimitRange", "Limit Ranges", true),
+                    ("autoscaling", "HorizontalPodAutoscaler", "Horizontal Pod Autoscalers", true),
+                    ("autoscaling.k8s.io", "VerticalPodAutoscaler", "Vertical Pod Autoscalers", true),
+                    ("policy", "PodDisruptionBudget", "Pod Disruption Budgets", true),
+                    ("scheduling.k8s.io", "PriorityClass", "Priority Classes", false),
+                    ("node.k8s.io", "RuntimeClass", "Runtime Classes", false),
+                    ("coordination.k8s.io", "Lease", "Leases", true),
+                    ("admissionregistration.k8s.io", "MutatingWebhookConfiguration", "Mutating Webhook Configurations", false),
+                    ("admissionregistration.k8s.io", "ValidatingWebhookConfiguration", "Validating Webhook Configurations", false),
+                ]);
+                self.ui_curated_category(ui, "Network", &[
+                    ("", "Service", "Services", true),
+                    ("", "Endpoints", "Endpoints", true),
+                    ("networking.k8s.io", "Ingress", "Ingresses", true),
+                    ("networking.k8s.io", "IngressClass", "Ingress Classes", false),
+                    ("networking.k8s.io", "NetworkPolicy", "Network Policies", true),
+                ]);
+                self.ui_curated_category(ui, "Storage", &[
+                    ("", "PersistentVolumeClaim", "Persistent Volume Claims", true),
+                    ("", "PersistentVolume", "Persistent Volumes", false),
+                    ("storage.k8s.io", "StorageClass", "Storage Classes", false),
+                ]);
+                self.ui_curated_category(ui, "Access Control", &[
+                    ("", "ServiceAccount", "Service Accounts", true),
+                    ("rbac.authorization.k8s.io", "ClusterRole", "Cluster Roles", false),
+                    ("rbac.authorization.k8s.io", "Role", "Roles", true),
+                    ("rbac.authorization.k8s.io", "ClusterRoleBinding", "Cluster Role Bindings", false),
+                    ("rbac.authorization.k8s.io", "RoleBinding", "Role Bindings", true),
+                ]);
+                // Singletons
+                if let Some(idx) = self.find_kind_index("", "Namespace") {
+                    self.ui_single_item(ui, idx, "Namespaces");
+                }
+                if let Some(idx) = self.find_kind_index("", "Node") {
+                    self.ui_single_item(ui, idx, "Nodes");
+                }
+                if let Some(idx) = self.find_kind_index("events.k8s.io", "Event").or_else(|| self.find_kind_index("", "Event")) {
+                    self.ui_single_item(ui, idx, "Events");
+                }
+
+                // Custom Resources (grouped by API group), collapsed by default
+                self.ui_crd_section(ui);
+            });
+    }
+
+    fn ui_single_item(&mut self, ui: &mut egui::Ui, idx: usize, label: &str) {
+        let selected = self.selected_idx == Some(idx);
+        let resp = ui.selectable_label(selected, label);
+        if resp.clicked() { self.on_select_idx(idx); }
+    }
+
+    fn ui_curated_category(&mut self, ui: &mut egui::Ui, title: &str, entries: &[(&str, &str, &str, bool)]) {
+        egui::CollapsingHeader::new(title).default_open(false).show(ui, |ui| {
+            for (group, kind, label, namespaced) in entries {
+                let rk = ResourceKind { group: (*group).to_string(), version: "v1".to_string(), kind: (*kind).to_string(), namespaced: *namespaced };
+                let is_sel = self.current_selected_kind().map(|k| gvk_label(k) == gvk_label(&rk)).unwrap_or(false);
+                let resp = ui.selectable_label(is_sel, *label);
+                if resp.clicked() { self.on_select_gvk(rk.clone()); }
+            }
+        });
+    }
+
+    fn is_builtin_group(group: &str) -> bool {
+        if group.is_empty() { return true; }
+        matches!(group,
+            "apps" | "batch" | "autoscaling" | "autoscaling.k8s.io" | "policy" | "rbac.authorization.k8s.io" |
+            "networking.k8s.io" | "storage.k8s.io" | "node.k8s.io" | "coordination.k8s.io" | "admissionregistration.k8s.io" |
+            "events.k8s.io" | "scheduling.k8s.io" | "apiregistration.k8s.io" | "authentication.k8s.io" | "authorization.k8s.io" |
+            "discovery.k8s.io" | "flowcontrol.apiserver.k8s.io"
+        )
+    }
+
+    fn ui_crd_section(&mut self, ui: &mut egui::Ui) {
+        use std::collections::BTreeMap;
+        // group -> Vec<(idx, kind)>
+        let mut groups: BTreeMap<String, Vec<(usize, String)>> = BTreeMap::new();
+        for (idx, k) in self.kinds.iter().enumerate() {
+            if OrkaGuiApp::is_builtin_group(&k.group) { continue; }
+            let entry = groups.entry(k.group.clone()).or_default();
+            entry.push((idx, k.kind.clone()));
+        }
+        if groups.is_empty() { return; }
+        egui::CollapsingHeader::new("Custom Resources")
+            .default_open(false)
+            .show(ui, |ui| {
+                for (group, mut kinds) in groups.into_iter() {
+                    kinds.sort_by(|a, b| a.1.cmp(&b.1));
+                    egui::CollapsingHeader::new(group)
+                        .default_open(false)
                         .show(ui, |ui| {
-                            for (ver, kinds) in versions.into_iter() {
-                                egui::CollapsingHeader::new(ver.clone())
-                                    .default_open(true)
-                                    .show(ui, |ui| {
-                                        for (idx, kind_name) in kinds.into_iter() {
-                                            let selected = self.selected_idx == Some(idx);
-                                            let resp =
-                                                ui.selectable_label(selected, kind_name.clone());
-                                            if resp.clicked() {
-                                                if let Some(k) = self.kinds.get(idx) {
-                                                    info!(gvk = %gvk_label(k), "ui: kind clicked");
-                                                }
-                                                self.selected_idx = Some(idx);
-                                            }
-                                        }
-                                    });
+                            for (idx, name) in kinds.into_iter() {
+                                let selected = self.selected_idx == Some(idx);
+                                let resp = ui.selectable_label(selected, name);
+                                if resp.clicked() { self.on_select_idx(idx); }
                             }
                         });
                 }
             });
+    }
+
+    fn find_kind_index(&self, group: &str, kind: &str) -> Option<usize> {
+        // Prefer v1 when multiple versions exist
+        let mut candidate: Option<usize> = None;
+        for (idx, k) in self.kinds.iter().enumerate() {
+            if k.kind == kind && ((group.is_empty() && k.group.is_empty()) || k.group == group) {
+                if k.version == "v1" { return Some(idx); }
+                candidate = Some(idx);
+            }
+        }
+        candidate
+    }
+
+    fn on_select_idx(&mut self, idx: usize) {
+        if let Some(k) = self.kinds.get(idx).cloned() {
+            info!(gvk = %gvk_label(&k), "ui: kind clicked");
+            self.selected_kind = Some(k);
+            self.selected_idx = Some(idx);
+        }
+    }
+
+    fn on_select_gvk(&mut self, rk: ResourceKind) {
+        info!(gvk = %gvk_label(&rk), "ui: kind clicked");
+        self.selected_kind = Some(rk);
+        self.selected_idx = None;
+    }
+
+    fn current_selected_kind(&self) -> Option<&ResourceKind> {
+        match self.selected_kind.as_ref() {
+            Some(k) => Some(k),
+            None => self.selected_idx.and_then(|i| self.kinds.get(i)),
+        }
     }
 
     fn ui_details(&mut self, ui: &mut egui::Ui) {
@@ -280,6 +430,64 @@ impl eframe::App for OrkaGuiApp {
                     });
                     self.kinds = v;
                     self.discover_rx = None;
+                    // Prewarm watchers for common kinds to reduce first-click latency
+                    if !self.prewarm_started {
+                        self.prewarm_started = true;
+                        let api = self.api.clone();
+                        let keys = std::env::var("ORKA_PREWARM_KINDS").unwrap_or_else(|_| "v1/Pod,apps/v1/Deployment,v1/Service,v1/Namespace,v1/Node,v1/ConfigMap,v1/Secret".into());
+                        for key in keys.split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()) {
+                            let api_clone = api.clone();
+                            tokio::spawn(async move {
+                                let gvk = parse_gvk_key_to_kind(&key);
+                                let sel = Selector { gvk, namespace: None };
+                                let t0 = Instant::now();
+                                match watch_hub_subscribe(api_clone, sel).await {
+                                    Ok(mut rx) => {
+                                        info!(gvk = %key, took_ms = %t0.elapsed().as_millis(), "prewarm: stream opened");
+                                        // Wait for first event or a small timeout, then drop receiver; watcher stays
+                                        let _ = tokio::time::timeout(std::time::Duration::from_millis(800), async { let _ = rx.recv().await; }).await;
+                                        info!(gvk = %key, total_ms = %t0.elapsed().as_millis(), "prewarm: done");
+                                    }
+                                    Err(e) => {
+                                        info!(gvk = %key, error = %e, "prewarm: failed");
+                                    }
+                                }
+                            });
+                        }
+
+                        // Optional: prewarm all built-in kinds by listing first page and priming cache (no watchers)
+                        let prewarm_all = std::env::var("ORKA_PREWARM_ALL_BUILTINS").ok().map(|v| v == "1" || v.eq_ignore_ascii_case("true")).unwrap_or(true);
+                        if prewarm_all {
+                            // Extract built-in kinds from discovery results
+                            let groups_env = std::env::var("ORKA_PREWARM_BUILTIN_GROUPS").unwrap_or_else(|_|
+                                "core,apps,batch,networking.k8s.io,policy,rbac.authorization.k8s.io,autoscaling,coordination.k8s.io,storage.k8s.io,authentication.k8s.io,authorization.k8s.io,admissionregistration.k8s.io,node.k8s.io,certificates.k8s.io,discovery.k8s.io,events.k8s.io,flowcontrol.apiserver.k8s.io,scheduling.k8s.io,apiregistration.k8s.io".into()
+                            );
+                            let allowed: std::collections::HashSet<String> = groups_env.split(',').map(|s| s.trim().to_string()).collect();
+                            let conc: usize = std::env::var("ORKA_PREWARM_CONC").ok().and_then(|s| s.parse().ok()).unwrap_or(4);
+                            let sem = std::sync::Arc::new(Semaphore::new(conc.max(1)));
+                            for k in self.kinds.iter() {
+                                let group_key = if k.group.is_empty() { "core".to_string() } else { k.group.clone() };
+                                if !allowed.contains(&group_key) { continue; }
+                                let gvk_key = gvk_label(k);
+                                let semc = sem.clone();
+                                tokio::spawn(async move {
+                                    let _permit = semc.acquire().await.ok();
+                                    let t0 = Instant::now();
+                                    match orka_kubehub::list_lite_first_page(&gvk_key, None).await {
+                                        Ok(items) => {
+                                            if !items.is_empty() {
+                                                info!(gvk = %gvk_key, items = items.len(), took_ms = %t0.elapsed().as_millis(), "prewarm_list: first page ok");
+                                                watch_hub_prime(&format!("{}|", gvk_key), items);
+                                            }
+                                        }
+                                        Err(e) => {
+                                            info!(gvk = %gvk_key, error = %e, took_ms = %t0.elapsed().as_millis(), "prewarm_list: failed");
+                                        }
+                                    }
+                                });
+                            }
+                        }
+                    }
                 }
                 Ok(Err(err)) => {
                     info!(error = %err, "ui: discovery error");
@@ -292,8 +500,9 @@ impl eframe::App for OrkaGuiApp {
                 Err(mpsc::TryRecvError::Empty) => {}
             }
         }
-        // Drain UI updates from background tasks (bounded per frame)
+        // Drain UI updates from background tasks (bounded per frame and time)
         let mut processed = 0usize;
+        let mut saw_batch = false; // treat snapshot as a batch marker
         if let Some(rx) = &self.updates_rx {
             while processed < 256 {
                 match rx.try_recv() {
@@ -306,6 +515,13 @@ impl eframe::App for OrkaGuiApp {
                                 self.index.insert(it.uid, i);
                             }
                             info!(items = count, total = self.results.len(), "ui: snapshot applied (initial)");
+                            if !self.ttfr_logged {
+                                if let Some(t0) = self.select_t0.take() {
+                                    let ms = t0.elapsed().as_millis();
+                                    info!(ttfr_ms = %ms, "metric: time_to_first_row_ms");
+                                }
+                                self.ttfr_logged = true;
+                            }
                         } else {
                             let pre_total = self.results.len();
                             // Merge new items we don't yet have; deletions will arrive via watch
@@ -321,6 +537,7 @@ impl eframe::App for OrkaGuiApp {
                         // Snapshot received -> no longer loading
                         self.last_error = None;
                         processed += 1;
+                        saw_batch = true;
                     }
                     Ok(UiUpdate::Event(LiteEvent::Applied(lo))) => {
                         if let Some(idx) = self.index.get(&lo.uid).copied() {
@@ -375,9 +592,18 @@ impl eframe::App for OrkaGuiApp {
                     }
                 }
             }
+            // Debounce repaint: flush on batch marker, size threshold, or elapsed time
             if processed > 0 {
-                info!(processed, total = self.results.len(), "ui: drained updates");
-                ctx.request_repaint();
+                self.pending_count += processed;
+                if self.pending_since.is_none() { self.pending_since = Some(Instant::now()); }
+                let elapsed_ms = self.pending_since.map(|t| t.elapsed().as_millis() as u64).unwrap_or(0);
+                let should_flush = saw_batch || self.pending_count >= 256 || elapsed_ms >= self.ui_debounce_ms;
+                if should_flush {
+                    info!(processed = self.pending_count, total = self.results.len(), "ui: flushed updates");
+                    ctx.request_repaint();
+                    self.pending_count = 0;
+                    self.pending_since = None;
+                }
             }
         }
 
@@ -447,16 +673,11 @@ impl eframe::App for OrkaGuiApp {
                     ui.vertical(|ui| {
                         ui.heading("Kinds");
                         ui.separator();
-                        if self.kinds.is_empty() {
-                            ui.label("loading kinds…");
-                        } else {
-                            self.ui_kind_tree(ui);
-                        }
-                        if let Some(i) = self.selected_idx {
-                            if let Some(k) = self.kinds.get(i) {
-                                ui.separator();
-                                ui.label(format!("Selected: {}", gvk_label(k)));
-                            }
+                        // Render curated sidebar immediately; CRDs appear when discovery is ready
+                        self.ui_kind_tree(ui);
+                        if let Some(k) = self.current_selected_kind().cloned() {
+                            ui.separator();
+                            ui.label(format!("Selected: {}", gvk_label(&k)));
                         }
                     });
                 });
@@ -519,28 +740,33 @@ impl eframe::App for OrkaGuiApp {
         }
 
         // Auto start/refresh watch when selection changes
-        if let Some(i) = self.selected_idx {
-            if let Some(k) = self.kinds.get(i) {
+        if let Some(k) = self.current_selected_kind().cloned() {
+            if !k.kind.is_empty() {
                 let ns_opt = if k.namespaced && !self.namespace.is_empty() {
                     Some(self.namespace.clone())
                 } else {
                     None
                 };
-                let changed = self.loaded_idx != Some(i) || self.loaded_ns != ns_opt;
+                let key = gvk_label(&k);
+                let changed = self.loaded_gvk_key.as_deref() != Some(&key) || self.loaded_ns != ns_opt;
                 if changed {
                     // Cancel previous task if any
                     if let Some(stop) = self.watch_stop.take() {
                         info!("watch: stopping previous task");
                         let _ = stop.send(());
                     }
+                    // mark selection start for TTFR metric
+                    self.select_t0 = Some(Instant::now());
+                    self.ttfr_logged = false;
                     let (tx, rx) = mpsc::channel::<UiUpdate>();
                     self.updates_tx = Some(tx.clone());
                     self.updates_rx = Some(rx);
                     let api = self.api.clone();
-                    let label = gvk_label(k);
+                    let label = key.clone();
                     let (stop_tx, mut stop_rx) = tokio::sync::oneshot::channel::<()>();
                     let k_cloned = k.clone();
                     let ns_cloned = ns_opt.clone();
+                    let should_fetch_namespaces = self.namespaces.is_empty();
                     info!(gvk = %label, ns = %ns_cloned.as_deref().unwrap_or("(all)"), "watch: starting snapshot + watch");
                     let task = tokio::spawn(async move {
                         let load_t0 = Instant::now();
@@ -548,39 +774,61 @@ impl eframe::App for OrkaGuiApp {
                             gvk: k_cloned,
                             namespace: ns_cloned,
                         };
-                        // Start watch first for faster perceived latency
+                        // Instant rows: emit cached items from watch hub if available
+                        let cache_key = format!("{}|{}", gvk_label(&sel.gvk), sel.namespace.as_deref().unwrap_or(""));
+                        let cached = watch_hub_snapshot(&cache_key);
+                        if !cached.is_empty() {
+                            let _ = tx.send(UiUpdate::Snapshot(cached));
+                        }
+                        // Start (or attach to) a persistent watcher via WatchHub for faster perceived latency
                         let watch_fut = async {
-                            match api.watch_lite(sel.clone()).await {
-                                Ok(mut sh) => {
+                            match watch_hub_subscribe(api.clone(), sel.clone()).await {
+                                Ok(mut rx) => {
                                     info!(took_ms = %load_t0.elapsed().as_millis(), "watch: stream opened");
                                     let mut first_event = true;
                                     loop {
                                         tokio::select! {
-                                            _ = &mut stop_rx => { sh.cancel.cancel(); break; }
-                                            evt = sh.rx.recv() => {
+                                            _ = &mut stop_rx => { break; }
+                                            evt = rx.recv() => {
                                                 match evt {
-                                                Some(e) => {
+                                                Ok(e) => {
                                                     if first_event {
-                                                        info!(since_ms = %load_t0.elapsed().as_millis(), "watch: first event received");
+                                                        let ms = load_t0.elapsed().as_millis();
+                                                        info!(since_ms = %ms, "watch: first event received");
+                                                        info!(ttfe_ms = %ms, "metric: time_to_first_event_ms");
                                                         first_event = false;
                                                     }
-                                                    if tx.send(UiUpdate::Event(e)).is_err() { sh.cancel.cancel(); break; }
+                                                    if tx.send(UiUpdate::Event(e)).is_err() { break; }
                                                 }
-                                                None => break,
+                                                Err(broadcast::error::RecvError::Lagged(_)) => { /* drop */ }
+                                                Err(broadcast::error::RecvError::Closed) => break,
                                                 }
                                             }
                                         }
                                     }
-                                },
+                                }
                                 Err(e) => {
-                                    let _ = tx.send(UiUpdate::Error(format!(
-                                        "watch_lite({}) error: {}",
-                                        label, e
-                                    )));
-                                    info!(error = %e, "watch: failed to open stream");
+                                    let _ = tx.send(UiUpdate::Error(format!("watch_hub error: {}", e)));
                                 }
                             }
                         };
+                        // Fast first page: list_lite_first_page for quick initial rows
+                        let fast_tx = tx.clone();
+                        let fast_sel = sel.clone();
+                        tokio::spawn(async move {
+                            let t0 = Instant::now();
+                            info!("snapshot: fast first page start");
+                            let gvk_key = if fast_sel.gvk.group.is_empty() { format!("{}/{}", fast_sel.gvk.version, fast_sel.gvk.kind) } else { format!("{}/{}/{}", fast_sel.gvk.group, fast_sel.gvk.version, fast_sel.gvk.kind) };
+                            match orka_kubehub::list_lite_first_page(&gvk_key, fast_sel.namespace.as_deref()).await {
+                                Ok(items) => {
+                                    info!(items = items.len(), took_ms = %t0.elapsed().as_millis(), "snapshot: fast first page ok");
+                                    let _ = fast_tx.send(UiUpdate::Snapshot(items));
+                                }
+                                Err(e) => {
+                                    info!(error = %e, took_ms = %t0.elapsed().as_millis(), "snapshot: fast first page failed");
+                                }
+                            }
+                        });
                         // Kick snapshot in parallel (merge into list on arrival)
                         let snap_tx = tx.clone();
                         let snap_api = api.clone();
@@ -603,42 +851,45 @@ impl eframe::App for OrkaGuiApp {
                                 }
                             }
                         });
-                        // Fetch namespaces list (best-effort)
+                        // Fetch namespaces list once (best-effort) if not already loaded
                         let ns_tx = tx.clone();
                         let ns_api = api.clone();
-                        tokio::spawn(async move {
-                            let t0 = Instant::now();
-                            info!("namespaces: fetch start");
-                            let ns_kind = ResourceKind {
-                                group: String::new(),
-                                version: "v1".into(),
-                                kind: "Namespace".into(),
-                                namespaced: false,
-                            };
-                            let sel = Selector {
-                                gvk: ns_kind,
-                                namespace: None,
-                            };
-                            match ns_api.snapshot(sel).await {
-                                Ok(resp) => {
-                                    let mut list: Vec<String> =
-                                        resp.data.items.into_iter().map(|o| o.name).collect();
-                                    list.sort();
-                                    list.dedup();
-                                    info!(namespaces = list.len(), took_ms = %t0.elapsed().as_millis(), "namespaces: fetch ok");
-                                    let _ = ns_tx.send(UiUpdate::Namespaces(list));
+                        if should_fetch_namespaces {
+                            tokio::spawn(async move {
+                                let t0 = Instant::now();
+                                info!("namespaces: fetch start");
+                                let ns_kind = ResourceKind {
+                                    group: String::new(),
+                                    version: "v1".into(),
+                                    kind: "Namespace".into(),
+                                    namespaced: false,
+                                };
+                                let sel = Selector {
+                                    gvk: ns_kind,
+                                    namespace: None,
+                                };
+                                match ns_api.snapshot(sel).await {
+                                    Ok(resp) => {
+                                        let mut list: Vec<String> =
+                                            resp.data.items.into_iter().map(|o| o.name).collect();
+                                        list.sort();
+                                        list.dedup();
+                                        info!(namespaces = list.len(), took_ms = %t0.elapsed().as_millis(), "namespaces: fetch ok");
+                                        let _ = ns_tx.send(UiUpdate::Namespaces(list));
+                                    }
+                                    Err(e) => {
+                                        info!(error = %e, took_ms = %t0.elapsed().as_millis(), "namespaces: fetch failed");
+                                    }
                                 }
-                                Err(e) => {
-                                    info!(error = %e, took_ms = %t0.elapsed().as_millis(), "namespaces: fetch failed");
-                                }
-                            }
-                        });
+                            });
+                        }
                         let _ = watch_fut.await;
                         info!(took_ms = %load_t0.elapsed().as_millis(), "watch: stopped or stream ended");
                     });
                     self.watch_task = Some(task);
                     self.watch_stop = Some(stop_tx);
-                    self.loaded_idx = Some(i);
+                    self.loaded_idx = None;
+                    self.loaded_gvk_key = Some(key);
                     self.loaded_ns = ns_opt;
                     self.results.clear();
                     self.index.clear();
@@ -654,6 +905,86 @@ fn gvk_label(k: &ResourceKind) -> String {
         format!("{}/{}", k.version, k.kind)
     } else {
         format!("{}/{}/{}", k.group, k.version, k.kind)
+    }
+}
+
+fn parse_gvk_key_to_kind(key: &str) -> ResourceKind {
+    let parts: Vec<&str> = key.split('/').collect();
+    match parts.as_slice() {
+        [version, kind] => ResourceKind { group: String::new(), version: (*version).to_string(), kind: (*kind).to_string(), namespaced: true },
+        [group, version, kind] => ResourceKind { group: (*group).to_string(), version: (*version).to_string(), kind: (*kind).to_string(), namespaced: true },
+        _ => ResourceKind { group: String::new(), version: String::new(), kind: key.to_string(), namespaced: true },
+    }
+}
+
+// -------- Persistent Watch Hub (broadcast) --------
+use std::sync::Mutex;
+use once_cell::sync::OnceCell;
+
+struct WatchHub {
+    map: Mutex<std::collections::HashMap<String, broadcast::Sender<LiteEvent>>>,
+    cache: Mutex<std::collections::HashMap<String, std::collections::HashMap<Uid, LiteObj>>>,
+}
+
+static WATCH_HUB: OnceCell<WatchHub> = OnceCell::new();
+
+fn watch_hub() -> &'static WatchHub {
+    WATCH_HUB.get_or_init(|| WatchHub {
+        map: Mutex::new(std::collections::HashMap::new()),
+        cache: Mutex::new(std::collections::HashMap::new()),
+    })
+}
+
+async fn watch_hub_subscribe(api: std::sync::Arc<dyn OrkaApi>, sel: Selector) -> Result<broadcast::Receiver<LiteEvent>, String> {
+    let key = format!("{}|{}", gvk_label(&sel.gvk), sel.namespace.as_deref().unwrap_or(""));
+    // Fast path: existing
+    if let Some(tx) = watch_hub().map.lock().unwrap().get(&key).cloned() {
+        return Ok(tx.subscribe());
+    }
+    // Create sender and spawn underlying watcher task
+    let (tx, rx) = broadcast::channel::<LiteEvent>(2048);
+    watch_hub().map.lock().unwrap().insert(key.clone(), tx.clone());
+    tokio::spawn(async move {
+        match api.watch_lite(sel).await {
+            Ok(mut sh) => {
+                loop {
+                    match sh.rx.recv().await {
+                        Some(LiteEvent::Applied(lo)) => {
+                            // Update cache then broadcast
+                            let mut cache = watch_hub().cache.lock().unwrap();
+                            let entry = cache.entry(key.clone()).or_insert_with(|| std::collections::HashMap::new());
+                            entry.insert(lo.uid, lo.clone());
+                            let _ = tx.send(LiteEvent::Applied(lo));
+                        }
+                        Some(LiteEvent::Deleted(lo)) => {
+                            let mut cache = watch_hub().cache.lock().unwrap();
+                            if let Some(map) = cache.get_mut(&key) { map.remove(&lo.uid); }
+                            let _ = tx.send(LiteEvent::Deleted(lo));
+                        }
+                        None => break,
+                    }
+                }
+            }
+            Err(_e) => { /* keep map entry; clients may retry */ }
+        }
+    });
+    Ok(rx)
+}
+
+fn watch_hub_snapshot(gvk_ns_key: &str) -> Vec<LiteObj> {
+    let cache = watch_hub().cache.lock().unwrap();
+    if let Some(map) = cache.get(gvk_ns_key) {
+        map.values().cloned().collect()
+    } else {
+        Vec::new()
+    }
+}
+
+fn watch_hub_prime(gvk_ns_key: &str, items: Vec<LiteObj>) {
+    let mut cache = watch_hub().cache.lock().unwrap();
+    let entry = cache.entry(gvk_ns_key.to_string()).or_insert_with(|| std::collections::HashMap::new());
+    for it in items {
+        entry.insert(it.uid, it);
     }
 }
 

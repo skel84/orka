@@ -232,10 +232,53 @@ impl OrkaApi for InProcApi {
         use std::sync::Arc;
         use tokio::sync::mpsc;
         let gvk_key = Self::gvk_key(&selector.gvk);
-        // Projector from CRD schema if available
-        let (projector, explain_available) = match orka_schema::fetch_crd_schema(&gvk_key).await {
-            Ok(Some(schema)) => (Some(Arc::new(schema.projector()) as Arc<dyn orka_core::Projector + Send + Sync>), true),
-            _ => (None, false),
+        // Fast-path for core and selected built-in groups: optional lite list (no JSON round-trip)
+        let enable_lite_flag = std::env::var("ORKA_LIST_LITE_BUILTINS")
+            .ok()
+            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+            .unwrap_or(true);
+        let lite_groups_env = std::env::var("ORKA_LIST_LITE_GROUPS").unwrap_or_else(|_| "*".to_string());
+        let group_key = if selector.gvk.group.is_empty() { "core".to_string() } else { selector.gvk.group.clone() };
+        let allowed = {
+            let mut ok = false;
+            for s in lite_groups_env.split(',').map(|s| s.trim()) {
+                if s.is_empty() { continue; }
+                if s == "*" || s.eq_ignore_ascii_case(&group_key) { ok = true; break; }
+            }
+            ok
+        };
+        let use_lite_list = enable_lite_flag && allowed;
+        if use_lite_list {
+            let l0 = Instant::now();
+            match orka_kubehub::list_lite(&gvk_key, selector.namespace.as_deref()).await {
+                Ok(items) => {
+                    info!(items = items.len(), took_ms = %l0.elapsed().as_millis(), "api: snapshot lite-list ok");
+                    let ws = orka_core::WorldSnapshot { epoch: 0, items };
+                    return Ok(SnapshotResponse {
+                        data: ws,
+                        meta: ResponseMeta { partial: false, pressure_events: PressureEvents::default(), explain_available: false },
+                    });
+                }
+                Err(e) => {
+                    info!(error = %e, took_ms = %l0.elapsed().as_millis(), "api: snapshot lite-list failed; falling back");
+                    // fallthrough to regular snapshot path
+                }
+            }
+        }
+        // Projector from CRD schema, optionally deferred to keep snapshot fast
+        // Skip for built-ins (empty group) and when deferral is enabled (default on)
+        let defer_schema = std::env::var("ORKA_DEFER_SCHEMA")
+            .ok()
+            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+            .unwrap_or(true);
+        let is_builtin = selector.gvk.group.is_empty();
+        let (projector, explain_available) = if is_builtin || defer_schema {
+            (None, false)
+        } else {
+            match orka_schema::fetch_crd_schema(&gvk_key).await {
+                Ok(Some(schema)) => (Some(Arc::new(schema.projector()) as Arc<dyn orka_core::Projector + Send + Sync>), true),
+                _ => (None, false),
+            }
         };
         let cap = std::env::var("ORKA_QUEUE_CAP").ok().and_then(|s| s.parse::<usize>().ok()).unwrap_or(2048);
         let (tx, mut rx) = mpsc::channel::<orka_core::Delta>(cap);
@@ -315,21 +358,11 @@ impl OrkaApi for InProcApi {
     async fn get_raw(&self, reference: ResourceRef) -> OrkaResult<Vec<u8>> {
         let t0 = Instant::now();
         info!(gvk = %Self::gvk_key(&reference.gvk), name = %reference.name, ns = %reference.namespace.as_deref().unwrap_or("-"), "api: get_raw start");
-        use kube::{discovery::{Discovery, Scope}, core::DynamicObject, api::Api};
+        use kube::{core::DynamicObject, api::Api};
         let client = kube::Client::try_default().await.map_err(|e| OrkaError::Internal(e.to_string()))?;
-        // Locate ApiResource via discovery
-        let gvk = kube::core::GroupVersionKind { group: reference.gvk.group.clone(), version: reference.gvk.version.clone(), kind: reference.gvk.kind.clone() };
-        let discovery = Discovery::new(client.clone()).run().await.map_err(|e| OrkaError::Internal(e.to_string()))?;
-        let mut ar_opt: Option<(kube::core::ApiResource, bool)> = None;
-        for group in discovery.groups() {
-            for (ar, caps) in group.recommended_resources() {
-                if ar.group == gvk.group && ar.version == gvk.version && ar.kind == gvk.kind {
-                    ar_opt = Some((ar.clone(), matches!(caps.scope, Scope::Namespaced)));
-                    break;
-                }
-            }
-        }
-        let (ar, namespaced) = ar_opt.ok_or_else(|| OrkaError::NotFound(format!("GVK not found: {}/{}/{}", gvk.group, gvk.version, gvk.kind)))?;
+        // Locate ApiResource via cached discovery in kubehub
+        let gvk_key = Self::gvk_key(&reference.gvk);
+        let (ar, namespaced) = orka_kubehub::get_api_resource(&gvk_key).await.map_err(Self::map_err)?;
         let api: Api<DynamicObject> = if namespaced {
             match reference.namespace.as_deref() {
                 Some(ns) => Api::namespaced_with(client.clone(), ns, &ar),
@@ -407,111 +440,33 @@ impl OrkaApi for InProcApi {
         use tokio::sync::mpsc;
         info!(gvk = %Self::gvk_key(&selector.gvk), ns = %selector.namespace.as_deref().unwrap_or("(all)"), "api: watch_lite start");
         let cap = std::env::var("ORKA_QUEUE_CAP").ok().and_then(|s| s.parse::<usize>().ok()).unwrap_or(2048);
-        let (delta_tx, mut delta_rx) = mpsc::channel::<orka_core::Delta>(cap);
         let (evt_tx, evt_rx) = mpsc::channel::<LiteEvent>(cap);
         let gvk_key = Self::gvk_key(&selector.gvk);
         let ns = selector.namespace.clone();
-        // Optional projector from CRD
-        let projector = match orka_schema::fetch_crd_schema(&gvk_key).await {
-            Ok(Some(schema)) => Some(std::sync::Arc::new(schema.projector()) as std::sync::Arc<dyn orka_core::Projector + Send + Sync>),
-            _ => None,
-        };
-        let max_labels_per_obj = std::env::var("ORKA_MAX_LABELS_PER_OBJ").ok().and_then(|s| s.parse::<usize>().ok());
-        let max_annos_per_obj = std::env::var("ORKA_MAX_ANNOS_PER_OBJ").ok().and_then(|s| s.parse::<usize>().ok());
-
-        // Spawn watcher feeding deltas
-        let watcher = tokio::spawn({
-            let g = gvk_key.clone();
-            async move {
-                info!("api: watcher(deltas) task starting");
-                let _ = orka_kubehub::start_watcher(&g, ns.as_deref(), delta_tx).await;
-                info!("api: watcher(deltas) task ended");
+        // Resolve ApiResource once and pass it to the lite watcher to skip discovery
+        let (ar, namespaced) = orka_kubehub::get_api_resource(&gvk_key).await.map_err(Self::map_err)?;
+        let handle = tokio::spawn(async move {
+            info!("api: watcher(lite) task starting");
+            let (tx_internal, mut rx_internal) = mpsc::channel::<orka_kubehub::LiteEvent>(cap);
+            // launch kubehub lite watcher
+            let watch_task = tokio::spawn({
+                async move {
+                    // We already have ApiResource; reuse to avoid discovery cost
+                    let client = kube::Client::try_default().await.expect("client");
+                    let _ = orka_kubehub::start_watcher_lite_with(client, ar, namespaced, ns.as_deref(), tx_internal).await;
+                }
+            });
+            // forward events into API channel
+            while let Some(ev) = rx_internal.recv().await {
+                match ev {
+                    orka_kubehub::LiteEvent::Applied(lo) => { if evt_tx.send(LiteEvent::Applied(lo)).await.is_err() { break; } }
+                    orka_kubehub::LiteEvent::Deleted(lo) => { if evt_tx.send(LiteEvent::Deleted(lo)).await.is_err() { break; } }
+                }
             }
+            let _ = watch_task.abort();
+            info!("api: watcher(lite) task ended");
         });
-
-        // Shaping helper
-        fn shape_lite(
-            d: &orka_core::Delta,
-            projector: &Option<std::sync::Arc<dyn orka_core::Projector + Send + Sync>>,
-            max_labels: Option<usize>,
-            max_annos: Option<usize>,
-        ) -> orka_core::LiteObj {
-            use smallvec::SmallVec;
-            let meta = d.raw.get("metadata");
-            let name = meta.and_then(|m| m.get("name")).and_then(|v| v.as_str()).unwrap_or("").to_string();
-            let namespace = meta.and_then(|m| m.get("namespace")).and_then(|v| v.as_str()).map(|s| s.to_string());
-            let creation_ts = meta
-                .and_then(|m| m.get("creationTimestamp")).and_then(|v| v.as_str())
-                .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
-                .map(|dt| dt.timestamp())
-                .unwrap_or(0);
-            let projected: SmallVec<[(u32, String); 8]> = if let Some(pj) = projector { pj.project(&d.raw) } else { SmallVec::new() };
-            let mut labels = SmallVec::<[(String, String); 8]>::new();
-            let mut annotations = SmallVec::<[(String, String); 4]>::new();
-            if let Some(meta_obj) = d.raw.get("metadata").and_then(|m| m.as_object()) {
-                if let Some(lbls) = meta_obj.get("labels").and_then(|m| m.as_object()) {
-                    for (k, v) in lbls.iter() {
-                        if let Some(val) = v.as_str() { labels.push((k.clone(), val.to_string())); }
-                        if let Some(cap) = max_labels { if labels.len() >= cap { break; } }
-                    }
-                }
-                if let Some(ann) = meta_obj.get("annotations").and_then(|m| m.as_object()) {
-                    for (k, v) in ann.iter() {
-                        if let Some(val) = v.as_str() { annotations.push((k.clone(), val.to_string())); }
-                        if let Some(cap) = max_annos { if annotations.len() >= cap { break; } }
-                    }
-                }
-            }
-            orka_core::LiteObj { uid: d.uid, namespace, name, creation_ts, projected, labels, annotations }
-        }
-
-        // Processing task: dedup by resourceVersion and emit LiteEvent
-        let proc_task = tokio::spawn(async move {
-            let t0 = Instant::now();
-            let mut first = true;
-            let mut applied = 0usize;
-            let mut deleted = 0usize;
-            let mut last_rv: HashMap<orka_core::Uid, String> = HashMap::new();
-            let mut last_lite: HashMap<orka_core::Uid, orka_core::LiteObj> = HashMap::new();
-            while let Some(d) = delta_rx.recv().await {
-                match d.kind {
-                    orka_core::DeltaKind::Applied => {
-                        let rv = d
-                            .raw.get("metadata").and_then(|m| m.get("resourceVersion")).and_then(|v| v.as_str())
-                            .unwrap_or("").to_string();
-                        let should_emit = match last_rv.get(&d.uid) {
-                            Some(prev) if prev == &rv => false,
-                            _ => true,
-                        };
-                        if !should_emit { continue; }
-                        last_rv.insert(d.uid, rv);
-                        let lo = shape_lite(&d, &projector, max_labels_per_obj, max_annos_per_obj);
-                        last_lite.insert(d.uid, lo.clone());
-                        let _ = evt_tx.send(LiteEvent::Applied(lo)).await;
-                        applied += 1;
-                        if first { info!(since_ms = %t0.elapsed().as_millis(), "api: first lite event (applied)"); first = false; }
-                    }
-                    orka_core::DeltaKind::Deleted => {
-                        if let Some(lo) = last_lite.remove(&d.uid) {
-                            let _ = evt_tx.send(LiteEvent::Deleted(lo)).await;
-                        } else {
-                            // Best-effort shape from deletion payload
-                            let lo = shape_lite(&d, &projector, max_labels_per_obj, max_annos_per_obj);
-                            let _ = evt_tx.send(LiteEvent::Deleted(lo)).await;
-                        }
-                        last_rv.remove(&d.uid);
-                        deleted += 1;
-                        if first { info!(since_ms = %t0.elapsed().as_millis(), "api: first lite event (deleted)"); first = false; }
-                    }
-                }
-            }
-            // channel closed; watcher will also stop once delta_tx is dropped
-            let _ = watcher.abort();
-            info!(applied, deleted, ran_ms = %t0.elapsed().as_millis(), "api: lite processor ended");
-        });
-
-        // The processing task owns delta_rx; aborting it will drop rx and end watcher
-        Ok(StreamHandle { rx: evt_rx, cancel: CancelHandle { task: Some(proc_task) } })
+        Ok(StreamHandle { rx: evt_rx, cancel: CancelHandle { task: Some(handle) } })
     }
 
     async fn schema(&self, gvk_key: &str) -> OrkaResult<Option<CrdSchema>> {
@@ -535,7 +490,7 @@ impl OrkaApi for InProcApi {
         namespace: Option<&str>,
         limit: Option<usize>,
     ) -> OrkaResult<Vec<LastApplied>> {
-        use kube::{discovery::{Discovery, Scope}, api::Api, core::{DynamicObject, GroupVersionKind}};
+        use kube::{api::Api, core::{DynamicObject, GroupVersionKind}};
         let t0 = Instant::now();
         info!(gvk = %gvk_key, name = %name, ns = %namespace.unwrap_or("-"), limit = ?limit, "api: last_applied start");
         // Resolve UID via live object fetch
@@ -547,18 +502,9 @@ impl OrkaApi for InProcApi {
             [group, version, kind] => GroupVersionKind { group: (*group).to_string(), version: (*version).to_string(), kind: (*kind).to_string() },
             _ => return Err(OrkaError::Validation(format!("invalid gvk: {}", gvk_key))),
         };
-        // Find ApiResource
-        let discovery = Discovery::new(client.clone()).run().await.map_err(|e| OrkaError::Internal(e.to_string()))?;
-        let mut ar_opt: Option<(kube::core::ApiResource, bool)> = None;
-        for group in discovery.groups() {
-            for (ar, caps) in group.recommended_resources() {
-                if ar.group == gvk.group && ar.version == gvk.version && ar.kind == gvk.kind {
-                    ar_opt = Some((ar.clone(), matches!(caps.scope, Scope::Namespaced)));
-                    break;
-                }
-            }
-        }
-        let (ar, namespaced) = ar_opt.ok_or_else(|| OrkaError::NotFound(format!("GVK not found: {}/{}/{}", gvk.group, gvk.version, gvk.kind)))?;
+        // Find ApiResource via kubehub cache
+        let key = if gvk.group.is_empty() { format!("{}/{}", gvk.version, gvk.kind) } else { format!("{}/{}/{}", gvk.group, gvk.version, gvk.kind) };
+        let (ar, namespaced) = orka_kubehub::get_api_resource(&key).await.map_err(Self::map_err)?;
         let api: Api<DynamicObject> = if namespaced {
             match namespace {
                 Some(ns) => Api::namespaced_with(client.clone(), ns, &ar),
