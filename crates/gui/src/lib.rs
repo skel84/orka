@@ -58,6 +58,7 @@ pub struct OrkaGuiApp {
     last_error: Option<String>,
     // scratch
     search: String,
+    results_filter: String,
     log: String,
     #[cfg(feature = "dock")]
     dock: dock::Tree<Tab>,
@@ -80,6 +81,14 @@ pub struct OrkaGuiApp {
     // metrics: selection start time for TTFR
     select_t0: Option<Instant>,
     ttfr_logged: bool,
+    // filter cache: Uid -> lowercase haystack for fast filtering
+    filter_cache: HashMap<Uid, String>,
+    // soft cap for rendering rows when no filter is applied
+    results_soft_cap: usize,
+    // display cache: pre-rendered strings per row per column (excluding Age)
+    display_cache: HashMap<Uid, Vec<String>>,
+    // results virtualization mode
+    results_virtual_mode: VirtualMode,
 }
 
 impl OrkaGuiApp {
@@ -121,6 +130,7 @@ impl OrkaGuiApp {
             detail_stop: None,
             last_error: None,
             search: String::new(),
+            results_filter: String::new(),
             log: String::new(),
             #[cfg(feature = "dock")]
             dock: {
@@ -142,6 +152,10 @@ impl OrkaGuiApp {
             prewarm_started: false,
             select_t0: None,
             ttfr_logged: false,
+            filter_cache: HashMap::new(),
+            results_soft_cap: std::env::var("ORKA_RESULTS_SOFT_CAP").ok().and_then(|s| s.parse::<usize>().ok()).unwrap_or(2000),
+            display_cache: HashMap::new(),
+            results_virtual_mode: VirtualMode::Auto,
         };
         // Start prewarm watchers for curated built-ins immediately (without waiting for discovery)
         if !this.prewarm_started {
@@ -166,6 +180,15 @@ impl OrkaGuiApp {
             }
         }
         this
+    }
+
+    fn build_filter_haystack(&self, it: &LiteObj) -> String {
+        let mut s = String::with_capacity(64);
+        s.push_str(&it.name);
+        s.push(' ');
+        if let Some(ns) = it.namespace.as_deref() { s.push_str(ns); s.push(' '); }
+        for (_k, v) in &it.projected { s.push_str(v); s.push(' '); }
+        s.to_lowercase()
     }
 
     fn apply_sort_if_needed(&mut self) {
@@ -218,270 +241,47 @@ impl OrkaGuiApp {
         self.sort_dirty = false;
     }
 
-}
-
-#[cfg(any())]
-impl OrkaGuiApp {
-
-    fn ui_results_old_removed(&mut self, ui: &mut egui::Ui) {
-        ui.heading("Results");
-        if self.results.is_empty() {
-            if self.last_error.is_none() && self.watch_task.is_some() {
-                ui.add(egui::Spinner::new());
-            } else {
-                ui.label(
-                    egui::RichText::new("Select a Kind to load results")
-                        .italics()
-                        .weak(),
-                );
-            }
-        }
-        // Apply pending sort before drawing the table
-        self.apply_sort_if_needed();
-        let rows_len = self.results.len() as u64;
-        // Build columns vector before creating the delegate to avoid borrow conflicts
-        let cols_spec = self.active_cols.clone();
-        let cols: Vec<Column> = if cols_spec.is_empty() {
-            vec![Column::new(160.0).resizable(true), Column::new(240.0).resizable(true), Column::new(70.0).resizable(true)]
-        } else {
-            cols_spec.iter().map(|c| Column::new(c.width).resizable(true)).collect()
-        };
-        let mut delegate = ResultsDelegate { app: self };
-        Table::new()
-            .id_salt("results_table")
-            .headers(vec![HeaderRow::new(20.0)])
-            .num_rows(rows_len)
-            .columns(cols)
-            .show(ui, &mut delegate);
-    }
-
-    fn ui_kind_tree_old_removed(&mut self, ui: &mut egui::Ui) {
-        egui::ScrollArea::vertical()
-            .id_salt("kind_tree_scroll")
-            .show(ui, |ui| {
-                // Curated built-in categories (collapsed by default)
-                self.ui_curated_category(ui, "Workloads", &[
-                    ("", "Pod", "Pods", true),
-                    ("apps", "Deployment", "Deployments", true),
-                    ("apps", "DaemonSet", "Daemon Sets", true),
-                    ("apps", "StatefulSet", "Stateful Sets", true),
-                    ("apps", "ReplicaSet", "Replica Sets", true),
-                    ("", "ReplicationController", "Replication Controllers", true),
-                    ("batch", "Job", "Jobs", true),
-                    ("batch", "CronJob", "Cron Jobs", true),
-                ]);
-                self.ui_curated_category(ui, "Config", &[
-                    ("", "ConfigMap", "Config Maps", true),
-                    ("", "Secret", "Secrets", true),
-                    ("", "ResourceQuota", "Resource Quotas", true),
-                    ("", "LimitRange", "Limit Ranges", true),
-                    ("autoscaling", "HorizontalPodAutoscaler", "Horizontal Pod Autoscalers", true),
-                    ("autoscaling.k8s.io", "VerticalPodAutoscaler", "Vertical Pod Autoscalers", true),
-                    ("policy", "PodDisruptionBudget", "Pod Disruption Budgets", true),
-                    ("scheduling.k8s.io", "PriorityClass", "Priority Classes", false),
-                    ("node.k8s.io", "RuntimeClass", "Runtime Classes", false),
-                    ("coordination.k8s.io", "Lease", "Leases", true),
-                    ("admissionregistration.k8s.io", "MutatingWebhookConfiguration", "Mutating Webhook Configurations", false),
-                    ("admissionregistration.k8s.io", "ValidatingWebhookConfiguration", "Validating Webhook Configurations", false),
-                ]);
-                self.ui_curated_category(ui, "Network", &[
-                    ("", "Service", "Services", true),
-                    ("", "Endpoints", "Endpoints", true),
-                    ("networking.k8s.io", "Ingress", "Ingresses", true),
-                    ("networking.k8s.io", "IngressClass", "Ingress Classes", false),
-                    ("networking.k8s.io", "NetworkPolicy", "Network Policies", true),
-                ]);
-                self.ui_curated_category(ui, "Storage", &[
-                    ("", "PersistentVolumeClaim", "Persistent Volume Claims", true),
-                    ("", "PersistentVolume", "Persistent Volumes", false),
-                    ("storage.k8s.io", "StorageClass", "Storage Classes", false),
-                ]);
-                self.ui_curated_category(ui, "Access Control", &[
-                    ("", "ServiceAccount", "Service Accounts", true),
-                    ("rbac.authorization.k8s.io", "ClusterRole", "Cluster Roles", false),
-                    ("rbac.authorization.k8s.io", "Role", "Roles", true),
-                    ("rbac.authorization.k8s.io", "ClusterRoleBinding", "Cluster Role Bindings", false),
-                    ("rbac.authorization.k8s.io", "RoleBinding", "Role Bindings", true),
-                ]);
-                // Singletons
-                if let Some(idx) = self.find_kind_index("", "Namespace") {
-                    self.ui_single_item(ui, idx, "Namespaces");
-                }
-                if let Some(idx) = self.find_kind_index("", "Node") {
-                    self.ui_single_item(ui, idx, "Nodes");
-                }
-                if let Some(idx) = self.find_kind_index("events.k8s.io", "Event").or_else(|| self.find_kind_index("", "Event")) {
-                    self.ui_single_item(ui, idx, "Events");
-                }
-
-                // Custom Resources (grouped by API group), collapsed by default
-                self.ui_crd_section(ui);
-            });
-    }
-
-    fn ui_single_item_old_removed(&mut self, ui: &mut egui::Ui, idx: usize, label: &str) {
-        let selected = self.selected_idx == Some(idx);
-        let resp = ui.selectable_label(selected, label);
-        if resp.clicked() { self.on_select_idx(idx); }
-    }
-
-    fn ui_curated_category_old_removed(&mut self, ui: &mut egui::Ui, title: &str, entries: &[(&str, &str, &str, bool)]) {
-        egui::CollapsingHeader::new(title).default_open(false).show(ui, |ui| {
-            for (group, kind, label, namespaced) in entries {
-                let rk = ResourceKind { group: (*group).to_string(), version: "v1".to_string(), kind: (*kind).to_string(), namespaced: *namespaced };
-                let is_sel = self.current_selected_kind().map(|k| gvk_label(k) == gvk_label(&rk)).unwrap_or(false);
-                let resp = ui.selectable_label(is_sel, *label);
-                if resp.clicked() { self.on_select_gvk(rk.clone()); }
-            }
-        });
-    }
-
-    fn is_builtin_group_old_removed(group: &str) -> bool {
-        if group.is_empty() { return true; }
-        matches!(group,
-            "apps" | "batch" | "autoscaling" | "autoscaling.k8s.io" | "policy" | "rbac.authorization.k8s.io" |
-            "networking.k8s.io" | "storage.k8s.io" | "node.k8s.io" | "coordination.k8s.io" | "admissionregistration.k8s.io" |
-            "events.k8s.io" | "scheduling.k8s.io" | "apiregistration.k8s.io" | "authentication.k8s.io" | "authorization.k8s.io" |
-            "discovery.k8s.io" | "flowcontrol.apiserver.k8s.io"
-        )
-    }
-
-    fn ui_crd_section_old_removed(&mut self, ui: &mut egui::Ui) {
-        use std::collections::BTreeMap;
-        // group -> Vec<(idx, kind)>
-        let mut groups: BTreeMap<String, Vec<(usize, String)>> = BTreeMap::new();
-        for (idx, k) in self.kinds.iter().enumerate() {
-            if OrkaGuiApp::is_builtin_group(&k.group) { continue; }
-            let entry = groups.entry(k.group.clone()).or_default();
-            entry.push((idx, k.kind.clone()));
-        }
-        if groups.is_empty() { return; }
-        egui::CollapsingHeader::new("Custom Resources")
-            .default_open(false)
-            .show(ui, |ui| {
-                for (group, mut kinds) in groups.into_iter() {
-                    kinds.sort_by(|a, b| a.1.cmp(&b.1));
-                    egui::CollapsingHeader::new(group)
-                        .default_open(false)
-                        .show(ui, |ui| {
-                            for (idx, name) in kinds.into_iter() {
-                                let selected = self.selected_idx == Some(idx);
-                                let resp = ui.selectable_label(selected, name);
-                                if resp.clicked() { self.on_select_idx(idx); }
-                            }
-                        });
-                }
-            });
-    }
-
-    fn find_kind_index_old_removed(&self, group: &str, kind: &str) -> Option<usize> {
-        // Prefer v1 when multiple versions exist
-        let mut candidate: Option<usize> = None;
-        for (idx, k) in self.kinds.iter().enumerate() {
-            if k.kind == kind && ((group.is_empty() && k.group.is_empty()) || k.group == group) {
-                if k.version == "v1" { return Some(idx); }
-                candidate = Some(idx);
-            }
-        }
-        candidate
-    }
-
-    fn on_select_idx_old_removed(&mut self, idx: usize) {
-        if let Some(k) = self.kinds.get(idx).cloned() {
-            info!(gvk = %gvk_label(&k), "ui: kind clicked");
-            self.selected_kind = Some(k);
-            self.selected_idx = Some(idx);
-        }
-    }
-
-    fn on_select_gvk_old_removed(&mut self, rk: ResourceKind) {
-        info!(gvk = %gvk_label(&rk), "ui: kind clicked");
-        self.selected_kind = Some(rk);
-        self.selected_idx = None;
-    }
-
-    fn current_selected_kind_old_removed(&self) -> Option<&ResourceKind> {
-        match self.selected_kind.as_ref() {
-            Some(k) => Some(k),
-            None => self.selected_idx.and_then(|i| self.kinds.get(i)),
-        }
-    }
-
-    fn ui_details_old_removed(&mut self, ui: &mut egui::Ui) {
-        ui.heading("Details");
-        egui::ScrollArea::vertical()
-            .id_salt("details_scroll")
-            .show(ui, |ui| {
-                if self.detail_buffer.is_empty() {
-                    ui.label("Select a row to view details");
-                } else {
-                    let te = egui::TextEdit::multiline(&mut self.detail_buffer)
-                        .font(egui::TextStyle::Monospace)
-                        .desired_rows(24)
-                        .desired_width(f32::INFINITY)
-                        .interactive(false);
-                    ui.add(te);
-                }
-            });
-    }
-
-    fn select_row_old_removed(&mut self, it: LiteObj) {
-        info!(uid = ?it.uid, name = %it.name, ns = %it.namespace.as_deref().unwrap_or("-"), "details: selecting row");
-        self.selected = Some(it.uid);
-        self.detail_buffer.clear();
-        // cancel previous detail task if any
-        if let Some(stop) = self.detail_stop.take() {
-            info!("details: cancelling previous task");
-            let _ = stop.send(());
-        }
-        // need current kind
-        let Some(kind_idx) = self.selected_idx else {
-            return;
-        };
-        let Some(kind) = self.kinds.get(kind_idx).cloned() else {
-            return;
-        };
-        // build reference
-        let reference = ResourceRef {
-            cluster: None,
-            gvk: kind,
-            namespace: it.namespace.clone(),
-            name: it.name.clone(),
-        };
-        let api = self.api.clone();
-        let tx_opt = self.updates_tx.clone();
-        let (stop_tx, mut stop_rx) = tokio::sync::oneshot::channel::<()>();
-        self.detail_stop = Some(stop_tx);
-        // spawn fetch task
-        self.detail_task = Some(tokio::spawn(async move {
-            let t0 = Instant::now();
-            info!(gvk = %gvk_label(&reference.gvk), name = %reference.name, ns = %reference.namespace.as_deref().unwrap_or("-"), "details: fetch start");
-            let fetch = async {
-                match api.get_raw(reference).await {
-                    Ok(bytes) => {
-                        let text = match serde_json::from_slice::<serde_json::Value>(&bytes) {
-                            Ok(v) => match serde_yaml::to_string(&v) {
-                                Ok(y) => y,
-                                Err(_) => String::from_utf8_lossy(&bytes).into_owned(),
-                            },
-                            Err(_) => String::from_utf8_lossy(&bytes).into_owned(),
-                        };
-                        info!(size = bytes.len(), took_ms = %t0.elapsed().as_millis(), "details: fetch ok");
-                        if let Some(tx) = tx_opt.as_ref() {
-                            let _ = tx.send(UiUpdate::Detail(text));
-                        }
-                    }
-                    Err(e) => {
-                        info!(took_ms = %t0.elapsed().as_millis(), error = %e, "details: fetch failed");
-                        if let Some(tx) = tx_opt.as_ref() {
-                            let _ = tx.send(UiUpdate::DetailError(e.to_string()));
-                        }
-                    }
-                }
+    pub(crate) fn build_display_row(&self, it: &LiteObj) -> Vec<String> {
+        // Produce a vector of strings aligned with active_cols; Age left empty to render live
+        let mut out = Vec::with_capacity(self.active_cols.len());
+        for spec in &self.active_cols {
+            let s = match &spec.kind {
+                ColumnKind::Namespace => it.namespace.as_deref().unwrap_or("-").to_string(),
+                ColumnKind::Name => it.name.clone(),
+                ColumnKind::Age => String::new(), // dynamic
+                ColumnKind::Projected(id) => it
+                    .projected
+                    .iter()
+                    .find(|(k, _)| k == id)
+                    .map(|(_, v)| v.clone())
+                    .unwrap_or_else(|| "-".into()),
             };
-            tokio::select! { _ = &mut stop_rx => {}, _ = fetch => {} }
-        }));
+            out.push(s);
+        }
+        out
     }
+
+    pub(crate) fn display_cell_string(&mut self, it: &LiteObj, col_idx: usize, spec: &ColumnSpec) -> String {
+        match spec.kind {
+            ColumnKind::Age => crate::util::render_age(it.creation_ts),
+            _ => {
+                let recalc = match self.display_cache.get(&it.uid) {
+                    Some(vec) => vec.len() != self.active_cols.len(),
+                    None => true,
+                };
+                if recalc {
+                    let row = self.build_display_row(it);
+                    self.display_cache.insert(it.uid, row);
+                }
+                self.display_cache
+                    .get(&it.uid)
+                    .and_then(|v| v.get(col_idx))
+                    .cloned()
+                    .unwrap_or_default()
+            }
+        }
+    }
+
 }
 
 impl eframe::App for OrkaGuiApp {
@@ -589,6 +389,8 @@ impl eframe::App for OrkaGuiApp {
                             self.index.clear();
                             for (i, it) in self.results.iter().enumerate() {
                                 self.index.insert(it.uid, i);
+                                self.filter_cache.insert(it.uid, self.build_filter_haystack(it));
+                                // lazy display cache; can be built on demand
                             }
                             info!(items = count, total = self.results.len(), "ui: snapshot applied (initial)");
                             if !self.ttfr_logged {
@@ -605,6 +407,9 @@ impl eframe::App for OrkaGuiApp {
                                 if !self.index.contains_key(&it.uid) {
                                     let idx = self.results.len();
                                     self.index.insert(it.uid, idx);
+                                    self.filter_cache.insert(it.uid, self.build_filter_haystack(&it));
+                                    // prefill display cache for new rows
+                                    self.display_cache.insert(it.uid, self.build_display_row(&it));
                                     self.results.push(it);
                                 }
                             }
@@ -619,10 +424,14 @@ impl eframe::App for OrkaGuiApp {
                     }
                     Ok(UiUpdate::Event(LiteEvent::Applied(lo))) => {
                         if let Some(idx) = self.index.get(&lo.uid).copied() {
+                            self.filter_cache.insert(lo.uid, self.build_filter_haystack(&lo));
+                            self.display_cache.insert(lo.uid, self.build_display_row(&lo));
                             self.results[idx] = lo;
                         } else {
                             let idx = self.results.len();
                             self.index.insert(lo.uid, idx);
+                            self.filter_cache.insert(lo.uid, self.build_filter_haystack(&lo));
+                            self.display_cache.insert(lo.uid, self.build_display_row(&lo));
                             self.results.push(lo);
                         }
                         // Don't log every event to avoid spam; tiny heartbeat below
@@ -639,6 +448,8 @@ impl eframe::App for OrkaGuiApp {
                                     self.index.insert(mv.uid, idx);
                                 }
                             }
+                            self.filter_cache.remove(&lo.uid);
+                            self.display_cache.remove(&lo.uid);
                         }
                         self.sort_dirty = true;
                         processed += 1;
@@ -980,6 +791,8 @@ impl eframe::App for OrkaGuiApp {
                     self.loaded_ns = ns_opt;
                     self.results.clear();
                     self.index.clear();
+                    self.filter_cache.clear();
+                    self.display_cache.clear();
                     self.last_error = None;
                 }
             }
@@ -1004,86 +817,5 @@ enum Tab {
     Details,
 }
 
-#[cfg(any())]
-struct ResultsDelegateOldRemoved<'a> {
-    app: &'a mut OrkaGuiApp,
-}
-
-#[cfg(any())]
-impl<'a> TableDelegate for ResultsDelegateOldRemoved<'a> {
-    fn prepare(&mut self, _info: &egui_table::PrefetchInfo) {}
-
-    fn header_cell_ui(&mut self, ui: &mut egui::Ui, cell: &HeaderCellInfo) {
-        if cell.row_nr == 0 {
-            // Fill header cell background for contrast
-            let rect = ui.max_rect();
-            let bg = ui.visuals().widgets.inactive.bg_fill;
-            ui.painter().rect_filled(rect, 0.0, bg);
-            let col_idx = cell.col_range.start as usize;
-            let label = self
-                .app
-                .active_cols
-                .get(col_idx)
-                .map(|c| c.label)
-                .unwrap_or("");
-            if !label.is_empty() {
-                ui.add_space(2.0);
-                let is_sorted = self.app.sort_col == Some(col_idx);
-                let mut text = label.to_string();
-                if is_sorted {
-                    text.push_str(if self.app.sort_asc { " ↑" } else { " ↓" });
-                }
-                let resp = ui.selectable_label(is_sorted, egui::RichText::new(text).strong());
-                if resp.clicked() {
-                    if is_sorted {
-                        self.app.sort_asc = !self.app.sort_asc;
-                    } else {
-                        self.app.sort_col = Some(col_idx);
-                        self.app.sort_asc = true;
-                    }
-                    self.app.sort_dirty = true;
-                }
-            }
-        }
-    }
-
-    fn cell_ui(&mut self, ui: &mut egui::Ui, cell: &CellInfo) {
-        let idx = cell.row_nr as usize;
-        if let Some(it) = self.app.results.get(idx).cloned() {
-            let is_sel = self.app.selected.map(|u| u == it.uid).unwrap_or(false);
-            // zebra stripes and selection background
-            let rect = ui.max_rect();
-            if is_sel {
-                ui.painter()
-                    .rect_filled(rect, 0.0, ui.visuals().selection.bg_fill);
-            } else if idx % 2 == 0 {
-                ui.painter()
-                    .rect_filled(rect, 0.0, ui.visuals().faint_bg_color);
-            }
-            let col = self.app.active_cols.get(cell.col_nr as usize);
-            if let Some(spec) = col {
-                match &spec.kind {
-                    ColumnKind::Namespace => {
-                        let ns = it.namespace.as_deref().unwrap_or("-");
-                        let _ = ui.selectable_label(is_sel, egui::RichText::new(ns).monospace());
-                    }
-                    ColumnKind::Name => {
-                        let resp = ui.selectable_label(is_sel, egui::RichText::new(&it.name).monospace());
-                        if resp.clicked() { self.app.select_row(it); }
-                    }
-                    ColumnKind::Age => {
-                        ui.label(egui::RichText::new(render_age(it.creation_ts)).monospace());
-                    }
-                    ColumnKind::Projected(id) => {
-                        let val = it.projected.iter().find(|(k, _)| k == id).map(|(_, v)| v.as_str()).unwrap_or("-");
-                        ui.label(egui::RichText::new(val).monospace());
-                    }
-                }
-            }
-        }
-    }
-
-    fn default_row_height(&self) -> f32 {
-        18.0
-    }
-}
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum VirtualMode { Auto, On, Off }

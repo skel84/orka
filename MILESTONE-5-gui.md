@@ -110,6 +110,12 @@ Notes on perf: perceived first‑paint latency reduced by starting `watch_lite` 
 
 - Results: added clickable header sorting (asc/desc) for Namespace • Name • Age and Projected columns; rebuilds UID→row index after sort.
 - Results: added periodic repaint (1s) so Age column auto-refreshes without user interaction.
+- Results: added simple filter box in Results panel; filters by name/namespace/projected values.
+- Results: added row display cache (Uid→Vec<String>) for Name/Namespace/Projected; Age rendered live.
+- Results: added soft cap banner and capped unfiltered render to `ORKA_RESULTS_SOFT_CAP` (default 2000).
+- Results: virtualized rows for large unfiltered sets using `egui::ScrollArea::show_rows`; keeps clickable header; automatic heuristic + manual toggle.
+- Results: UI toggle for row mode: Auto • Virtual • Table.
+- Results: small UX niceties: Escape clears filter; show “No matches” when filter yields zero rows; Namespace cell clickable to select.
 - Refactor: split GUI crate into focused modules to keep `lib.rs` lean:
   - `util.rs` (helpers: gvk_label, parse_gvk_key_to_kind, render_age)
   - `watch.rs` (persistent WatchHub + cache)
@@ -117,6 +123,7 @@ Notes on perf: perceived first‑paint latency reduced by starting `watch_lite` 
   - `nav.rs` (kind tree: curated + CRDs)
   - `details.rs` (details panel + fetch task)
 - Hygiene: cleared leftover warnings and unused imports across crates affected by the GUI work.
+- Hygiene: removed dead/legacy GUI code from `crates/gui/src/lib.rs`.
 
 Notes: user-visible behavior unchanged except for sorting and Age auto-refresh; existing load strategy and background tasks preserved.
 
@@ -126,9 +133,10 @@ Notes: user-visible behavior unchanged except for sorting and Age auto-refresh; 
 
 1. Results table polish
    - DONE: Sort by columns; age text refresh timer.
-   - TODO: Basic filter box.
-   - Row display cache (Uid→rendered strings) to reduce per‑frame work.
-   - Guard huge result sets with a soft cap + “refine filters” banner; explore virtualization later.
+   - DONE: Basic filter box.
+   - DONE: Row display cache (Uid→rendered strings) to reduce per‑frame work.
+   - DONE: Guard huge result sets with a soft cap + “refine filters” banner.
+   - DONE: Virtualized rows for large unfiltered sets; Auto/Virtual/Table switch.
 2. Search integration
    - Wire top‑bar search to `api.search(selector, query, limit)`; overlay hits in Results and add an Explain tab with stage counts.
 3. Logs tab (Pods)
@@ -149,9 +157,10 @@ Notes: user-visible behavior unchanged except for sorting and Age auto-refresh; 
 - Runtime: single tokio runtime (from CLI) with background tasks; UI communicates via bounded `std::sync::mpsc` channels.
 - Backpressure: bounded channels with `try_send` drop‑on‑full; counters surfaced in bottom bar (to be added).
 - Load strategy: start `watch_lite` first for fast paint; fetch snapshot in parallel and merge; cancel both on selection change.
-- UI primitives: `egui_table` for results; stable `TextEdit` for YAML details; unique `id_source` on scroll areas.
+- UI primitives: `egui_table` for normal results; `egui::ScrollArea::show_rows` virtualization for large unfiltered sets; stable `TextEdit` for YAML details; unique `id_source` on scroll areas.
 - Refactor: `orka_gui` split into `util`, `watch`, `results`, `nav`, `details` modules; `lib.rs` keeps app state and wiring.
 - Sorting: header click toggles asc/desc; sorting mutates in‑memory rows and rebuilds UID index to keep delta merges consistent.
+- Results perf: display cache per row for static columns; filter cache (lowercased haystack) for quick substring matching; soft cap via `ORKA_RESULTS_SOFT_CAP`; rows mode toggle (Auto/Virtual/Table).
 
 ---
 
