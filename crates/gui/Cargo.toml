@@ -24,6 +24,7 @@ eframe = { version = "0.31", default-features = true, features = ["wgpu"] }
 egui_dock = { version = "0.12", optional = true }
 egui_virtual_list = { version = "0.3", optional = true }
 once_cell = "1.19"
+fuzzy-matcher = "0.3"
 
 [features]
 default = []

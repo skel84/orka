@@ -11,11 +11,32 @@ use crate::util::gvk_label;
 use super::{OrkaGuiApp, UiUpdate};
 
 impl OrkaGuiApp {
+    pub(crate) fn ui_explain(&mut self, ui: &mut egui::Ui) {
+        let has = self.search_explain.is_some();
+        egui::CollapsingHeader::new("Explain (Search)")
+            .default_open(false)
+            .show(ui, |ui| {
+                if let Some(ex) = &self.search_explain {
+                    ui.label(format!(
+                        "total={} ns={} label_keys={} labels={} anno_keys={} annos={} fields={}",
+                        ex.total, ex.after_ns, ex.after_label_keys, ex.after_labels, ex.after_anno_keys, ex.after_annos, ex.after_fields
+                    ));
+                    if self.search_partial {
+                        ui.label(egui::RichText::new("partial results — recovering from backlog/overflow").color(ui.visuals().warn_fg_color));
+                    }
+                } else {
+                    ui.label("Run a search to populate explain statistics.");
+                }
+            });
+        if has { ui.separator(); }
+    }
     pub(crate) fn ui_details(&mut self, ui: &mut egui::Ui) {
         ui.heading("Details");
         egui::ScrollArea::vertical()
             .id_salt("details_scroll")
             .show(ui, |ui| {
+                // Explain section (collapsed by default)
+                self.ui_explain(ui);
                 if self.detail_buffer.is_empty() {
                     ui.label("Select a row to view details");
                 } else {
@@ -38,9 +59,8 @@ impl OrkaGuiApp {
             info!("details: cancelling previous task");
             let _ = stop.send(());
         }
-        // need current kind
-        let Some(kind_idx) = self.selected_idx else { return; };
-        let Some(kind) = self.kinds.get(kind_idx).cloned() else { return; };
+        // need current kind (support both curated index selection and direct GVK selection)
+        let Some(kind) = self.current_selected_kind().cloned() else { return; };
         // build reference
         let reference = ResourceRef { cluster: None, gvk: kind, namespace: it.namespace.clone(), name: it.name.clone() };
         let api = self.api.clone();

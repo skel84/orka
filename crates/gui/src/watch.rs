@@ -76,3 +76,16 @@ pub(crate) fn watch_hub_prime(gvk_ns_key: &str, items: Vec<LiteObj>) {
     }
 }
 
+/// Snapshot all cached LiteObjs across all active watchers, returning pairs of
+/// `(gvk_key, LiteObj)` where `gvk_key` is `group/version/kind` or `version/kind`.
+pub(crate) fn watch_hub_snapshot_all() -> Vec<(String, LiteObj)> {
+    let cache = watch_hub().cache.lock().unwrap();
+    let mut out = Vec::new();
+    for (key, map) in cache.iter() {
+        // Keys are in the form "<gvk_label>|<ns>"; split at '|'
+        if let Some((gvk_key, _ns)) = key.split_once('|') {
+            for lo in map.values() { out.push((gvk_key.to_string(), lo.clone())); }
+        }
+    }
+    out
+}

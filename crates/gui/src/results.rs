@@ -25,6 +25,10 @@ impl OrkaGuiApp {
                 self.results_filter.clear();
             }
             ui.separator();
+            if !self.search_hits.is_empty() {
+                ui.label(format!("Hits: {}", self.search_hits.len()));
+                ui.separator();
+            }
             let total = self.results.len();
             let showing = if self.results_filter.is_empty() { total.min(self.results_soft_cap) } else { self.compute_filtered_ix().len() };
             ui.label(format!("Showing {} of {}", showing, total));
@@ -151,6 +155,7 @@ impl OrkaGuiApp {
                 let idx = filtered_ix[row_idx];
                 if let Some(it) = self.results.get(idx).cloned() {
                     let is_sel = self.selected.map(|u| u == it.uid).unwrap_or(false);
+                    let is_hit = self.search_hits.contains_key(&it.uid);
                     let rect = ui.max_rect();
                     if is_sel {
                         ui.painter().rect_filled(rect, 0.0, ui.visuals().selection.bg_fill);
@@ -159,7 +164,10 @@ impl OrkaGuiApp {
                     }
                     ui.horizontal(|ui| {
                         for (col_idx, spec) in self.active_cols.clone().into_iter().enumerate() {
-                            let text = self.display_cell_string(&it, col_idx, &spec);
+                            let mut text = self.display_cell_string(&it, col_idx, &spec);
+                            if is_hit && matches!(spec.kind, ColumnKind::Name) {
+                                text = format!("★ {}", text);
+                            }
                             match spec.kind {
                                 ColumnKind::Name | ColumnKind::Namespace => {
                                     let resp = ui.add_sized([spec.width, row_h], egui::SelectableLabel::new(is_sel, egui::RichText::new(text).monospace()));
@@ -224,6 +232,7 @@ impl<'a> TableDelegate for ResultsDelegate<'a> {
         let real_idx = *self.filtered_ix.get(idx).unwrap_or(&idx);
         if let Some(it) = self.app.results.get(real_idx).cloned() {
             let is_sel = self.app.selected.map(|u| u == it.uid).unwrap_or(false);
+            let is_hit = self.app.search_hits.contains_key(&it.uid);
             // zebra stripes and selection background
             let rect = ui.max_rect();
             if is_sel {
@@ -235,7 +244,8 @@ impl<'a> TableDelegate for ResultsDelegate<'a> {
             }
             let col_idx = cell.col_nr as usize;
             if let Some(spec) = self.app.active_cols.get(col_idx).cloned() {
-                let text = self.app.display_cell_string(&it, col_idx, &spec);
+                let mut text = self.app.display_cell_string(&it, col_idx, &spec);
+                if is_hit && matches!(spec.kind, ColumnKind::Name) { text = format!("★ {}", text); }
                 match spec.kind {
                     ColumnKind::Name | ColumnKind::Namespace => {
                         let resp = ui.selectable_label(is_sel, egui::RichText::new(text).monospace());

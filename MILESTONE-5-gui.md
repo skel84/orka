@@ -139,6 +139,9 @@ Notes: user-visible behavior unchanged except for sorting and Age auto-refresh; 
    - DONE: Virtualized rows for large unfiltered sets; Auto/Virtual/Table switch.
 2. Search integration
    - Wire top‑bar search to `api.search(selector, query, limit)`; overlay hits in Results and add an Explain tab with stage counts.
+   - Live preview under search (debounced), arrow‑key navigation, Enter to open; Esc to clear.
+   - Autocomplete for grammar (ns:, k:, label:, field:), cancelable searches.
+   - Global search (cross‑Kind) via Cmd‑K palette: lightweight, keyboard‑first overlay listing top hits across all kinds; supports ns:/k:/g:/label:/field: filters; Enter opens details; actions (logs/exec) as follow‑ups.
 3. Logs tab (Pods)
    - Integrate `orka_ops::logs` with bounded backlog, follow toggle, regex filter; show drop counters in bottom bar.
 4. Edit tab
@@ -148,7 +151,14 @@ Notes: user-visible behavior unchanged except for sorting and Age auto-refresh; 
 6. Stats modal
    - Surface `api.stats()` plus runtime metrics; show relist/backoff/shards/memory caps and posting/drop counters.
 7. Keyboard + palette
-   - Cmd‑K palette; shortcuts (F focus search, Enter open, L logs, E exec, Cmd‑S apply, Esc cancel fetch).
+   - Cmd‑K palette (global search enabled); shortcuts (F focus search, Enter open, L logs, E exec, Cmd‑S apply, Esc cancel fetch).
+
+8. UI perf & YAML rendering (moved up from Mini‑UI/Perf)
+   - YAML LayoutJob cache in Details: bounded LRU of `egui::text::LayoutJob` keyed by YAML hash; reduces per‑frame CPU.
+   - Details string cache by `Uid` with TTL; invalidate on Applied/Deleted; TTL via `ORKA_DETAILS_TTL_SECS`.
+   - Debounced prefetch of details after row selection (~150ms), cancel on change.
+   - Metrics: `time_to_first_details_ms`, `yaml_layout_build_ms`, and cache hit/miss counters.
+   - Env knobs: `ORKA_YAML_LAYOUT_CACHE_CAP`, `ORKA_DETAILS_TTL_SECS`.
 
 ---
 

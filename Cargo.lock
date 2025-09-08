@@ -3673,6 +3673,7 @@ dependencies = [
  "egui_dock",
  "egui_table",
  "egui_virtual_list",
+ "fuzzy-matcher",
  "once_cell",
  "orka-core",
  "orka-kubehub",
