@@ -20,6 +20,13 @@ pub(crate) fn ui_statusbar(app: &mut OrkaGuiApp, ctx: &egui::Context) {
                         if app.search.partial { " (partial)" } else { "" }
                     ));
                 }
+                if app.logs.dropped > 0 || (app.logs.running && app.logs.recv > 0) {
+                    ui.separator();
+                    let mut parts = Vec::new();
+                    if app.logs.recv > 0 { parts.push(format!("logs recv: {}", app.logs.recv)); }
+                    if app.logs.dropped > 0 { parts.push(format!("dropped: {}", app.logs.dropped)); }
+                    ui.label(parts.join("  •  "));
+                }
                 if let Some(err) = &app.last_error {
                     ui.separator();
                     ui.label(egui::RichText::new(err).color(ui.visuals().warn_fg_color));

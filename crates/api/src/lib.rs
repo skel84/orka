@@ -11,6 +11,11 @@ use std::time::Instant;
 use tracing::info;
 
 pub use orka_ops::OrkaOps; // Re-export imperative ops trait
+pub use orka_ops::LogOptions as OpsLogOptions; // Re-export ops types for frontends
+pub use orka_ops::CancelHandle as OpsCancelHandle;
+pub use orka_ops::LogChunk as OpsLogChunk;
+pub use orka_ops::StreamHandle as OpsStreamHandle;
+pub use orka_ops::ForwardEvent as OpsForwardEvent;
 pub use orka_schema::CrdSchema; // Re-export schema type
 pub use orka_persist::LastApplied; // Re-export last-applied row
 use std::collections::HashMap;
@@ -538,8 +543,102 @@ pub struct CancelHandle { task: Option<tokio::task::JoinHandle<()>> }
 
 impl CancelHandle { pub fn cancel(mut self) { if let Some(h) = self.task.take() { h.abort(); } } }
 
+impl std::fmt::Debug for CancelHandle {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CancelHandle").finish()
+    }
+}
+
 /// Generic stream handle used by API streaming endpoints.
 pub struct StreamHandle<T> { pub rx: tokio::sync::mpsc::Receiver<T>, pub cancel: CancelHandle }
+
+// ----------------- Ops Facade (API-level) -----------------
+
+/// Lightweight facade over imperative ops, returning API-level stream handles
+/// and hiding ops-internal transport types.
+pub struct ApiOps { inner: std::sync::Arc<dyn OrkaOps> }
+
+impl ApiOps {
+    pub fn new(inner: std::sync::Arc<dyn OrkaOps>) -> Self { Self { inner } }
+
+    /// Stream pod logs and return strings via a bounded channel.
+    pub async fn logs(
+        &self,
+        namespace: Option<&str>,
+        pod: &str,
+        container: Option<&str>,
+        opts: OpsLogOptions,
+    ) -> OrkaResult<StreamHandle<String>> {
+        let cap = std::env::var("ORKA_OPS_QUEUE_CAP").ok().and_then(|s| s.parse().ok()).unwrap_or(1024);
+        let (tx, rx) = tokio::sync::mpsc::channel::<String>(cap);
+        // Start underlying stream
+        let res = self.inner.logs(namespace, pod, container, opts).await.map_err(|e| OrkaError::Internal(e.to_string()))?;
+        // Guard that cancels underlying stream when the pump ends/aborts
+        struct OpsCancelGuard { inner: Option<OpsCancelHandle> }
+        impl Drop for OpsCancelGuard { fn drop(&mut self) { if let Some(c) = self.inner.take() { c.cancel(); } } }
+        let mut rx_ops = res.rx;
+        let guard = OpsCancelGuard { inner: Some(res.cancel) };
+        let task = tokio::spawn(async move {
+            let _g = guard; // ensure drop on task end/abort
+            while let Some(chunk) = rx_ops.recv().await {
+                let _ = tx.try_send(chunk.line);
+            }
+        });
+        Ok(StreamHandle { rx, cancel: CancelHandle { task: Some(task) } })
+    }
+
+    /// Execute a command in a pod. For now this is a one-shot operation using
+    /// the underlying ops provider and does not return a streaming handle.
+    pub async fn exec(
+        &self,
+        namespace: Option<&str>,
+        pod: &str,
+        container: Option<&str>,
+        cmd: &[String],
+        pty: bool,
+    ) -> OrkaResult<()> {
+        self.inner.exec(namespace, pod, container, cmd, pty).await.map_err(|e| OrkaError::Internal(e.to_string()))
+    }
+
+    /// Port-forward from local to a pod port. Returns API-level event stream.
+    pub async fn port_forward(
+        &self,
+        namespace: Option<&str>,
+        pod: &str,
+        local: u16,
+        remote: u16,
+    ) -> OrkaResult<StreamHandle<PortForwardEvent>> {
+        let (tx, rx) = tokio::sync::mpsc::channel::<PortForwardEvent>(16);
+        let res = self
+            .inner
+            .port_forward(namespace, pod, local, remote)
+            .await
+            .map_err(|e| OrkaError::Internal(e.to_string()))?;
+        struct OpsCancelGuard { inner: Option<OpsCancelHandle> }
+        impl Drop for OpsCancelGuard { fn drop(&mut self) { if let Some(c) = self.inner.take() { c.cancel(); } } }
+        let mut rx_ops = res.rx;
+        let guard = OpsCancelGuard { inner: Some(res.cancel) };
+        let task = tokio::spawn(async move {
+            let _g = guard;
+            while let Some(ev) = rx_ops.recv().await {
+                let mapped = match ev {
+                    OpsForwardEvent::Ready(s) => PortForwardEvent::Ready(s),
+                    OpsForwardEvent::Connected(s) => PortForwardEvent::Connected(s),
+                    OpsForwardEvent::Closed => PortForwardEvent::Closed,
+                    OpsForwardEvent::Error(e) => PortForwardEvent::Error(e),
+                };
+                let _ = tx.send(mapped).await;
+            }
+        });
+        Ok(StreamHandle { rx, cancel: CancelHandle { task: Some(task) } })
+    }
+}
+
+/// Construct an ApiOps facade from an OrkaApi object.
+pub fn api_ops(api: &dyn OrkaApi) -> ApiOps { ApiOps::new(api.ops()) }
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum PortForwardEvent { Ready(String), Connected(String), Closed, Error(String) }
 
 #[async_trait::async_trait]
 impl OrkaApi for MockApi {

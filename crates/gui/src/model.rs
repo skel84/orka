@@ -22,6 +22,18 @@ pub enum UiUpdate {
     Namespaces(Vec<String>),
     SearchResults { hits: Vec<(Uid, f32)>, explain: SearchExplain, partial: bool },
     SearchError(String),
+    // Logs streaming updates
+    LogStarted(orka_api::CancelHandle),
+    LogLine(String),
+    LogError(String),
+    LogEnded,
+    // Pod-specific metadata
+    PodContainers(Vec<String>),
+    // Edit tab updates
+    EditStatus(String),
+    EditDryRunDone { summary: String },
+    EditDiffDone { live: String, last: Option<String> },
+    EditApplyDone { message: String },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -106,6 +118,34 @@ pub struct DetailsState {
     pub buffer: String,
     pub task: Option<JoinHandle<()>>,
     pub stop: Option<tokio::sync::oneshot::Sender<()>>,
+}
+
+#[derive(Default)]
+pub struct EditState {
+    pub buffer: String,
+    pub original: String,
+    pub dirty: bool,
+    pub running: bool,
+    pub status: String,
+    pub task: Option<JoinHandle<()>>,
+    pub stop: Option<tokio::sync::oneshot::Sender<()>>,
+}
+
+#[derive(Default)]
+pub struct LogsState {
+    pub running: bool,
+    pub follow: bool,
+    pub grep: String,
+    pub backlog: std::collections::VecDeque<String>,
+    pub backlog_cap: usize,
+    pub dropped: usize,
+    pub recv: usize,
+    pub containers: Vec<String>,
+    pub container: Option<String>,
+    pub tail_lines: Option<i64>,
+    pub since_seconds: Option<i64>,
+    pub task: Option<JoinHandle<()>>,
+    pub cancel: Option<orka_api::CancelHandle>,
 }
 
 #[derive(Default)]

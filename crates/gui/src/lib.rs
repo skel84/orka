@@ -22,7 +22,7 @@ mod model;
 mod ui;
 mod tasks;
 pub use model::{UiUpdate, VirtualMode, SearchExplain, PaletteItem, PaletteState, LayoutState};
-use model::{ResultsState, SearchState, DetailsState, SelectionState, UiDebounce, DiscoveryState, WatchState};
+use model::{ResultsState, SearchState, DetailsState, SelectionState, UiDebounce, DiscoveryState, WatchState, LogsState, EditState};
 use util::{gvk_label, parse_gvk_key_to_kind};
 use watch::{watch_hub_subscribe, watch_hub_prime};
 
@@ -43,6 +43,8 @@ pub struct OrkaGuiApp {
     // selection + details
     selection: SelectionState,
     details: DetailsState,
+    logs: LogsState,
+    edit: EditState,
     // status
     last_error: Option<String>,
     // scratch
@@ -97,6 +99,11 @@ impl OrkaGuiApp {
             },
             watch: WatchState { updates_rx: None, updates_tx: None, task: None, stop: None, loaded_idx: None, loaded_gvk_key: None, loaded_ns: None, prewarm_started: false, select_t0: None, ttfr_logged: false },
             details: DetailsState { selected: None, buffer: String::new(), task: None, stop: None },
+            logs: {
+                let cap = std::env::var("ORKA_LOGS_BACKLOG_CAP").ok().and_then(|s| s.parse().ok()).unwrap_or(2000);
+                LogsState { running: false, follow: true, grep: String::new(), backlog: std::collections::VecDeque::with_capacity(cap.min(256)), backlog_cap: cap, dropped: 0, recv: 0, containers: Vec::new(), container: None, tail_lines: None, since_seconds: None, task: None, cancel: None }
+            },
+            edit: EditState { buffer: String::new(), original: String::new(), dirty: false, running: false, status: String::new(), task: None, stop: None },
             last_error: None,
             search: SearchState {
                 query: String::new(),
@@ -422,12 +429,33 @@ impl eframe::App for OrkaGuiApp {
                     Ok(UiUpdate::Detail(text)) => {
                         info!(chars = text.len(), "ui: details ready");
                         self.details.buffer = text;
+                        // Initialize Edit buffer from details
+                        self.edit.original = self.details.buffer.clone();
+                        self.edit.buffer = self.details.buffer.clone();
+                        self.edit.dirty = false;
+                        self.edit.status.clear();
+                        processed += 1;
+                    }
+                    Ok(UiUpdate::PodContainers(list)) => {
+                        info!(count = list.len(), "ui: pod containers ready");
+                        self.logs.containers = list.clone();
+                        // Default selection heuristic: keep existing if still valid, else first
+                        if let Some(cur) = &self.logs.container {
+                            if !self.logs.containers.iter().any(|c| c == cur) {
+                                self.logs.container = self.logs.containers.get(0).cloned();
+                            }
+                        } else {
+                            self.logs.container = self.logs.containers.get(0).cloned();
+                        }
                         processed += 1;
                     }
                     Ok(UiUpdate::DetailError(err)) => {
                         info!(error = %err, "ui: details error");
                         self.details.buffer = format!("error: {}", err);
                         self.last_error = Some(err);
+                        self.edit.buffer.clear();
+                        self.edit.original.clear();
+                        self.edit.dirty = false;
                         processed += 1;
                     }
                     Ok(UiUpdate::Namespaces(list)) => {
@@ -457,6 +485,54 @@ impl eframe::App for OrkaGuiApp {
                         processed += 1;
                         ctx.request_repaint();
                     }
+                    Ok(UiUpdate::LogStarted(cancel)) => {
+                        self.logs.cancel = Some(cancel);
+                        self.logs.running = true;
+                        processed += 1;
+                    }
+                    Ok(UiUpdate::LogLine(line)) => {
+                        // Append to backlog with cap; count drops
+                        self.logs.recv += 1;
+                        if self.logs.backlog.len() >= self.logs.backlog_cap { self.logs.backlog.pop_front(); self.logs.dropped += 1; }
+                        self.logs.backlog.push_back(line);
+                        processed += 1;
+                    }
+                    Ok(UiUpdate::LogError(err)) => {
+                        self.last_error = Some(err.clone());
+                        self.log = format!("logs: {}", err);
+                        self.logs.running = false;
+                        self.logs.task = None;
+                        self.logs.cancel = None;
+                        processed += 1;
+                    }
+                    Ok(UiUpdate::LogEnded) => {
+                        self.logs.running = false;
+                        self.logs.task = None;
+                        self.logs.cancel = None;
+                        processed += 1;
+                    }
+                    Ok(UiUpdate::EditStatus(s)) => {
+                        self.edit.status = s;
+                        processed += 1;
+                    }
+                    Ok(UiUpdate::EditDryRunDone { summary }) => {
+                        self.edit.running = false;
+                        self.edit.status = format!("dry-run: {}", summary);
+                        processed += 1;
+                    }
+                    Ok(UiUpdate::EditDiffDone { live, last }) => {
+                        self.edit.running = false;
+                        self.edit.status = match last {
+                            Some(s) => format!("diff live: {}  •  vs last-applied: {}", live, s),
+                            None => format!("diff live: {}", live),
+                        };
+                        processed += 1;
+                    }
+                    Ok(UiUpdate::EditApplyDone { message }) => {
+                        self.edit.running = false;
+                        self.edit.status = message;
+                        processed += 1;
+                    }
                     Err(mpsc::TryRecvError::Empty) => break,
                     Err(mpsc::TryRecvError::Disconnected) => {
                         self.watch.updates_rx = None;
@@ -480,7 +556,7 @@ impl eframe::App for OrkaGuiApp {
         }
 
         // Periodic repaint to refresh Age column text
-        if !self.results.rows.is_empty() {
+        if !self.results.rows.is_empty() || self.logs.running {
             ctx.request_repaint_after(std::time::Duration::from_secs(1));
         }
 

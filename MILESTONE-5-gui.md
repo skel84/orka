@@ -20,8 +20,8 @@ Imperative Ops integration (logs, exec, scale, etc).
 Core UI: egui + eframe + wgpu
 Tables/Virtualization: egui_table (simpler API, sorting-ready)
 Docking/Layout: egui_dock
-Code editor: egui_code_editor (+ ropey buffer)
-Syntax highlight: syntect (viewport-only)
+Code editor: TextEdit + syntect (current)
+Syntax highlight: syntect (viewport-only); egui_code_editor evaluated
 Toasts/Modals: egui-toast, egui-modal
 Diff view: render with similar output (side-by-side or inline)
 Graphs (owner graph): egui_graphs (optional) or simple list/tree
@@ -41,8 +41,8 @@ Graphs (owner graph): egui_graphs (optional) or simple list/tree
      - Virtualized table of results (`egui_virtual_list`, fallback `egui_table`).
      - Sortable columns, filter box.
    - **Detail panel (right, tabs):**
-     - **Details:** YAML view (`egui_code_editor`) + labels/annotations.
-     - **Edit:** YAML editor (`egui_code_editor`) with Validate • Dry-run • Apply flow.
+     - **Details:** YAML view (TextEdit + syntect) + labels/annotations; line numbers and indent guides.
+     - **Edit:** YAML editor (TextEdit + syntect) with Validate • Dry-run • Diff • Apply (SSA) flow; line numbers and current-line highlight.
      - **Explain:** filter-stage counts from search.
      - **Logs:** streaming pod logs with follow/tail/regex
      - **Terminal:** interactive exec with PTY resize. (`egui_term`)
@@ -129,6 +129,29 @@ Notes: user-visible behavior unchanged except for sorting and Age auto-refresh; 
 
 ---
 
+## Progress (2025-09-09)
+
+- Search: wired top‑bar to `api.search(selector, query, limit)`; overlays hits in Results (★ on Name) and shows Explain stage counts in Details.
+- Search: debounced live preview under the search box (arrow‑key navigation; Enter opens selection); Esc clears search + overlay.
+- Search: cancelable — starting a new search cancels the previous task.
+- Palette: Cmd‑K global search overlay refined; supports `ns:`/`k:`/`g:` filters; Enter opens selection; added optional global prime mode. (label:/field: still TODO)
+- API: added `ApiOps` facade in `orka_api` bridging imperative ops with API‑friendly streams (`logs`, `exec`, `port_forward`); re‑exported ops types for frontends; added `CancelHandle` Debug.
+- GUI↔Ops: GUI switched to use `api.ops()`/`ApiOps` (no direct `orka_ops` dependency).
+- Logs (Pods): new “Logs (Pod)” section in Details; streams via `ApiOps::logs` into a bounded backlog; Follow toggle; Tail N; Regex `grep` filter; drop counters.
+- Logs (Pods): container dropdown populated from Pod spec (containers/initContainers/ephemeralContainers) on details load; defaults to first container.
+- Status bar: shows logs recv and dropped counters.
+
+- Edit: added Edit tab with YAML editor using TextEdit + syntect highlighting; toolbar with Reset • Dry‑run • Diff • Apply.
+- Edit: Dry‑run calls `api.dry_run` and shows adds/updates/removes summary.
+- Edit: Diff calls `api.diff` and shows minimal diff summaries vs live and last‑applied (when available).
+- Edit: Apply calls `api.apply` and reports result (rv when present).
+- Edit: UX — line numbers gutter, indent guides (2‑space), current‑line highlight; horizontal scroll for long lines.
+- Details: switched YAML rendering to TextEdit + syntect with small LRU memo for layout jobs.
+
+Notes: Logs are Pod‑only for now; Exec/PF are available via API facade but not yet wired into the GUI. Container list is refreshed on row selection.
+
+---
+
 ## Next Steps (short‑term)
 
 1. Results table polish
@@ -138,16 +161,17 @@ Notes: user-visible behavior unchanged except for sorting and Age auto-refresh; 
    - DONE: Guard huge result sets with a soft cap + “refine filters” banner.
    - DONE: Virtualized rows for large unfiltered sets; Auto/Virtual/Table switch.
 2. Search integration
-   - Wire top‑bar search to `api.search(selector, query, limit)`; overlay hits in Results and add an Explain tab with stage counts.
-   - Live preview under search (debounced), arrow‑key navigation, Enter to open; Esc to clear.
-   - Autocomplete for grammar (ns:, k:, label:, field:), cancelable searches.
-   - Global search (cross‑Kind) via Cmd‑K palette: lightweight, keyboard‑first overlay listing top hits across all kinds; supports ns:/k:/g:/label:/field: filters; Enter opens details; actions (logs/exec) as follow‑ups.
+   - DONE: Wire top‑bar search to `api.search` with hits overlay + Explain counts.
+   - DONE: Live preview (debounced), arrow‑keys, Enter open; Esc clears.
+   - DONE: Cancelable searches.
+   - PARTIAL: Global search (Cmd‑K) with `ns:`/`k:`/`g:` filters and Enter open. TODO: `label:`/`field:` filters and follow‑up actions (logs/exec).
+   - TODO: Autocomplete for grammar (ns:, k:, label:, field:).
 3. Logs tab (Pods)
-   - Integrate `orka_ops::logs` with bounded backlog, follow toggle, regex filter; show drop counters in bottom bar.
+   - DONE: Stream logs with bounded backlog, Follow, Tail, Regex `grep`; drop counters in bottom bar; container dropdown (from Pod spec).
 4. Edit tab
-   - YAML editor with Validate (feature‑gated), Dry‑run (summary), Apply (SSA) using `api.{dry_run,apply}`; minimal diff summary view.
+   - DONE: YAML editor (TextEdit + syntect) with Validate (feature‑gated, TBD), Dry‑run (summary), Diff (live/last‑applied), Apply (SSA) using `api.{dry_run,diff,apply}`; minimal diff summaries.
 5. Actions bar + row context menu
-   - Ops: logs, exec, port‑forward, scale, rollout restart, delete pod, cordon/drain; gate via `ops.caps()`.
+   - Ops: logs, exec, port‑forward, scale, rollout restart, delete pod, cordon/drain; gate via `ops.caps()`. (API facade ready; GUI wiring TBD)
 6. Stats modal
    - Surface `api.stats()` plus runtime metrics; show relist/backoff/shards/memory caps and posting/drop counters.
 7. Keyboard + palette
@@ -167,7 +191,7 @@ Notes: user-visible behavior unchanged except for sorting and Age auto-refresh; 
 - Runtime: single tokio runtime (from CLI) with background tasks; UI communicates via bounded `std::sync::mpsc` channels.
 - Backpressure: bounded channels with `try_send` drop‑on‑full; counters surfaced in bottom bar (to be added).
 - Load strategy: start `watch_lite` first for fast paint; fetch snapshot in parallel and merge; cancel both on selection change.
-- UI primitives: `egui_table` for normal results; `egui::ScrollArea::show_rows` virtualization for large unfiltered sets; stable `TextEdit` for YAML details; unique `id_source` on scroll areas.
+- UI primitives: `egui_table` for normal results; `egui::ScrollArea::show_rows` virtualization for large unfiltered sets; TextEdit + syntect for YAML Details/Edit; line numbers/indent guides/current‑line highlight; unique widget IDs on scroll areas.
 - Refactor: `orka_gui` split into `util`, `watch`, `results`, `nav`, `details` modules; `lib.rs` keeps app state and wiring.
 - Sorting: header click toggles asc/desc; sorting mutates in‑memory rows and rebuilds UID index to keep delta merges consistent.
 - Results perf: display cache per row for static columns; filter cache (lowercased haystack) for quick substring matching; soft cap via `ORKA_RESULTS_SOFT_CAP`; rows mode toggle (Auto/Virtual/Table).

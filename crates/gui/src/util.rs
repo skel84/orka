@@ -2,6 +2,8 @@
 
 use orka_api::ResourceKind;
 
+pub mod highlight;
+
 pub(crate) fn gvk_label(k: &ResourceKind) -> String {
     if k.group.is_empty() { format!("{}/{}", k.version, k.kind) } else { format!("{}/{}/{}", k.group, k.version, k.kind) }
 }
@@ -40,4 +42,3 @@ pub(crate) fn render_age(creation_ts: i64) -> String {
         format!("{}s", secs)
     }
 }
-

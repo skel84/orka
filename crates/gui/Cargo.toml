@@ -18,13 +18,15 @@ tokio = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 serde_yaml = "0.9"
-egui_table = "0.3"
-egui = "0.31"
-eframe = { version = "0.31", default-features = true, features = ["wgpu"] }
+egui_table = "0.4"
+egui = "0.32"
+eframe = { version = "0.32", default-features = true, features = ["wgpu"] }
 egui_dock = { version = "0.12", optional = true }
 egui_virtual_list = { version = "0.3", optional = true }
 once_cell = "1.19"
 fuzzy-matcher = "0.3"
+regex = { workspace = true }
+syntect = "5"
 
 [features]
 default = []

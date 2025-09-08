@@ -75,6 +75,14 @@ pub(crate) fn ui_topbar(app: &mut OrkaGuiApp, ctx: &egui::Context) {
                     let prev = if cur == 0 { len - 1 } else { cur - 1 };
                     app.search.preview_sel = Some(prev);
                 }
+                if ui.input(|i| i.key_pressed(egui::Key::Escape)) {
+                    app.search.query.clear();
+                    app.search.hits.clear();
+                    app.search.explain = None;
+                    app.search.partial = false;
+                    app.search.preview.clear();
+                    app.search.preview_sel = None;
+                }
             }
             let enter_pressed = ui.input(|i| i.key_pressed(egui::Key::Enter));
             if enter_pressed && (re.has_focus() || !app.search.preview.is_empty()) {
