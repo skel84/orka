@@ -353,6 +353,7 @@ pub async fn list_lite(gvk_key: &str, namespace: Option<&str>) -> Result<Vec<ork
     };
 
     let page_limit: u32 = std::env::var("ORKA_SNAPSHOT_PAGE_LIMIT").ok().and_then(|s| s.parse::<u32>().ok()).unwrap_or(500);
+    let projector = orka_core::columns::builtin_projector_for(&gvk.group, &gvk.version, &gvk.kind);
     let mut out: Vec<orka_core::LiteObj> = Vec::new();
     let mut continue_token: Option<String> = None;
     loop {
@@ -361,7 +362,14 @@ pub async fn list_lite(gvk_key: &str, namespace: Option<&str>) -> Result<Vec<ork
         if let Some(ref token) = continue_token { params = params.continue_token(token.as_str()); }
         let list = api.list(&params).await?;
         for o in list.items.iter() {
-            let lo = lite_from_dynamic(o)?;
+            let mut lo = lite_from_dynamic(o)?;
+            if let Some(p) = projector.as_ref() {
+                let enabled = std::env::var("ORKA_LITE_PROJECT").ok().map(|v| v == "1" || v.eq_ignore_ascii_case("true")).unwrap_or(true);
+                if enabled {
+                    let raw = serde_json::to_value(o).context("serialize DynamicObject for projection")?;
+                    lo.projected = p.project(&raw);
+                }
+            }
             out.push(lo);
         }
         continue_token = list.metadata.continue_.clone();
@@ -393,9 +401,17 @@ pub async fn list_lite_first_page(gvk_key: &str, namespace: Option<&str>) -> Res
     let mut params = kube::api::ListParams::default();
     if page_limit > 0 { params = params.limit(page_limit); }
     let list = api.list(&params).await?;
+    let projector = orka_core::columns::builtin_projector_for(&gvk.group, &gvk.version, &gvk.kind);
     let mut out: Vec<orka_core::LiteObj> = Vec::with_capacity(list.items.len());
     for o in list.items.iter() {
-        let lo = lite_from_dynamic(o)?;
+        let mut lo = lite_from_dynamic(o)?;
+        if let Some(p) = projector.as_ref() {
+            let enabled = std::env::var("ORKA_LITE_PROJECT").ok().map(|v| v == "1" || v.eq_ignore_ascii_case("true")).unwrap_or(true);
+            if enabled {
+                let raw = serde_json::to_value(o).context("serialize DynamicObject for projection")?;
+                lo.projected = p.project(&raw);
+            }
+        }
         out.push(lo);
     }
     counter!("snapshot_pages_total", 1u64);
@@ -484,22 +500,44 @@ pub async fn start_watcher_lite_with(
         tokio::pin!(relist_timer);
         info!(relist_actual, "lite watch stream opened");
 
+        let projector = orka_core::columns::builtin_projector_for(&ar.group, &ar.version, &ar.kind);
         let ended = loop {
             tokio::select! {
                 maybe_ev = stream.try_next() => {
                     match maybe_ev {
                         Ok(Some(Event::Applied(o))) => {
-                            let lo = lite_from_dynamic(&o)?;
+                            let mut lo = lite_from_dynamic(&o)?;
+                            if let Some(p) = projector.as_ref() {
+                                let enabled = std::env::var("ORKA_LITE_PROJECT").ok().map(|v| v == "1" || v.eq_ignore_ascii_case("true")).unwrap_or(true);
+                                if enabled {
+                                    let raw = serde_json::to_value(&o).context("serialize DynamicObject for projection")?;
+                                    lo.projected = p.project(&raw);
+                                }
+                            }
                             if evt_tx.send(LiteEvent::Applied(lo)).await.is_err() { return Ok(()); }
                         }
                         Ok(Some(Event::Deleted(o))) => {
-                            let lo = lite_from_dynamic(&o)?;
+                            let mut lo = lite_from_dynamic(&o)?;
+                            if let Some(p) = projector.as_ref() {
+                                let enabled = std::env::var("ORKA_LITE_PROJECT").ok().map(|v| v == "1" || v.eq_ignore_ascii_case("true")).unwrap_or(true);
+                                if enabled {
+                                    let raw = serde_json::to_value(&o).context("serialize DynamicObject for projection")?;
+                                    lo.projected = p.project(&raw);
+                                }
+                            }
                             if evt_tx.send(LiteEvent::Deleted(lo)).await.is_err() { return Ok(()); }
                         }
                         Ok(Some(Event::Restarted(list))) => {
                             debug!(count = list.len(), "lite watch restart");
                             for o in list.iter() {
-                                let lo = lite_from_dynamic(o)?;
+                                let mut lo = lite_from_dynamic(o)?;
+                                if let Some(p) = projector.as_ref() {
+                                    let enabled = std::env::var("ORKA_LITE_PROJECT").ok().map(|v| v == "1" || v.eq_ignore_ascii_case("true")).unwrap_or(true);
+                                    if enabled {
+                                        let raw = serde_json::to_value(o).context("serialize DynamicObject for projection")?;
+                                        lo.projected = p.project(&raw);
+                                    }
+                                }
                                 if evt_tx.send(LiteEvent::Applied(lo)).await.is_err() { return Ok(()); }
                             }
                         }

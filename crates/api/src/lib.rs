@@ -272,7 +272,7 @@ impl OrkaApi for InProcApi {
             .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
             .unwrap_or(true);
         let is_builtin = selector.gvk.group.is_empty();
-        let (projector, explain_available) = if is_builtin || defer_schema {
+        let (mut projector, explain_available) = if is_builtin || defer_schema {
             (None, false)
         } else {
             match orka_schema::fetch_crd_schema(&gvk_key).await {
@@ -280,6 +280,10 @@ impl OrkaApi for InProcApi {
                 _ => (None, false),
             }
         };
+        // If no schema projector, try built-in projector for known core kinds
+        if projector.is_none() {
+            projector = orka_core::columns::builtin_projector_for(&selector.gvk.group, &selector.gvk.version, &selector.gvk.kind);
+        }
         let cap = std::env::var("ORKA_QUEUE_CAP").ok().and_then(|s| s.parse::<usize>().ok()).unwrap_or(2048);
         let (tx, mut rx) = mpsc::channel::<orka_core::Delta>(cap);
         // Fire a one-shot list in background to overlap with shaping

@@ -10,6 +10,7 @@ use egui_dock as dock;
 use egui_table::{CellInfo, Column, HeaderCellInfo, HeaderRow, Table, TableDelegate};
 use orka_api::{LiteEvent, OrkaApi, ResourceKind, ResourceRef, Selector};
 use orka_core::{LiteObj, Uid};
+use orka_core::columns::{self, ColumnKind, ColumnSpec};
 use tracing::info;
 use tokio::sync::broadcast;
 use tokio::sync::Semaphore;
@@ -42,6 +43,7 @@ pub struct OrkaGuiApp {
     // selection + details
     selected: Option<Uid>,
     selected_kind: Option<ResourceKind>,
+    active_cols: Vec<ColumnSpec>,
     detail_buffer: String,
     detail_task: Option<tokio::task::JoinHandle<()>>,
     detail_stop: Option<tokio::sync::oneshot::Sender<()>>,
@@ -102,6 +104,7 @@ impl OrkaGuiApp {
             loaded_ns: None,
             selected: None,
             selected_kind: None,
+            active_cols: Vec::new(),
             detail_buffer: String::new(),
             detail_task: None,
             detail_stop: None,
@@ -165,12 +168,14 @@ impl OrkaGuiApp {
             }
         }
         let rows_len = self.results.len() as u64;
+        // Build columns vector before creating the delegate to avoid borrow conflicts
+        let cols_spec = self.active_cols.clone();
+        let cols: Vec<Column> = if cols_spec.is_empty() {
+            vec![Column::new(160.0).resizable(true), Column::new(240.0).resizable(true), Column::new(70.0).resizable(true)]
+        } else {
+            cols_spec.iter().map(|c| Column::new(c.width).resizable(true)).collect()
+        };
         let mut delegate = ResultsDelegate { app: self };
-        let cols = vec![
-            Column::new(160.0).resizable(true),
-            Column::new(240.0).resizable(true),
-            Column::new(70.0).resizable(true),
-        ];
         Table::new()
             .id_salt("results_table")
             .headers(vec![HeaderRow::new(20.0)])
@@ -750,6 +755,8 @@ impl eframe::App for OrkaGuiApp {
                 let key = gvk_label(&k);
                 let changed = self.loaded_gvk_key.as_deref() != Some(&key) || self.loaded_ns != ns_opt;
                 if changed {
+                    // compute active columns for this kind
+                    self.active_cols = columns::builtin_columns_for(&k.group, &k.version, &k.kind, k.namespaced);
                     // Cancel previous task if any
                     if let Some(stop) = self.watch_stop.take() {
                         info!("watch: stopping previous task");
@@ -1042,12 +1049,12 @@ impl<'a> TableDelegate for ResultsDelegate<'a> {
             let rect = ui.max_rect();
             let bg = ui.visuals().widgets.inactive.bg_fill;
             ui.painter().rect_filled(rect, 0.0, bg);
-            let text = match cell.col_range.start {
-                0 => "Namespace",
-                1 => "Name",
-                2 => "Age",
-                _ => "",
-            };
+            let text = self
+                .app
+                .active_cols
+                .get(cell.col_range.start as usize)
+                .map(|c| c.label)
+                .unwrap_or("");
             if !text.is_empty() {
                 ui.add_space(2.0);
                 ui.label(egui::RichText::new(text).strong());
@@ -1068,22 +1075,25 @@ impl<'a> TableDelegate for ResultsDelegate<'a> {
                 ui.painter()
                     .rect_filled(rect, 0.0, ui.visuals().faint_bg_color);
             }
-            match cell.col_nr {
-                0 => {
-                    let ns = it.namespace.as_deref().unwrap_or("-");
-                    let _ = ui.selectable_label(is_sel, egui::RichText::new(ns).monospace());
-                }
-                1 => {
-                    let resp =
-                        ui.selectable_label(is_sel, egui::RichText::new(&it.name).monospace());
-                    if resp.clicked() {
-                        self.app.select_row(it);
+            let col = self.app.active_cols.get(cell.col_nr as usize);
+            if let Some(spec) = col {
+                match &spec.kind {
+                    ColumnKind::Namespace => {
+                        let ns = it.namespace.as_deref().unwrap_or("-");
+                        let _ = ui.selectable_label(is_sel, egui::RichText::new(ns).monospace());
+                    }
+                    ColumnKind::Name => {
+                        let resp = ui.selectable_label(is_sel, egui::RichText::new(&it.name).monospace());
+                        if resp.clicked() { self.app.select_row(it); }
+                    }
+                    ColumnKind::Age => {
+                        ui.label(egui::RichText::new(render_age(it.creation_ts)).monospace());
+                    }
+                    ColumnKind::Projected(id) => {
+                        let val = it.projected.iter().find(|(k, _)| k == id).map(|(_, v)| v.as_str()).unwrap_or("-");
+                        ui.label(egui::RichText::new(val).monospace());
                     }
                 }
-                2 => {
-                    ui.label(egui::RichText::new(render_age(it.creation_ts)).monospace());
-                }
-                _ => {}
             }
         }
     }

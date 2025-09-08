@@ -54,6 +54,9 @@ pub trait Projector: Send + Sync {
     fn project(&self, raw: &serde_json::Value) -> SmallVec<[(u32, String); 8]>;
 }
 
+// Built-in columns and projectors for core K8s kinds
+pub mod columns;
+
 // ---- M3 sharding primitives ----
 
 /// Shard selection key composed from logical dimensions.
