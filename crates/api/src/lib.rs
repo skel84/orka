@@ -7,6 +7,8 @@
 
 use serde::{Deserialize, Serialize};
 use orka_persist::Store;
+use std::time::Instant;
+use tracing::info;
 
 pub use orka_ops::OrkaOps; // Re-export imperative ops trait
 pub use orka_schema::CrdSchema; // Re-export schema type
@@ -216,11 +218,17 @@ impl InProcApi {
 #[async_trait::async_trait]
 impl OrkaApi for InProcApi {
     async fn discover(&self) -> OrkaResult<Vec<ResourceKind>> {
+        let t0 = Instant::now();
+        info!("api: discover start");
         let v = orka_kubehub::discover(false).await.map_err(Self::map_err)?;
-        Ok(v.into_iter().map(|r| r.into()).collect())
+        let kinds: Vec<ResourceKind> = v.into_iter().map(|r| r.into()).collect();
+        info!(count = kinds.len(), took_ms = %t0.elapsed().as_millis(), "api: discover ok");
+        Ok(kinds)
     }
 
     async fn snapshot(&self, selector: Selector) -> OrkaResult<SnapshotResponse> {
+        let t0 = Instant::now();
+        info!(gvk = %Self::gvk_key(&selector.gvk), ns = %selector.namespace.as_deref().unwrap_or("(all)"), "api: snapshot start");
         use std::sync::Arc;
         use tokio::sync::mpsc;
         let gvk_key = Self::gvk_key(&selector.gvk);
@@ -231,16 +239,45 @@ impl OrkaApi for InProcApi {
         };
         let cap = std::env::var("ORKA_QUEUE_CAP").ok().and_then(|s| s.parse::<usize>().ok()).unwrap_or(2048);
         let (tx, mut rx) = mpsc::channel::<orka_core::Delta>(cap);
-        // Fire a one-shot list
-        let _ = orka_kubehub::prime_list(&gvk_key, selector.namespace.as_deref(), &tx).await.map_err(|e| OrkaError::Internal(e.to_string()))?;
+        // Fire a one-shot list in background to overlap with shaping
+        let list_key = gvk_key.clone();
+        let list_ns = selector.namespace.clone();
+        let tx_clone = tx.clone();
+        let l0 = Instant::now();
+        let list_task = tokio::spawn(async move {
+            let res = orka_kubehub::prime_list(&list_key, list_ns.as_deref(), &tx_clone).await;
+            match &res {
+                Ok(sent) => info!(sent, took_ms = %l0.elapsed().as_millis(), "api: snapshot list done"),
+                Err(e) => info!(error = %e, took_ms = %l0.elapsed().as_millis(), "api: snapshot list failed"),
+            }
+            res
+        });
+        // Drop our sender so the channel closes when list_task ends
         drop(tx);
-        // Collect deltas
-        let mut deltas: Vec<orka_core::Delta> = Vec::new();
-        while let Some(d) = rx.recv().await { deltas.push(d); }
-        // Build snapshot
+        // Stream and apply deltas in batches
         let mut builder = orka_store::WorldBuilder::with_projector(projector);
-        builder.apply(deltas);
+        let mut applied = 0usize;
+        let mut batch: Vec<orka_core::Delta> = Vec::with_capacity(256);
+        while let Some(d) = rx.recv().await {
+            batch.push(d);
+            if batch.len() >= 256 {
+                let n = batch.len();
+                builder.apply(std::mem::take(&mut batch));
+                applied += n;
+            }
+        }
+        if !batch.is_empty() {
+            let n = batch.len();
+            builder.apply(batch);
+            applied += n;
+        }
+        // Ensure listing finished successfully
+        if let Err(e) = list_task.await.map_err(|e| OrkaError::Internal(e.to_string()))?.map(|_| ()) {
+            return Err(OrkaError::Internal(e.to_string()));
+        }
+        info!(applied, "api: snapshot deltas applied");
         let snap = builder.freeze();
+        info!(items = snap.items.len(), took_ms = %t0.elapsed().as_millis(), "api: snapshot ok");
         Ok(SnapshotResponse {
             data: (*snap).clone(),
             meta: ResponseMeta { partial: false, pressure_events: PressureEvents { dropped: 0, trimmed_bytes: 0 }, explain_available },
@@ -253,6 +290,8 @@ impl OrkaApi for InProcApi {
         query: &str,
         limit: usize,
     ) -> OrkaResult<SearchResponse> {
+        let t0 = Instant::now();
+        info!(gvk = %Self::gvk_key(&selector.gvk), ns = %selector.namespace.as_deref().unwrap_or("(all)"), query = %query, limit, "api: search start");
         let resp = self.snapshot(selector.clone()).await?;
         let snap = resp.data.clone();
         // Field mapping and metadata
@@ -262,15 +301,20 @@ impl OrkaApi for InProcApi {
             Ok(Some(schema)) => Some(schema.projected_paths.iter().map(|p| (p.json_path.clone(), p.id)).collect()),
             _ => None,
         };
+        let i0 = Instant::now();
         let index = match pairs {
             Some(p) => orka_search::Index::build_from_snapshot_with_meta(&snap, Some(&p), Some(&kind), Some(&group)),
             None => orka_search::Index::build_from_snapshot_with_meta(&snap, None, Some(&kind), Some(&group)),
         };
+        info!(index_ms = %i0.elapsed().as_millis(), "api: search index built");
         let (hits, dbg) = index.search_with_debug_opts(query, limit, Default::default());
+        info!(hits = hits.len(), took_ms = %t0.elapsed().as_millis(), "api: search ok");
         Ok(SearchResponse { hits, debug: dbg, meta: ResponseMeta { partial: resp.meta.partial, pressure_events: resp.meta.pressure_events, explain_available: resp.meta.explain_available } })
     }
 
     async fn get_raw(&self, reference: ResourceRef) -> OrkaResult<Vec<u8>> {
+        let t0 = Instant::now();
+        info!(gvk = %Self::gvk_key(&reference.gvk), name = %reference.name, ns = %reference.namespace.as_deref().unwrap_or("-"), "api: get_raw start");
         use kube::{discovery::{Discovery, Scope}, core::DynamicObject, api::Api};
         let client = kube::Client::try_default().await.map_err(|e| OrkaError::Internal(e.to_string()))?;
         // Locate ApiResource via discovery
@@ -294,11 +338,15 @@ impl OrkaApi for InProcApi {
         } else { Api::all_with(client.clone(), &ar) };
         let obj = api.get(&reference.name).await.map_err(|e| OrkaError::Internal(e.to_string()))?;
         let bytes = serde_json::to_vec(&obj).map_err(|e| OrkaError::Internal(e.to_string()))?;
+        info!(bytes = bytes.len(), took_ms = %t0.elapsed().as_millis(), "api: get_raw ok");
         Ok(bytes)
     }
 
     async fn dry_run(&self, yaml: &str) -> OrkaResult<orka_apply::DiffSummary> {
+        let t0 = Instant::now();
+        info!("api: dry_run start");
         let (live, _last) = orka_apply::diff_from_yaml(yaml, None).await.map_err(|e| OrkaError::Internal(e.to_string()))?;
+        info!(took_ms = %t0.elapsed().as_millis(), "api: dry_run ok");
         Ok(live)
     }
 
@@ -307,17 +355,25 @@ impl OrkaApi for InProcApi {
         yaml: &str,
         ns_override: Option<&str>,
     ) -> OrkaResult<(orka_apply::DiffSummary, Option<orka_apply::DiffSummary>)> {
-        orka_apply::diff_from_yaml(yaml, ns_override)
+        let t0 = Instant::now();
+        info!(ns = %ns_override.unwrap_or("(none)"), "api: diff start");
+        let res = orka_apply::diff_from_yaml(yaml, ns_override)
             .await
-            .map_err(|e| OrkaError::Internal(e.to_string()))
+            .map_err(|e| OrkaError::Internal(e.to_string()));
+        info!(took_ms = %t0.elapsed().as_millis(), ok = res.is_ok(), "api: diff done");
+        res
     }
 
     async fn apply(&self, yaml: &str) -> OrkaResult<orka_apply::ApplyResult> {
+        let t0 = Instant::now();
+        info!("api: apply start");
         let res = orka_apply::edit_from_yaml(yaml, None, false, true).await.map_err(|e| OrkaError::Internal(e.to_string()))?;
+        info!(took_ms = %t0.elapsed().as_millis(), "api: apply ok");
         Ok(res)
     }
 
     async fn stats(&self) -> OrkaResult<Stats> {
+        let t0 = Instant::now();
         let shards = std::env::var("ORKA_SHARDS").ok().and_then(|s| s.parse().ok()).unwrap_or(1);
         let relist_secs = std::env::var("ORKA_RELIST_SECS").ok().and_then(|s| s.parse().ok()).unwrap_or(300);
         let watch_backoff_max_secs = std::env::var("ORKA_WATCH_BACKOFF_MAX_SECS").ok().and_then(|s| s.parse().ok()).unwrap_or(30);
@@ -327,23 +383,29 @@ impl OrkaApi for InProcApi {
         let max_rss_mb = std::env::var("ORKA_MAX_RSS_MB").ok().and_then(|s| s.parse().ok());
         let max_index_bytes = std::env::var("ORKA_MAX_INDEX_BYTES").ok().and_then(|s| s.parse().ok());
         let metrics_addr = std::env::var("ORKA_METRICS_ADDR").ok();
-        Ok(Stats { shards, relist_secs, watch_backoff_max_secs, max_labels_per_obj, max_annos_per_obj, max_postings_per_key, max_rss_mb, max_index_bytes, metrics_addr })
+        let stats = Stats { shards, relist_secs, watch_backoff_max_secs, max_labels_per_obj, max_annos_per_obj, max_postings_per_key, max_rss_mb, max_index_bytes, metrics_addr };
+        info!(took_ms = %t0.elapsed().as_millis(), "api: stats ready");
+        Ok(stats)
     }
 
     async fn watch(&self, selector: Selector) -> OrkaResult<StreamHandle<orka_core::Delta>> {
         use tokio::sync::mpsc;
+        info!(gvk = %Self::gvk_key(&selector.gvk), ns = %selector.namespace.as_deref().unwrap_or("(all)"), "api: watch start");
         let cap = std::env::var("ORKA_QUEUE_CAP").ok().and_then(|s| s.parse::<usize>().ok()).unwrap_or(2048);
         let (tx, rx) = mpsc::channel::<orka_core::Delta>(cap);
         let gvk_key = Self::gvk_key(&selector.gvk);
         let ns = selector.namespace.clone();
         let handle = tokio::spawn(async move {
+            info!("api: watcher task starting");
             let _ = orka_kubehub::start_watcher(&gvk_key, ns.as_deref(), tx).await;
+            info!("api: watcher task ended");
         });
         Ok(StreamHandle { rx, cancel: CancelHandle { task: Some(handle) } })
     }
 
     async fn watch_lite(&self, selector: Selector) -> OrkaResult<StreamHandle<LiteEvent>> {
         use tokio::sync::mpsc;
+        info!(gvk = %Self::gvk_key(&selector.gvk), ns = %selector.namespace.as_deref().unwrap_or("(all)"), "api: watch_lite start");
         let cap = std::env::var("ORKA_QUEUE_CAP").ok().and_then(|s| s.parse::<usize>().ok()).unwrap_or(2048);
         let (delta_tx, mut delta_rx) = mpsc::channel::<orka_core::Delta>(cap);
         let (evt_tx, evt_rx) = mpsc::channel::<LiteEvent>(cap);
@@ -361,7 +423,9 @@ impl OrkaApi for InProcApi {
         let watcher = tokio::spawn({
             let g = gvk_key.clone();
             async move {
+                info!("api: watcher(deltas) task starting");
                 let _ = orka_kubehub::start_watcher(&g, ns.as_deref(), delta_tx).await;
+                info!("api: watcher(deltas) task ended");
             }
         });
 
@@ -403,6 +467,10 @@ impl OrkaApi for InProcApi {
 
         // Processing task: dedup by resourceVersion and emit LiteEvent
         let proc_task = tokio::spawn(async move {
+            let t0 = Instant::now();
+            let mut first = true;
+            let mut applied = 0usize;
+            let mut deleted = 0usize;
             let mut last_rv: HashMap<orka_core::Uid, String> = HashMap::new();
             let mut last_lite: HashMap<orka_core::Uid, orka_core::LiteObj> = HashMap::new();
             while let Some(d) = delta_rx.recv().await {
@@ -420,6 +488,8 @@ impl OrkaApi for InProcApi {
                         let lo = shape_lite(&d, &projector, max_labels_per_obj, max_annos_per_obj);
                         last_lite.insert(d.uid, lo.clone());
                         let _ = evt_tx.send(LiteEvent::Applied(lo)).await;
+                        applied += 1;
+                        if first { info!(since_ms = %t0.elapsed().as_millis(), "api: first lite event (applied)"); first = false; }
                     }
                     orka_core::DeltaKind::Deleted => {
                         if let Some(lo) = last_lite.remove(&d.uid) {
@@ -430,11 +500,14 @@ impl OrkaApi for InProcApi {
                             let _ = evt_tx.send(LiteEvent::Deleted(lo)).await;
                         }
                         last_rv.remove(&d.uid);
+                        deleted += 1;
+                        if first { info!(since_ms = %t0.elapsed().as_millis(), "api: first lite event (deleted)"); first = false; }
                     }
                 }
             }
             // channel closed; watcher will also stop once delta_tx is dropped
             let _ = watcher.abort();
+            info!(applied, deleted, ran_ms = %t0.elapsed().as_millis(), "api: lite processor ended");
         });
 
         // The processing task owns delta_rx; aborting it will drop rx and end watcher
@@ -442,9 +515,17 @@ impl OrkaApi for InProcApi {
     }
 
     async fn schema(&self, gvk_key: &str) -> OrkaResult<Option<CrdSchema>> {
-        orka_schema::fetch_crd_schema(gvk_key)
+        let t0 = Instant::now();
+        info!(gvk = %gvk_key, "api: schema fetch start");
+        let res = orka_schema::fetch_crd_schema(gvk_key)
             .await
-            .map_err(|e| OrkaError::Internal(e.to_string()))
+            .map_err(|e| OrkaError::Internal(e.to_string()));
+        match &res {
+            Ok(Some(_)) => info!(took_ms = %t0.elapsed().as_millis(), "api: schema found"),
+            Ok(None) => info!(took_ms = %t0.elapsed().as_millis(), "api: schema not found"),
+            Err(e) => info!(error = %e, took_ms = %t0.elapsed().as_millis(), "api: schema failed"),
+        }
+        res
     }
 
     async fn last_applied(
@@ -455,6 +536,8 @@ impl OrkaApi for InProcApi {
         limit: Option<usize>,
     ) -> OrkaResult<Vec<LastApplied>> {
         use kube::{discovery::{Discovery, Scope}, api::Api, core::{DynamicObject, GroupVersionKind}};
+        let t0 = Instant::now();
+        info!(gvk = %gvk_key, name = %name, ns = %namespace.unwrap_or("-"), limit = ?limit, "api: last_applied start");
         // Resolve UID via live object fetch
         let client = kube::Client::try_default().await.map_err(|e| OrkaError::Internal(e.to_string()))?;
         // Parse GVK key -> GroupVersionKind
@@ -489,6 +572,7 @@ impl OrkaApi for InProcApi {
         // Load from SQLite
         let store = orka_persist::SqliteStore::open_default().map_err(|e| OrkaError::Internal(e.to_string()))?;
         let rows = store.get_last(uid, limit).map_err(|e| OrkaError::Internal(e.to_string()))?;
+        info!(rows = rows.len(), took_ms = %t0.elapsed().as_millis(), "api: last_applied ok");
         Ok(rows)
     }
 
