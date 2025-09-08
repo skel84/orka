@@ -7,13 +7,20 @@ use std::sync::{mpsc, Arc};
 use eframe::egui;
 #[cfg(feature = "dock")]
 use egui_dock as dock;
-use egui_table::{CellInfo, Column, HeaderCellInfo, HeaderRow, Table, TableDelegate};
-use orka_api::{LiteEvent, OrkaApi, ResourceKind, ResourceRef, Selector};
+use orka_api::{LiteEvent, OrkaApi, ResourceKind, Selector};
 use orka_core::{LiteObj, Uid};
 use orka_core::columns::{self, ColumnKind, ColumnSpec};
 use tracing::info;
 use tokio::sync::broadcast;
 use tokio::sync::Semaphore;
+
+mod util;
+mod watch;
+mod results;
+mod nav;
+mod details;
+use util::{gvk_label, parse_gvk_key_to_kind};
+use watch::{watch_hub_prime, watch_hub_snapshot, watch_hub_subscribe};
 
 /// Entry point used by the CLI to launch the GUI.
 pub fn run_native(api: Arc<dyn OrkaApi>) -> eframe::Result<()> {
@@ -64,6 +71,10 @@ pub struct OrkaGuiApp {
     ui_debounce_ms: u64,
     pending_count: usize,
     pending_since: Option<Instant>,
+    // sort state for results table
+    sort_col: Option<usize>,
+    sort_asc: bool,
+    sort_dirty: bool,
     // prewarm watchers once after discovery
     prewarm_started: bool,
     // metrics: selection start time for TTFR
@@ -125,6 +136,9 @@ impl OrkaGuiApp {
             ui_debounce_ms: std::env::var("ORKA_UI_DEBOUNCE_MS").ok().and_then(|s| s.parse::<u64>().ok()).unwrap_or(100),
             pending_count: 0,
             pending_since: None,
+            sort_col: None,
+            sort_asc: true,
+            sort_dirty: false,
             prewarm_started: false,
             select_t0: None,
             ttfr_logged: false,
@@ -154,7 +168,62 @@ impl OrkaGuiApp {
         this
     }
 
-    fn ui_results(&mut self, ui: &mut egui::Ui) {
+    fn apply_sort_if_needed(&mut self) {
+        let Some(col_idx) = self.sort_col else { return; };
+        if !self.sort_dirty || self.active_cols.is_empty() || self.results.len() <= 1 {
+            return;
+        }
+        let Some(spec) = self.active_cols.get(col_idx).cloned() else { self.sort_dirty = false; return; };
+        let asc = self.sort_asc;
+        match spec.kind {
+            ColumnKind::Age => {
+                if asc {
+                    self.results.sort_by(|a, b| a.creation_ts.cmp(&b.creation_ts));
+                } else {
+                    self.results.sort_by(|a, b| b.creation_ts.cmp(&a.creation_ts));
+                }
+            }
+            ColumnKind::Name => {
+                if asc {
+                    self.results.sort_by(|a, b| a.name.cmp(&b.name));
+                } else {
+                    self.results.sort_by(|a, b| b.name.cmp(&a.name));
+                }
+            }
+            ColumnKind::Namespace => {
+                if asc {
+                    self.results.sort_by(|a, b| a.namespace.as_deref().unwrap_or("").cmp(b.namespace.as_deref().unwrap_or("")));
+                } else {
+                    self.results.sort_by(|a, b| b.namespace.as_deref().unwrap_or("").cmp(a.namespace.as_deref().unwrap_or("")));
+                }
+            }
+            ColumnKind::Projected(id) => {
+                let key_for = |o: &LiteObj| -> String {
+                    o.projected
+                        .iter()
+                        .find(|(k, _)| *k == id)
+                        .map(|(_, v)| v.clone())
+                        .unwrap_or_default()
+                };
+                // Use sort_by_key to compute keys once per element
+                self.results.sort_by_key(|o| key_for(o));
+                if !asc { self.results.reverse(); }
+            }
+        }
+        // rebuild index map after reordering
+        self.index.clear();
+        for (i, it) in self.results.iter().enumerate() {
+            self.index.insert(it.uid, i);
+        }
+        self.sort_dirty = false;
+    }
+
+}
+
+#[cfg(any())]
+impl OrkaGuiApp {
+
+    fn ui_results_old_removed(&mut self, ui: &mut egui::Ui) {
         ui.heading("Results");
         if self.results.is_empty() {
             if self.last_error.is_none() && self.watch_task.is_some() {
@@ -167,6 +236,8 @@ impl OrkaGuiApp {
                 );
             }
         }
+        // Apply pending sort before drawing the table
+        self.apply_sort_if_needed();
         let rows_len = self.results.len() as u64;
         // Build columns vector before creating the delegate to avoid borrow conflicts
         let cols_spec = self.active_cols.clone();
@@ -184,7 +255,7 @@ impl OrkaGuiApp {
             .show(ui, &mut delegate);
     }
 
-    fn ui_kind_tree(&mut self, ui: &mut egui::Ui) {
+    fn ui_kind_tree_old_removed(&mut self, ui: &mut egui::Ui) {
         egui::ScrollArea::vertical()
             .id_salt("kind_tree_scroll")
             .show(ui, |ui| {
@@ -248,13 +319,13 @@ impl OrkaGuiApp {
             });
     }
 
-    fn ui_single_item(&mut self, ui: &mut egui::Ui, idx: usize, label: &str) {
+    fn ui_single_item_old_removed(&mut self, ui: &mut egui::Ui, idx: usize, label: &str) {
         let selected = self.selected_idx == Some(idx);
         let resp = ui.selectable_label(selected, label);
         if resp.clicked() { self.on_select_idx(idx); }
     }
 
-    fn ui_curated_category(&mut self, ui: &mut egui::Ui, title: &str, entries: &[(&str, &str, &str, bool)]) {
+    fn ui_curated_category_old_removed(&mut self, ui: &mut egui::Ui, title: &str, entries: &[(&str, &str, &str, bool)]) {
         egui::CollapsingHeader::new(title).default_open(false).show(ui, |ui| {
             for (group, kind, label, namespaced) in entries {
                 let rk = ResourceKind { group: (*group).to_string(), version: "v1".to_string(), kind: (*kind).to_string(), namespaced: *namespaced };
@@ -265,7 +336,7 @@ impl OrkaGuiApp {
         });
     }
 
-    fn is_builtin_group(group: &str) -> bool {
+    fn is_builtin_group_old_removed(group: &str) -> bool {
         if group.is_empty() { return true; }
         matches!(group,
             "apps" | "batch" | "autoscaling" | "autoscaling.k8s.io" | "policy" | "rbac.authorization.k8s.io" |
@@ -275,7 +346,7 @@ impl OrkaGuiApp {
         )
     }
 
-    fn ui_crd_section(&mut self, ui: &mut egui::Ui) {
+    fn ui_crd_section_old_removed(&mut self, ui: &mut egui::Ui) {
         use std::collections::BTreeMap;
         // group -> Vec<(idx, kind)>
         let mut groups: BTreeMap<String, Vec<(usize, String)>> = BTreeMap::new();
@@ -303,7 +374,7 @@ impl OrkaGuiApp {
             });
     }
 
-    fn find_kind_index(&self, group: &str, kind: &str) -> Option<usize> {
+    fn find_kind_index_old_removed(&self, group: &str, kind: &str) -> Option<usize> {
         // Prefer v1 when multiple versions exist
         let mut candidate: Option<usize> = None;
         for (idx, k) in self.kinds.iter().enumerate() {
@@ -315,7 +386,7 @@ impl OrkaGuiApp {
         candidate
     }
 
-    fn on_select_idx(&mut self, idx: usize) {
+    fn on_select_idx_old_removed(&mut self, idx: usize) {
         if let Some(k) = self.kinds.get(idx).cloned() {
             info!(gvk = %gvk_label(&k), "ui: kind clicked");
             self.selected_kind = Some(k);
@@ -323,20 +394,20 @@ impl OrkaGuiApp {
         }
     }
 
-    fn on_select_gvk(&mut self, rk: ResourceKind) {
+    fn on_select_gvk_old_removed(&mut self, rk: ResourceKind) {
         info!(gvk = %gvk_label(&rk), "ui: kind clicked");
         self.selected_kind = Some(rk);
         self.selected_idx = None;
     }
 
-    fn current_selected_kind(&self) -> Option<&ResourceKind> {
+    fn current_selected_kind_old_removed(&self) -> Option<&ResourceKind> {
         match self.selected_kind.as_ref() {
             Some(k) => Some(k),
             None => self.selected_idx.and_then(|i| self.kinds.get(i)),
         }
     }
 
-    fn ui_details(&mut self, ui: &mut egui::Ui) {
+    fn ui_details_old_removed(&mut self, ui: &mut egui::Ui) {
         ui.heading("Details");
         egui::ScrollArea::vertical()
             .id_salt("details_scroll")
@@ -354,7 +425,7 @@ impl OrkaGuiApp {
             });
     }
 
-    fn select_row(&mut self, it: LiteObj) {
+    fn select_row_old_removed(&mut self, it: LiteObj) {
         info!(uid = ?it.uid, name = %it.name, ns = %it.namespace.as_deref().unwrap_or("-"), "details: selecting row");
         self.selected = Some(it.uid);
         self.detail_buffer.clear();
@@ -541,6 +612,8 @@ impl eframe::App for OrkaGuiApp {
                         }
                         // Snapshot received -> no longer loading
                         self.last_error = None;
+                        // Mark sort dirty to refresh order
+                        self.sort_dirty = true;
                         processed += 1;
                         saw_batch = true;
                     }
@@ -553,6 +626,7 @@ impl eframe::App for OrkaGuiApp {
                             self.results.push(lo);
                         }
                         // Don't log every event to avoid spam; tiny heartbeat below
+                        self.sort_dirty = true;
                         processed += 1;
                     }
                     Ok(UiUpdate::Event(LiteEvent::Deleted(lo))) => {
@@ -566,6 +640,7 @@ impl eframe::App for OrkaGuiApp {
                                 }
                             }
                         }
+                        self.sort_dirty = true;
                         processed += 1;
                     }
                     Ok(UiUpdate::Error(err)) => {
@@ -610,6 +685,11 @@ impl eframe::App for OrkaGuiApp {
                     self.pending_since = None;
                 }
             }
+        }
+
+        // Periodic repaint to refresh Age column text
+        if !self.results.is_empty() {
+            ctx.request_repaint_after(std::time::Duration::from_secs(1));
         }
 
         egui::TopBottomPanel::top("top_bar").show(ctx, |ui| {
@@ -907,94 +987,6 @@ impl eframe::App for OrkaGuiApp {
     }
 }
 
-fn gvk_label(k: &ResourceKind) -> String {
-    if k.group.is_empty() {
-        format!("{}/{}", k.version, k.kind)
-    } else {
-        format!("{}/{}/{}", k.group, k.version, k.kind)
-    }
-}
-
-fn parse_gvk_key_to_kind(key: &str) -> ResourceKind {
-    let parts: Vec<&str> = key.split('/').collect();
-    match parts.as_slice() {
-        [version, kind] => ResourceKind { group: String::new(), version: (*version).to_string(), kind: (*kind).to_string(), namespaced: true },
-        [group, version, kind] => ResourceKind { group: (*group).to_string(), version: (*version).to_string(), kind: (*kind).to_string(), namespaced: true },
-        _ => ResourceKind { group: String::new(), version: String::new(), kind: key.to_string(), namespaced: true },
-    }
-}
-
-// -------- Persistent Watch Hub (broadcast) --------
-use std::sync::Mutex;
-use once_cell::sync::OnceCell;
-
-struct WatchHub {
-    map: Mutex<std::collections::HashMap<String, broadcast::Sender<LiteEvent>>>,
-    cache: Mutex<std::collections::HashMap<String, std::collections::HashMap<Uid, LiteObj>>>,
-}
-
-static WATCH_HUB: OnceCell<WatchHub> = OnceCell::new();
-
-fn watch_hub() -> &'static WatchHub {
-    WATCH_HUB.get_or_init(|| WatchHub {
-        map: Mutex::new(std::collections::HashMap::new()),
-        cache: Mutex::new(std::collections::HashMap::new()),
-    })
-}
-
-async fn watch_hub_subscribe(api: std::sync::Arc<dyn OrkaApi>, sel: Selector) -> Result<broadcast::Receiver<LiteEvent>, String> {
-    let key = format!("{}|{}", gvk_label(&sel.gvk), sel.namespace.as_deref().unwrap_or(""));
-    // Fast path: existing
-    if let Some(tx) = watch_hub().map.lock().unwrap().get(&key).cloned() {
-        return Ok(tx.subscribe());
-    }
-    // Create sender and spawn underlying watcher task
-    let (tx, rx) = broadcast::channel::<LiteEvent>(2048);
-    watch_hub().map.lock().unwrap().insert(key.clone(), tx.clone());
-    tokio::spawn(async move {
-        match api.watch_lite(sel).await {
-            Ok(mut sh) => {
-                loop {
-                    match sh.rx.recv().await {
-                        Some(LiteEvent::Applied(lo)) => {
-                            // Update cache then broadcast
-                            let mut cache = watch_hub().cache.lock().unwrap();
-                            let entry = cache.entry(key.clone()).or_insert_with(|| std::collections::HashMap::new());
-                            entry.insert(lo.uid, lo.clone());
-                            let _ = tx.send(LiteEvent::Applied(lo));
-                        }
-                        Some(LiteEvent::Deleted(lo)) => {
-                            let mut cache = watch_hub().cache.lock().unwrap();
-                            if let Some(map) = cache.get_mut(&key) { map.remove(&lo.uid); }
-                            let _ = tx.send(LiteEvent::Deleted(lo));
-                        }
-                        None => break,
-                    }
-                }
-            }
-            Err(_e) => { /* keep map entry; clients may retry */ }
-        }
-    });
-    Ok(rx)
-}
-
-fn watch_hub_snapshot(gvk_ns_key: &str) -> Vec<LiteObj> {
-    let cache = watch_hub().cache.lock().unwrap();
-    if let Some(map) = cache.get(gvk_ns_key) {
-        map.values().cloned().collect()
-    } else {
-        Vec::new()
-    }
-}
-
-fn watch_hub_prime(gvk_ns_key: &str, items: Vec<LiteObj>) {
-    let mut cache = watch_hub().cache.lock().unwrap();
-    let entry = cache.entry(gvk_ns_key.to_string()).or_insert_with(|| std::collections::HashMap::new());
-    for it in items {
-        entry.insert(it.uid, it);
-    }
-}
-
 enum UiUpdate {
     Snapshot(Vec<LiteObj>),
     Event(LiteEvent),
@@ -1004,31 +996,7 @@ enum UiUpdate {
     Namespaces(Vec<String>),
 }
 
-fn render_age(creation_ts: i64) -> String {
-    if creation_ts <= 0 {
-        return "-".to_string();
-    }
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs() as i64;
-    let mut secs = (now - creation_ts).max(0) as u64;
-    let days = secs / 86_400;
-    secs %= 86_400;
-    let hours = secs / 3600;
-    secs %= 3600;
-    let mins = secs / 60;
-    secs %= 60;
-    if days > 0 {
-        format!("{}d{}h", days, hours)
-    } else if hours > 0 {
-        format!("{}h{}m", hours, mins)
-    } else if mins > 0 {
-        format!("{}m", mins)
-    } else {
-        format!("{}s", secs)
-    }
-}
+// render_age moved to util
 #[cfg(feature = "dock")]
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 enum Tab {
@@ -1036,11 +1004,13 @@ enum Tab {
     Details,
 }
 
-struct ResultsDelegate<'a> {
+#[cfg(any())]
+struct ResultsDelegateOldRemoved<'a> {
     app: &'a mut OrkaGuiApp,
 }
 
-impl<'a> TableDelegate for ResultsDelegate<'a> {
+#[cfg(any())]
+impl<'a> TableDelegate for ResultsDelegateOldRemoved<'a> {
     fn prepare(&mut self, _info: &egui_table::PrefetchInfo) {}
 
     fn header_cell_ui(&mut self, ui: &mut egui::Ui, cell: &HeaderCellInfo) {
@@ -1049,15 +1019,30 @@ impl<'a> TableDelegate for ResultsDelegate<'a> {
             let rect = ui.max_rect();
             let bg = ui.visuals().widgets.inactive.bg_fill;
             ui.painter().rect_filled(rect, 0.0, bg);
-            let text = self
+            let col_idx = cell.col_range.start as usize;
+            let label = self
                 .app
                 .active_cols
-                .get(cell.col_range.start as usize)
+                .get(col_idx)
                 .map(|c| c.label)
                 .unwrap_or("");
-            if !text.is_empty() {
+            if !label.is_empty() {
                 ui.add_space(2.0);
-                ui.label(egui::RichText::new(text).strong());
+                let is_sorted = self.app.sort_col == Some(col_idx);
+                let mut text = label.to_string();
+                if is_sorted {
+                    text.push_str(if self.app.sort_asc { " ↑" } else { " ↓" });
+                }
+                let resp = ui.selectable_label(is_sorted, egui::RichText::new(text).strong());
+                if resp.clicked() {
+                    if is_sorted {
+                        self.app.sort_asc = !self.app.sort_asc;
+                    } else {
+                        self.app.sort_col = Some(col_idx);
+                        self.app.sort_asc = true;
+                    }
+                    self.app.sort_dirty = true;
+                }
             }
         }
     }

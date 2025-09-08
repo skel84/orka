@@ -382,7 +382,7 @@ impl OrkaOps for KubeOps {
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(timeout_secs);
 
         // Helper to filter target pods for eviction
-        let mut list_target = || async {
+        let list_target = || async {
             let mut targets: Vec<(String,String)> = Vec::new();
             let pods = all_pods.list(&lp).await?;
             for p in pods.items {
@@ -499,12 +499,12 @@ impl KubeOps {
 
 /// Internal: consume a stream of bytes, split into lines, send via bounded channel.
 /// Drops lines when channel is full. Flushes last partial line on end.
-async fn pump_bytes_to_lines<S, E>(stream: S, mut tx: mpsc::Sender<LogChunk>, mut cancel_rx: oneshot::Receiver<()>, ctx: Option<&str>)
+async fn pump_bytes_to_lines<S, E>(stream: S, tx: mpsc::Sender<LogChunk>, mut cancel_rx: oneshot::Receiver<()>, ctx: Option<&str>)
 where
     S: futures::Stream<Item = Result<bytes::Bytes, E>>,
     E: std::fmt::Display,
 {
-    let mut stream = stream.fuse();
+    let stream = stream.fuse();
     futures::pin_mut!(stream);
     let mut buf = bytes::BytesMut::new();
     loop {

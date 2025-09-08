@@ -449,6 +449,7 @@ pub fn spawn_ingest_with_planner(
     (tx, BackendHandle { snap, epoch_rx, partial_rx })
 }
 
+#[allow(dead_code)]
 fn approx_snapshot_bytes(snap: &WorldSnapshot) -> usize {
     approx_items_bytes(&snap.items)
 }

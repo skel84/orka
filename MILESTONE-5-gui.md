@@ -106,10 +106,27 @@ Notes on perf: perceived first‑paint latency reduced by starting `watch_lite` 
 
 ---
 
+## Progress (2025-09-08)
+
+- Results: added clickable header sorting (asc/desc) for Namespace • Name • Age and Projected columns; rebuilds UID→row index after sort.
+- Results: added periodic repaint (1s) so Age column auto-refreshes without user interaction.
+- Refactor: split GUI crate into focused modules to keep `lib.rs` lean:
+  - `util.rs` (helpers: gvk_label, parse_gvk_key_to_kind, render_age)
+  - `watch.rs` (persistent WatchHub + cache)
+  - `results.rs` (results table + delegate)
+  - `nav.rs` (kind tree: curated + CRDs)
+  - `details.rs` (details panel + fetch task)
+- Hygiene: cleared leftover warnings and unused imports across crates affected by the GUI work.
+
+Notes: user-visible behavior unchanged except for sorting and Age auto-refresh; existing load strategy and background tasks preserved.
+
+---
+
 ## Next Steps (short‑term)
 
 1. Results table polish
-   - Sort by columns; basic filter box; age text refresh timer.
+   - DONE: Sort by columns; age text refresh timer.
+   - TODO: Basic filter box.
    - Row display cache (Uid→rendered strings) to reduce per‑frame work.
    - Guard huge result sets with a soft cap + “refine filters” banner; explore virtualization later.
 2. Search integration
@@ -133,6 +150,8 @@ Notes on perf: perceived first‑paint latency reduced by starting `watch_lite` 
 - Backpressure: bounded channels with `try_send` drop‑on‑full; counters surfaced in bottom bar (to be added).
 - Load strategy: start `watch_lite` first for fast paint; fetch snapshot in parallel and merge; cancel both on selection change.
 - UI primitives: `egui_table` for results; stable `TextEdit` for YAML details; unique `id_source` on scroll areas.
+- Refactor: `orka_gui` split into `util`, `watch`, `results`, `nav`, `details` modules; `lib.rs` keeps app state and wiring.
+- Sorting: header click toggles asc/desc; sorting mutates in‑memory rows and rebuilds UID index to keep delta merges consistent.
 
 ---
 

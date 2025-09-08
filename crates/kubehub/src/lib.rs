@@ -163,6 +163,7 @@ fn delta_from(obj: &DynamicObject, kind: DeltaKind) -> Result<Delta> {
 }
 
 /// Start list+watch for a given GVK key and send coalesced deltas into provided channel.
+#[allow(unreachable_code)]
 pub async fn start_watcher(gvk_key: &str, namespace: Option<&str>, delta_tx: mpsc::Sender<Delta>) -> Result<()> {
     let client = Client::try_default().await?;
     let gvk = parse_gvk_key(gvk_key)?;

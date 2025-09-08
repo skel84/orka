@@ -43,6 +43,7 @@ struct IndexShard {
 pub struct Index {
     // Global arrays used for tie-breaking and for mapping hits back to snapshot indices
     g_names: Vec<String>,
+    #[allow(dead_code)]
     g_namespaces: Vec<String>,
     g_uids: Vec<[u8; 16]>,
     // Field path ids shared across shards

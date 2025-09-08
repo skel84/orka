@@ -377,7 +377,7 @@ impl BuiltinProjector {
         // Roles from labels
         let mut roles: Vec<String> = Vec::new();
         if let Some(lbls) = raw.pointer("/metadata/labels").and_then(|v| v.as_object()) {
-            for (k, v) in lbls.iter() {
+            for (k, _v) in lbls.iter() {
                 if k.starts_with("node-role.kubernetes.io/") {
                     let role = k.trim_start_matches("node-role.kubernetes.io/");
                     roles.push(if role.is_empty() { "node".into() } else { role.to_string() });
