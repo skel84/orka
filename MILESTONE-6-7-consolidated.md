@@ -1,6 +1,6 @@
 # Orka — Milestones 6+7 Consolidation (Perf + UI Polish)
 
-Status: Updated — several perf/UI items implemented; a few optional controls remain.
+Status: Updated — schema flags landed; docs polished; only optional CRD catalog remains.
 
 Goal: Keep first paint and steady‑state UI snappy on large clusters. Confirm what’s landed, finish the remaining high‑impact items, gate with env flags, and add light metrics to validate wins.
 
@@ -29,6 +29,12 @@ Goal: Keep first paint and steady‑state UI snappy on large clusters. Confirm w
   - `crates/api/src/lib.rs:268`
 - YAML highlighting layouter caches rendered galleys (small LRU):
   - `crates/gui/src/util/highlight.rs:1`
+
+- CRD schema controls (flags) wired in API:
+  - `ORKA_SCHEMA_OFFLINE_ONLY`: skip live CRD schema fetches; rely on built-ins.
+  - `ORKA_SCHEMA_BUILTIN_SKIP`: never fetch schema for built-ins (default on).
+  - Snapshot respects `ORKA_DEFER_SCHEMA` (default on). Search/schema API honor skip/offline.
+  - File: `crates/api/src/lib.rs`
 
 Recent session changes (this branch):
 - Reuse kube Client (OnceCell) in API and Kubehub to avoid per‑call TLS/config setup.
@@ -62,33 +68,21 @@ Recent session changes (this branch):
 
 ## Gaps vs M6/M7 (remaining)
 
-- CRD schema controls: `ORKA_SCHEMA_OFFLINE_ONLY`, `ORKA_SCHEMA_BUILTIN_SKIP` (explicit flags for clarity).
 - Optional embedded CRD catalog/offline lookup (low priority; keep live fallback).
-- Docs polish for new knobs and metrics.
 
 ---
 
 ## Plan (remaining, minimal risk)
 
-1) CRD Schema Controls (M6 optional)
-- Add `ORKA_SCHEMA_OFFLINE_ONLY` to skip live CRD fetches; rely on builtin projectors.
-- Add `ORKA_SCHEMA_BUILTIN_SKIP` for explicit built‑ins skip; document existing behavior.
-
-2) Docs polish
-- Update Performance section with new knobs, metrics, and defaults (prefetch=0, adaptive repaint).
+1) Optional embedded CRD catalog (future)
+- Add optional embedded catalog lookup for projector/printer columns; keep live fallback and flag-gate.
 
 ---
 
 ## Detailed Tasks
 
-1) CRD schema controls (optional)
-- Implement flags in API; keep defaults safe.
-
-2) Docs polish (Performance section)
-- Describe traffic counters and `ORKA_MEASURE_TRAFFIC`.
-- Document adaptive repaint knobs and new defaults.
-- Call out details cache/prefetch defaults and metrics.
-- Files: `crates/api/src/lib.rs`.
+1) Optional embedded CRD catalog (future)
+- Lookup order: embedded → live cluster → None. Flag-gate and expose metrics. Keep defaults conservative.
 
 ---
 

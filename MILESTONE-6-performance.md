@@ -194,6 +194,19 @@ Watch (lite)     → [events] ┘
 - `ORKA_LIST_ENRICH`: include labels/annotations in lite watcher shaping (default off)
 - `ORKA_UI_DEBOUNCE_MS`: coalesce repaint requests in GUI (default 100)
 
+New/clarified knobs (M6+7):
+- `ORKA_SCHEMA_OFFLINE_ONLY`: skip live CRD schema fetches; rely on built-ins (default off)
+- `ORKA_SCHEMA_BUILTIN_SKIP`: never fetch schema for built-in kinds (default on)
+- `ORKA_DEFER_SCHEMA`: keep schema lookup out of snapshot hot path (default on)
+- `ORKA_DETAILS_TTL_SECS`: details cache TTL (default 60)
+- `ORKA_DETAILS_CACHE_CAP`: max cached details entries (default 128)
+- `ORKA_DETAILS_PREFETCH_MS`: prefetch delay after selection (default 0)
+- `ORKA_YAML_LAYOUT_CACHE_CAP`: cached YAML galleys (default 128)
+- `ORKA_IDLE_FAST_MS`: fast idle repaint cadence after activity (default 8)
+- `ORKA_IDLE_SLOW_MS`: slow idle repaint cadence (default 120)
+- `ORKA_IDLE_FAST_WINDOW_MS`: time window to stay fast after activity (default 1000)
+- `ORKA_MEASURE_TRAFFIC`: enable traffic bytes counters (default off)
+
 ---
 
 ## File Touchpoints

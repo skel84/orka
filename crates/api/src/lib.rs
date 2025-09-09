@@ -39,6 +39,18 @@ pub use orka_schema::CrdSchema; // Re-export schema type
 pub use orka_persist::LastApplied; // Re-export last-applied row
 use std::collections::HashMap;
 
+// ------------- Env helpers (feature flags) -------------
+
+fn env_flag(name: &str, default: bool) -> bool {
+    std::env::var(name)
+        .ok()
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true") || v.eq_ignore_ascii_case("yes"))
+        .unwrap_or(default)
+}
+
+fn schema_offline_only() -> bool { env_flag("ORKA_SCHEMA_OFFLINE_ONLY", false) }
+fn schema_builtin_skip() -> bool { env_flag("ORKA_SCHEMA_BUILTIN_SKIP", true) }
+
 /// A served Kubernetes resource kind (incl. CRDs).
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ResourceKind {
@@ -294,21 +306,22 @@ impl OrkaApi for InProcApi {
                 }
             }
         }
-        // Projector from CRD schema, optionally deferred to keep snapshot fast
-        // Skip for built-ins (empty group) and when deferral is enabled (default on)
-        let defer_schema = std::env::var("ORKA_DEFER_SCHEMA")
-            .ok()
-            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
-            .unwrap_or(true);
+        // Projector from CRD schema, optionally deferred to keep snapshot fast.
+        // Controls:
+        // - ORKA_DEFER_SCHEMA (default on): keep schema lookup out of snapshot critical path
+        // - ORKA_SCHEMA_OFFLINE_ONLY (default off): never fetch schema from live cluster
+        // - ORKA_SCHEMA_BUILTIN_SKIP (default on): never fetch schema for built-ins
+        let defer_schema = env_flag("ORKA_DEFER_SCHEMA", true);
         let is_builtin = selector.gvk.group.is_empty();
-        let (mut projector, explain_available) = if is_builtin || defer_schema {
-            (None, false)
-        } else {
+        let offline_only = schema_offline_only();
+        let skip_builtins = schema_builtin_skip();
+        let should_try_schema = !defer_schema && !offline_only && !(is_builtin && skip_builtins);
+        let (mut projector, explain_available) = if should_try_schema {
             match orka_schema::fetch_crd_schema(&gvk_key).await {
                 Ok(Some(schema)) => (Some(Arc::new(schema.projector()) as Arc<dyn orka_core::Projector + Send + Sync>), true),
                 _ => (None, false),
             }
-        };
+        } else { (None, false) };
         // If no schema projector, try built-in projector for known core kinds
         if projector.is_none() {
             projector = orka_core::columns::builtin_projector_for(&selector.gvk.group, &selector.gvk.version, &selector.gvk.kind);
@@ -373,10 +386,16 @@ impl OrkaApi for InProcApi {
         // Field mapping and metadata
         let gvk_key = Self::gvk_key(&selector.gvk);
         let (group, kind) = (selector.gvk.group.clone(), selector.gvk.kind.clone());
-        let pairs: Option<Vec<(String, u32)>> = match orka_schema::fetch_crd_schema(&gvk_key).await {
-            Ok(Some(schema)) => Some(schema.projected_paths.iter().map(|p| (p.json_path.clone(), p.id)).collect()),
-            _ => None,
-        };
+        // Schema controls for search: respect offline/builtin skip; do not apply snapshot deferral here.
+        let offline_only = schema_offline_only();
+        let skip_builtins = schema_builtin_skip();
+        let is_builtin = group.is_empty();
+        let pairs: Option<Vec<(String, u32)>> = if !offline_only && !(is_builtin && skip_builtins) {
+            match orka_schema::fetch_crd_schema(&gvk_key).await {
+                Ok(Some(schema)) => Some(schema.projected_paths.iter().map(|p| (p.json_path.clone(), p.id)).collect()),
+                _ => None,
+            }
+        } else { None };
         let i0 = Instant::now();
         let index = match pairs {
             Some(p) => orka_search::Index::build_from_snapshot_with_meta(&snap, Some(&p), Some(&kind), Some(&group)),
@@ -541,6 +560,21 @@ impl OrkaApi for InProcApi {
     async fn schema(&self, gvk_key: &str) -> OrkaResult<Option<CrdSchema>> {
         let t0 = Instant::now();
         info!(gvk = %gvk_key, "api: schema fetch start");
+        // Respect schema control flags
+        let offline_only = schema_offline_only();
+        let skip_builtins = schema_builtin_skip();
+        let is_builtin = {
+            let parts: Vec<&str> = gvk_key.split('/').collect();
+            matches!(parts.as_slice(), [version, _kind] if !version.contains('/'))
+        };
+        if offline_only {
+            info!("api: schema offline-only; skipping live fetch");
+            return Ok(None);
+        }
+        if is_builtin && skip_builtins {
+            info!("api: schema builtin skip");
+            return Ok(None);
+        }
         let res = orka_schema::fetch_crd_schema(gvk_key)
             .await
             .map_err(|e| OrkaError::Internal(e.to_string()));
