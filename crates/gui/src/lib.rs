@@ -1,6 +1,6 @@
 #![forbid(unsafe_code)]
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::time::Instant;
 use std::sync::{mpsc, Arc};
 
@@ -52,7 +52,13 @@ pub struct OrkaGuiApp {
     search: SearchState,
     log: String,
     #[cfg(feature = "dock")]
-    dock: dock::Tree<Tab>,
+    dock: Option<dock::DockState<Tab>>,
+    #[cfg(feature = "dock")]
+    dock_pending: Vec<Uid>,
+    #[cfg(feature = "dock")]
+    details_tab_order: VecDeque<Uid>,
+    #[cfg(feature = "dock")]
+    details_tabs_cap: usize,
     // layout visibility
     layout: LayoutState,
     // cached namespaces for dropdown
@@ -81,6 +87,55 @@ pub struct OrkaGuiApp {
 }
 
 impl OrkaGuiApp {
+    #[cfg(feature = "dock")]
+    fn open_details_tab_for(&mut self, uid: Uid) {
+        // Defer dock mutations to after DockArea render to avoid borrow conflicts
+        self.dock_pending.push(uid);
+    }
+
+    #[cfg(feature = "dock")]
+    fn ensure_details_tab_in(&mut self, ds: &mut dock::DockState<Tab>, uid: Uid) {
+        let tree = ds.main_surface_mut();
+        // If tab exists for this uid, just focus it
+        if let Some((node, tab_index)) = tree.find_tab_from(|t| matches!(t, Tab::DetailsFor(id) if *id == uid)) {
+            tree.set_focused_node(node);
+            tree.set_active_tab(node, tab_index);
+        } else {
+            // Find an existing details leaf, else split root to create one on the right
+            if let Some((node, _)) = tree.find_tab_from(|t| matches!(t, Tab::DetailsFor(_) | Tab::Details)) {
+                tree.set_focused_node(node);
+                tree.push_to_focused_leaf(Tab::DetailsFor(uid));
+            } else {
+                tree.split_right(dock::NodeIndex::root(), 0.5, vec![Tab::DetailsFor(uid)]);
+            }
+        }
+        // Track order and enforce cap
+        self.note_opened_details_uid(uid, ds);
+    }
+
+    #[cfg(feature = "dock")]
+    fn note_opened_details_uid(&mut self, uid: Uid, ds: &mut dock::DockState<Tab>) {
+        if let Some(pos) = self.details_tab_order.iter().position(|u| *u == uid) {
+            self.details_tab_order.remove(pos);
+        }
+        self.details_tab_order.push_back(uid);
+        while self.details_tab_order.len() > self.details_tabs_cap {
+            if let Some(old) = self.details_tab_order.pop_front() {
+                if let Some((node, tab_index)) = ds.find_main_surface_tab(&Tab::DetailsFor(old)) {
+                    let surface = dock::SurfaceIndex::main();
+                    let _ = ds.remove_tab((surface, node, tab_index));
+                }
+            }
+        }
+    }
+
+    #[cfg(feature = "dock")]
+    pub(crate) fn close_all_details_tabs(&mut self) {
+        if let Some(ds) = self.dock.as_mut() {
+            ds.retain_tabs(|tab| !matches!(tab, Tab::Details | Tab::DetailsFor(_)));
+        }
+        self.details_tab_order.clear();
+    }
     pub(crate) fn selected_is_pod(&self) -> bool {
         match self.current_selected_kind() {
             Some(k) => k.group.is_empty() && k.version == "v1" && k.kind == "Pod",
@@ -152,11 +207,16 @@ impl OrkaGuiApp {
             log: String::new(),
             #[cfg(feature = "dock")]
             dock: {
-                let mut t = dock::Tree::new(vec![Tab::Results]);
-                let right = dock::Stack::new(vec![Tab::Details]);
-                t.split_right(dock::NodeIndex::root(), 0.5, right);
-                t
+                // Start with Results only; open Details tabs per resource as needed
+                let t = dock::DockState::new(vec![Tab::Results]);
+                Some(t)
             },
+            #[cfg(feature = "dock")]
+            dock_pending: Vec::new(),
+            #[cfg(feature = "dock")]
+            details_tab_order: VecDeque::new(),
+            #[cfg(feature = "dock")]
+            details_tabs_cap: std::env::var("ORKA_DETAILS_TABS_CAP").ok().and_then(|s| s.parse::<usize>().ok()).unwrap_or(8),
             layout: LayoutState { show_nav: true, show_details: true, show_log: true },
             namespaces: Vec::new(),
             ui_debounce: UiDebounce { ms: std::env::var("ORKA_UI_DEBOUNCE_MS").ok().and_then(|s| s.parse::<u64>().ok()).unwrap_or(100), pending_count: 0, pending_since: None },
@@ -463,9 +523,20 @@ impl eframe::App for OrkaGuiApp {
                     Ok(UiUpdate::Event(LiteEvent::Applied(lo))) => {
                         let uid = lo.uid;
                         if let Some(idx) = self.results.index.get(&uid).copied() {
-                            self.results.filter_cache.insert(lo.uid, self.build_filter_haystack(&lo));
-                            self.results.display_cache.insert(lo.uid, self.build_display_row(&lo));
-                            self.results.rows[idx] = lo;
+                            // Guard against stale/out-of-bounds index (can happen if a delete shrunk rows
+                            // between index insert and push in a previous frame).
+                            if idx < self.results.rows.len() {
+                                self.results.filter_cache.insert(lo.uid, self.build_filter_haystack(&lo));
+                                self.results.display_cache.insert(lo.uid, self.build_display_row(&lo));
+                                self.results.rows[idx] = lo;
+                            } else {
+                                let new_idx = self.results.rows.len();
+                                self.results.index.insert(uid, new_idx);
+                                self.results.filter_cache.insert(uid, self.build_filter_haystack(&lo));
+                                self.results.display_cache.insert(uid, self.build_display_row(&lo));
+                                self.results.rows.push(lo);
+                                info!(uid = ?uid, stale_idx = idx, new_idx, len = self.results.rows.len(), "ui: corrected stale index on Applied");
+                            }
                         } else {
                             let idx = self.results.rows.len();
                             self.results.index.insert(uid, idx);
@@ -747,6 +818,7 @@ impl eframe::App for OrkaGuiApp {
                 });
         }
 
+        #[cfg(not(feature = "dock"))]
         if self.layout.show_details {
             egui::SidePanel::right("details_panel")
                 .resizable(true)
@@ -767,16 +839,54 @@ impl eframe::App for OrkaGuiApp {
                         match tab {
                             Tab::Results => "Results".into(),
                             Tab::Details => "Details".into(),
+                            Tab::DetailsFor(uid) => {
+                                if let Some(i) = self.app.results.index.get(uid).copied() {
+                                    if let Some(row) = self.app.results.rows.get(i) {
+                                        let ns = row.namespace.as_deref().unwrap_or("-");
+                                        format!("Details: {}/{}", ns, row.name).into()
+                                    } else { "Details".into() }
+                                } else { "Details".into() }
+                            }
                         }
                     }
                     fn ui(&mut self, ui: &mut egui::Ui, tab: &mut Self::Tab) {
                         match tab {
                             Tab::Results => self.app.ui_results(ui),
                             Tab::Details => self.app.ui_details(ui),
+                            Tab::DetailsFor(_uid) => {
+                                // Do not force selection per-tab; selection is synced once per frame
+                                // to the currently focused tab after DockArea rendering.
+                                self.app.ui_details(ui);
+                            }
                         }
                     }
                 }
-                dock::DockArea::new(&mut self.dock).show_inside(ui, &mut Viewer { app: self });
+                if let Some(mut ds) = self.dock.take() {
+                    {
+                        let mut viewer = Viewer { app: self };
+                        dock::DockArea::new(&mut ds).show_inside(ui, &mut viewer);
+                    }
+                    // After rendering, apply any queued dock operations (e.g., open details tabs)
+                    while let Some(pending) = self.dock_pending.pop() {
+                        self.ensure_details_tab_in(&mut ds, pending);
+                    }
+                    // Sync selection to the currently focused Details tab (if any) to avoid thrash
+                    {
+                        let tree = ds.main_surface_mut();
+                        if let Some((_rect, tab)) = tree.find_active_focused() {
+                            if let Tab::DetailsFor(uid) = *tab {
+                                if self.details.selected != Some(uid) {
+                                    if let Some(i) = self.results.index.get(&uid).copied() {
+                                        if let Some(row) = self.results.rows.get(i).cloned() {
+                                            self.select_row(row);
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    self.dock = Some(ds);
+                }
             }
             #[cfg(not(feature = "dock"))]
             {
@@ -810,6 +920,7 @@ impl eframe::App for OrkaGuiApp {
 enum Tab {
     Results,
     Details,
+    DetailsFor(Uid),
 }
 
 impl OrkaGuiApp {}

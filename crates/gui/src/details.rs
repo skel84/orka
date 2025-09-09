@@ -223,6 +223,11 @@ impl OrkaGuiApp {
         self.details.selected = Some(uid);
         self.details.selected_at = Some(Instant::now());
         self.details.buffer.clear();
+        #[cfg(feature = "dock")]
+        {
+            // Open/focus a dedicated tab for this resource when docking is enabled
+            self.open_details_tab_for(uid);
+        }
         // Clear pod-specific logs metadata on selection change
         self.logs.containers.clear();
         self.logs.container = None;

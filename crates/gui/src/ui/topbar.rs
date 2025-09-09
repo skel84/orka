@@ -13,12 +13,22 @@ pub(crate) fn ui_topbar(app: &mut OrkaGuiApp, ctx: &egui::Context) {
             ui.small_button(if app.layout.show_nav { "Hide Nav" } else { "Show Nav" })
                 .clicked()
                 .then(|| app.layout.show_nav = !app.layout.show_nav);
-            ui.small_button(if app.layout.show_details { "Hide Details" } else { "Show Details" })
-                .clicked()
-                .then(|| app.layout.show_details = !app.layout.show_details);
+            #[cfg(not(feature = "dock"))]
+            {
+                ui.small_button(if app.layout.show_details { "Hide Details" } else { "Show Details" })
+                    .clicked()
+                    .then(|| app.layout.show_details = !app.layout.show_details);
+            }
             ui.small_button(if app.layout.show_log { "Hide Log" } else { "Show Log" })
                 .clicked()
                 .then(|| app.layout.show_log = !app.layout.show_log);
+            #[cfg(feature = "dock")]
+            {
+                ui.separator();
+                if ui.small_button("Close Details Tabs").on_hover_text("Close all Details tabs").clicked() {
+                    app.close_all_details_tabs();
+                }
+            }
             ui.separator();
             // Namespace dropdown
             if let Some(i) = app.selection.selected_idx {
