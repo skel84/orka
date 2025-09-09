@@ -1,6 +1,6 @@
 # Orka — Milestones 6+7 Consolidation (Perf + UI Polish)
 
-Status: In Progress — consolidate Milestone 6 (Performance & Responsiveness) and Mini‑Milestone 7 (UI YAML & TTFR polish) into a verified, actionable plan.
+Status: Updated — several perf/UI items implemented; a few optional controls remain.
 
 Goal: Keep first paint and steady‑state UI snappy on large clusters. Confirm what’s landed, finish the remaining high‑impact items, gate with env flags, and add light metrics to validate wins.
 
@@ -30,70 +30,64 @@ Goal: Keep first paint and steady‑state UI snappy on large clusters. Confirm w
 - YAML highlighting layouter caches rendered galleys (small LRU):
   - `crates/gui/src/util/highlight.rs:1`
 
+Recent session changes (this branch):
+- Reuse kube Client (OnceCell) in API and Kubehub to avoid per‑call TLS/config setup.
+  - API: `crates/api/src/lib.rs` (shared client + used in `get_raw`, `watch_lite`, `last_applied`)
+  - Kubehub: `crates/kubehub/src/lib.rs` (shared client + used in `discover`, list/watch helpers)
+- Details YAML fast path + cache (M7 core):
+  - Cache details per `Uid` with TTL and cap; invalidate on Applied/Deleted; prefetch on selection (default debounce now 0ms).
+  - Immediate flush on details arrival (bypass debounce) for snappier paint.
+  - Files: `crates/gui/src/details.rs`, `crates/gui/src/lib.rs`, `crates/gui/src/model.rs`.
+- Adaptive idle repaint cadence to bound queue latency without high idle CPU:
+  - Fast after activity (default 8ms), then slow (default 120ms) after a 1s window.
+  - Env: `ORKA_IDLE_FAST_MS`, `ORKA_IDLE_SLOW_MS`, `ORKA_IDLE_FAST_WINDOW_MS`.
+  - File: `crates/gui/src/lib.rs`.
+- Namespaces live watcher wired via WatchHub; dropdown updates live (sorted/deduped):
+  - Files: `crates/gui/src/tasks/watch_ctrl.rs`.
+- GUI metrics wiring and timing logs:
+  - Flush counters/histograms: `ui_updates_processed_per_frame`, `ui_debounce_flush_ms`.
+  - Details timing logs: `time_to_first_details_ms`, queue latency; YAML layout `yaml_layout_build_ms` (existing) + cache hit/miss.
+  - Files: `crates/gui/src/lib.rs`, `crates/gui/src/util/highlight.rs`.
+- API/kubehub observability:
+  - API `get_raw` slice timings (client, discovery lookup, HTTP, serialize, total) with histograms/logs.
+  - Kubehub discovery cache hit/miss debug logs.
+  - List page timings: `snapshot_page_ms`, `list_lite_page_ms`, `list_lite_first_page_ms`.
+  - Files: `crates/api/src/lib.rs`, `crates/kubehub/src/lib.rs`.
+- Optional live traffic counters exposed in Stats + UI:
+  - Counts cumulative bytes for snapshot, watch (opt‑in via `ORKA_MEASURE_TRAFFIC`), and details.
+  - API Stats exposes `traffic_{snapshot,watch,details}_bytes`; Stats modal renders them.
+  - Files: `crates/kubehub/src/lib.rs`, `crates/api/src/lib.rs`, `crates/gui/src/ui/stats.rs`.
+
 ---
 
-## Gaps vs M6/M7 (what’s still missing)
+## Gaps vs M6/M7 (remaining)
 
-- Namespaces live list (watch) instead of one‑shot snapshot fetch.
-- Details string cache (by `Uid`, TTL + invalidation on events).
-- Details prefetch (debounced on row selection) to improve perceived latency.
-- YAML layout cache knobs + metrics (capacity env, hit/miss, build time).
-- Details metrics: `time_to_first_details_ms`.
-- GUI metrics counters for per‑flush processed and debounce window (currently only logs).
-- Optional embedded CRD catalog or offline‑only mode flag (skip live CRD fetches when desired).
+- CRD schema controls: `ORKA_SCHEMA_OFFLINE_ONLY`, `ORKA_SCHEMA_BUILTIN_SKIP` (explicit flags for clarity).
+- Optional embedded CRD catalog/offline lookup (low priority; keep live fallback).
+- Docs polish for new knobs and metrics.
 
 ---
 
-## Plan (prioritized, minimal risk)
+## Plan (remaining, minimal risk)
 
-1) Details Caches + Prefetch (M7 core)
-- Add in‑proc details cache keyed by `Uid` with TTL and event‑based invalidation.
-- Debounce prefetch (~150ms) after selection change; cancel on new selection.
-- Keep memory bounded (e.g., 64–128 entries) and TTL configurable.
+1) CRD Schema Controls (M6 optional)
+- Add `ORKA_SCHEMA_OFFLINE_ONLY` to skip live CRD fetches; rely on builtin projectors.
+- Add `ORKA_SCHEMA_BUILTIN_SKIP` for explicit built‑ins skip; document existing behavior.
 
-2) YAML Layout Cache Controls (M7 metrics + knobs)
-- Expose env `ORKA_YAML_LAYOUT_CACHE_CAP` for the `util::highlight` LRU.
-- Emit `yaml_layout_cache_hit/miss` counters and `yaml_layout_build_ms` histogram on misses.
-
-3) Namespaces Live List (M6 polish)
-- Maintain a dedicated `watch_lite` on Namespaces and update a shared `namespaces` vector via the same hub pattern; fallback to snapshot if watch fails.
-
-4) GUI Metrics Wiring (M6 polish)
-- Track `ui_updates_processed_per_frame` and `ui_debounce_flush_ms` (histograms/counters) at flush points.
-- Log and optionally export `time_to_first_details_ms` alongside existing TTFR/TTFE.
-
-5) CRD Schema Controls (M6 optional)
-- Add `ORKA_SCHEMA_OFFLINE_ONLY` (skip live CRD fetch; builtin projectors only) and `ORKA_SCHEMA_BUILTIN_SKIP` (explicit skip for built‑ins; default true already via logic) for clarity.
+2) Docs polish
+- Update Performance section with new knobs, metrics, and defaults (prefetch=0, adaptive repaint).
 
 ---
 
 ## Detailed Tasks
 
-1) Details cache + prefetch
-- Add state in GUI model: `details_cache: HashMap<Uid, (Arc<String>, Instant)>`, `details_ttl_secs`.
-- In `select_row`, start a debounced task that checks cache → emits immediately if hit; otherwise kicks `get_raw`.
-- In watch event handler, invalidate cached entry for that `Uid` on `Applied`/`Deleted`.
-- Env: `ORKA_DETAILS_TTL_SECS` (default 60), `ORKA_DETAILS_CACHE_CAP` (optional, default 128).
-- Files: `crates/gui/src/model.rs`, `crates/gui/src/details.rs`, `crates/gui/src/lib.rs`.
+1) CRD schema controls (optional)
+- Implement flags in API; keep defaults safe.
 
-2) YAML layout cache controls + metrics
-- Change `util::highlight` LRU to a small LRU with capacity from `ORKA_YAML_LAYOUT_CACHE_CAP` (default 128) and record hit/miss metrics.
-- Emit `yaml_layout_build_ms` histogram around layout job creation.
-- Files: `crates/gui/src/util/highlight.rs`.
-
-3) Namespaces live list
-- Add a dedicated watcher via `watch_hub_subscribe` for `v1/Namespace` and update `UiUpdate::Namespaces` on changes (insert/remove, keep sorted/deduped).
-- On first boot, still seed from snapshot to avoid empty UI if watch is slow.
-- Files: `crates/gui/src/tasks/watch_ctrl.rs`, `crates/gui/src/model.rs`.
-
-4) GUI metrics wiring
-- At flush in `update`, increment `ui_updates_processed_per_frame` (count) and record `ui_debounce_flush_ms` (time since first pending).
-- On first details render (post fetch), record `time_to_first_details_ms`.
-- Files: `crates/gui/src/lib.rs`, `crates/gui/src/details.rs`.
-
-5) CRD schema controls (optional)
-- Support `ORKA_SCHEMA_OFFLINE_ONLY=1` to skip `api.schema()` network calls (keep projectors offline).
-- Add explicit `ORKA_SCHEMA_BUILTIN_SKIP` flag; default true (document existing behavior).
+2) Docs polish (Performance section)
+- Describe traffic counters and `ORKA_MEASURE_TRAFFIC`.
+- Document adaptive repaint knobs and new defaults.
+- Call out details cache/prefetch defaults and metrics.
 - Files: `crates/api/src/lib.rs`.
 
 ---
@@ -114,7 +108,7 @@ Goal: Keep first paint and steady‑state UI snappy on large clusters. Confirm w
 - Details open for recently selected rows typically <= 100ms from selection (hit or in‑flight prefetch).
 - YAML layout cache hit rate >= 80% when idle (no editing) on details.
 - Namespaces dropdown updates live on create/delete; remains snappy without re‑snapshotting.
-- Metrics present: `time_to_first_event_ms`, `time_to_first_row_ms`, `time_to_first_details_ms`, `ui_updates_processed_per_frame`, `ui_debounce_flush_ms`, `yaml_layout_cache_hit/miss`, `yaml_layout_build_ms`.
+- Metrics present: `time_to_first_event_ms`, `time_to_first_row_ms`, `time_to_first_details_ms`, `ui_updates_processed_per_frame`, `ui_debounce_flush_ms`, `yaml_layout_cache_hit/miss`, `yaml_layout_build_ms`, traffic bytes in Stats when enabled.
 - All knobs documented; defaults keep risk low (safe fallbacks).
 
 ---
@@ -126,12 +120,15 @@ Goal: Keep first paint and steady‑state UI snappy on large clusters. Confirm w
 - `ORKA_YAML_LAYOUT_CACHE_CAP` (default 128)
 - `ORKA_SCHEMA_OFFLINE_ONLY` (default off)
 - `ORKA_SCHEMA_BUILTIN_SKIP` (default on; clarifies existing behavior)
+- `ORKA_DETAILS_PREFETCH_MS` (default 0)
+- `ORKA_IDLE_FAST_MS` (default 8), `ORKA_IDLE_SLOW_MS` (default 120), `ORKA_IDLE_FAST_WINDOW_MS` (default 1000)
+- `ORKA_MEASURE_TRAFFIC` (default off): enable live traffic bytes
 
-Existing knobs remain: `ORKA_PREWARM_KINDS`, `ORKA_SNAPSHOT_PAGE_LIMIT`, `ORKA_LIST_ENRICH`, `ORKA_LITE_PROJECT`, `ORKA_LIST_LITE_BUILTINS`, `ORKA_LIST_LITE_GROUPS`, `ORKA_UI_DEBOUNCE_MS`.
+Existing knobs remain: `ORKA_PREWARM_KINDS`, `ORKA_SNAPSHOT_PAGE_LIMIT`, `ORKA_LIST_ENRICH`, `ORKA_LITE_PROJECT`, `ORKA_LIST_LITE_BUILTINS`, `ORKA_LIST_LITE_GROUPS`, `ORKA_UI_DEBOUNCE_MS`, `ORKA_YAML_LAYOUT_CACHE_CAP`.
 
 ---
 
-## Touchpoints (files to change)
+## Touchpoints
 
 - `crates/gui/src/model.rs`
 - `crates/gui/src/lib.rs`
@@ -139,6 +136,8 @@ Existing knobs remain: `ORKA_PREWARM_KINDS`, `ORKA_SNAPSHOT_PAGE_LIMIT`, `ORKA_L
 - `crates/gui/src/tasks/watch_ctrl.rs`
 - `crates/gui/src/util/highlight.rs`
 - `crates/api/src/lib.rs`
+- `crates/gui/src/ui/stats.rs`
+- `crates/kubehub/src/lib.rs`
 
 ---
 
@@ -146,4 +145,3 @@ Existing knobs remain: `ORKA_PREWARM_KINDS`, `ORKA_SNAPSHOT_PAGE_LIMIT`, `ORKA_L
 
 - Behind env flags with conservative defaults; keep previous code paths available.
 - Validate on kind and a medium cluster; compare TTFR/TTFE/Details and CPU with/without flags.
-
