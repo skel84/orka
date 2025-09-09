@@ -9,6 +9,23 @@ use serde::{Deserialize, Serialize};
 use orka_persist::Store;
 use std::time::Instant;
 use tracing::info;
+use std::sync::atomic::{AtomicU64, Ordering};
+use metrics::histogram;
+use tokio::sync::OnceCell;
+
+// Reuse a single kube Client across API calls to avoid costly TLS/config setup.
+static KUBE_CLIENT: OnceCell<kube::Client> = OnceCell::const_new();
+
+async fn get_kube_client() -> OrkaResult<kube::Client> {
+    KUBE_CLIENT
+        .get_or_try_init(|| async {
+            kube::Client::try_default()
+                .await
+                .map_err(|e| OrkaError::Internal(e.to_string()))
+        })
+        .await
+        .map(|c| c.clone())
+}
 
 pub use orka_ops::OrkaOps; // Re-export imperative ops trait
 pub use orka_ops::LogOptions as OpsLogOptions; // Re-export ops types for frontends
@@ -66,6 +83,9 @@ pub struct Stats {
     pub max_rss_mb: Option<usize>,
     pub max_index_bytes: Option<usize>,
     pub metrics_addr: Option<String>,
+    pub traffic_snapshot_bytes: Option<u64>,
+    pub traffic_watch_bytes: Option<u64>,
+    pub traffic_details_bytes: Option<u64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -222,6 +242,8 @@ impl InProcApi {
     }
 }
 
+static TRAFFIC_DETAILS_BYTES: AtomicU64 = AtomicU64::new(0);
+
 #[async_trait::async_trait]
 impl OrkaApi for InProcApi {
     async fn discover(&self) -> OrkaResult<Vec<ResourceKind>> {
@@ -368,21 +390,41 @@ impl OrkaApi for InProcApi {
 
     async fn get_raw(&self, reference: ResourceRef) -> OrkaResult<Vec<u8>> {
         let t0 = Instant::now();
-        info!(gvk = %Self::gvk_key(&reference.gvk), name = %reference.name, ns = %reference.namespace.as_deref().unwrap_or("-"), "api: get_raw start");
-        use kube::{core::DynamicObject, api::Api};
-        let client = kube::Client::try_default().await.map_err(|e| OrkaError::Internal(e.to_string()))?;
-        // Locate ApiResource via cached discovery in kubehub
         let gvk_key = Self::gvk_key(&reference.gvk);
+        info!(gvk = %gvk_key, name = %reference.name, ns = %reference.namespace.as_deref().unwrap_or("-"), "api: get_raw start");
+        use kube::{core::DynamicObject, api::Api};
+        let c0 = Instant::now();
+        let client = get_kube_client().await?;
+        let client_ms = c0.elapsed().as_millis() as f64;
+        histogram!("api_get_raw_client_ms", client_ms);
+        info!(ms = %client_ms, "api: get_raw client ready");
+        // Locate ApiResource via cached discovery in kubehub
+        let l0 = Instant::now();
         let (ar, namespaced) = orka_kubehub::get_api_resource(&gvk_key).await.map_err(Self::map_err)?;
+        let lookup_ms = l0.elapsed().as_millis() as f64;
+        histogram!("api_get_raw_lookup_ms", lookup_ms);
+        info!(ms = %lookup_ms, namespaced, kind = %ar.kind, group = %ar.group, version = %ar.version, "api: get_raw ar lookup");
         let api: Api<DynamicObject> = if namespaced {
             match reference.namespace.as_deref() {
                 Some(ns) => Api::namespaced_with(client.clone(), ns, &ar),
                 None => return Err(OrkaError::Validation("namespace required for namespaced kind".into())),
             }
         } else { Api::all_with(client.clone(), &ar) };
+        let h0 = Instant::now();
+        info!("api: get_raw http get start");
         let obj = api.get(&reference.name).await.map_err(|e| OrkaError::Internal(e.to_string()))?;
+        let http_ms = h0.elapsed().as_millis() as f64;
+        histogram!("api_get_raw_http_ms", http_ms);
+        info!(ms = %http_ms, "api: get_raw http get ok");
+        let s0 = Instant::now();
         let bytes = serde_json::to_vec(&obj).map_err(|e| OrkaError::Internal(e.to_string()))?;
-        info!(bytes = bytes.len(), took_ms = %t0.elapsed().as_millis(), "api: get_raw ok");
+        let ser_ms = s0.elapsed().as_millis() as f64;
+        histogram!("api_get_raw_serialize_ms", ser_ms);
+        TRAFFIC_DETAILS_BYTES.fetch_add(bytes.len() as u64, Ordering::Relaxed);
+        let took = t0.elapsed().as_millis() as f64;
+        histogram!("api_get_raw_total_ms", took);
+        let overhead_ms = took - http_ms;
+        info!(bytes = bytes.len(), took_ms = %took, kube_http_ms = %http_ms, client_ms = %client_ms, lookup_ms = %lookup_ms, serialize_ms = %ser_ms, api_overhead_ms = %overhead_ms, "api: get_raw breakdown");
         Ok(bytes)
     }
 
@@ -418,16 +460,32 @@ impl OrkaApi for InProcApi {
 
     async fn stats(&self) -> OrkaResult<Stats> {
         let t0 = Instant::now();
-        let shards = std::env::var("ORKA_SHARDS").ok().and_then(|s| s.parse().ok()).unwrap_or(1);
-        let relist_secs = std::env::var("ORKA_RELIST_SECS").ok().and_then(|s| s.parse().ok()).unwrap_or(300);
-        let watch_backoff_max_secs = std::env::var("ORKA_WATCH_BACKOFF_MAX_SECS").ok().and_then(|s| s.parse().ok()).unwrap_or(30);
+        info!("api: stats start");
+        let shards: usize = std::env::var("ORKA_SHARDS").ok().and_then(|s| s.parse().ok()).unwrap_or(1);
+        let relist_secs: u64 = std::env::var("ORKA_RELIST_SECS").ok().and_then(|s| s.parse().ok()).unwrap_or(300);
+        let watch_backoff_max_secs: u64 = std::env::var("ORKA_WATCH_BACKOFF_MAX_SECS").ok().and_then(|s| s.parse().ok()).unwrap_or(30);
         let max_labels_per_obj = std::env::var("ORKA_MAX_LABELS_PER_OBJ").ok().and_then(|s| s.parse().ok());
         let max_annos_per_obj = std::env::var("ORKA_MAX_ANNOS_PER_OBJ").ok().and_then(|s| s.parse().ok());
         let max_postings_per_key = std::env::var("ORKA_MAX_POSTINGS_PER_KEY").ok().and_then(|s| s.parse().ok());
         let max_rss_mb = std::env::var("ORKA_MAX_RSS_MB").ok().and_then(|s| s.parse().ok());
         let max_index_bytes = std::env::var("ORKA_MAX_INDEX_BYTES").ok().and_then(|s| s.parse().ok());
         let metrics_addr = std::env::var("ORKA_METRICS_ADDR").ok();
-        let stats = Stats { shards, relist_secs, watch_backoff_max_secs, max_labels_per_obj, max_annos_per_obj, max_postings_per_key, max_rss_mb, max_index_bytes, metrics_addr };
+        let (snap_b, watch_b) = orka_kubehub::traffic_bytes();
+        let details_b = TRAFFIC_DETAILS_BYTES.load(Ordering::Relaxed);
+        let stats = Stats {
+            shards,
+            relist_secs,
+            watch_backoff_max_secs,
+            max_labels_per_obj,
+            max_annos_per_obj,
+            max_postings_per_key,
+            max_rss_mb,
+            max_index_bytes,
+            metrics_addr,
+            traffic_snapshot_bytes: Some(snap_b),
+            traffic_watch_bytes: Some(watch_b),
+            traffic_details_bytes: Some(details_b),
+        };
         info!(took_ms = %t0.elapsed().as_millis(), "api: stats ready");
         Ok(stats)
     }
@@ -463,7 +521,7 @@ impl OrkaApi for InProcApi {
             let watch_task = tokio::spawn({
                 async move {
                     // We already have ApiResource; reuse to avoid discovery cost
-                    let client = kube::Client::try_default().await.expect("client");
+                    let client = match get_kube_client().await { Ok(c) => c, Err(_) => kube::Client::try_default().await.expect("client") };
                     let _ = orka_kubehub::start_watcher_lite_with(client, ar, namespaced, ns.as_deref(), tx_internal).await;
                 }
             });
@@ -505,7 +563,7 @@ impl OrkaApi for InProcApi {
         let t0 = Instant::now();
         info!(gvk = %gvk_key, name = %name, ns = %namespace.unwrap_or("-"), limit = ?limit, "api: last_applied start");
         // Resolve UID via live object fetch
-        let client = kube::Client::try_default().await.map_err(|e| OrkaError::Internal(e.to_string()))?;
+        let client = get_kube_client().await.map_err(|e| e)?;
         // Parse GVK key -> GroupVersionKind
         let parts: Vec<&str> = gvk_key.split('/').collect();
         let gvk = match parts.as_slice() {

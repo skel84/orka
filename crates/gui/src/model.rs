@@ -18,7 +18,7 @@ pub enum UiUpdate {
     Snapshot(Vec<LiteObj>),
     Event(LiteEvent),
     Error(String),
-    Detail(String),
+    Detail { uid: Uid, text: String, containers: Option<Vec<String>>, produced_at: Instant },
     DetailError(String),
     Namespaces(Vec<String>),
     Epoch(u64),
@@ -131,6 +131,7 @@ pub struct DetailsState {
     pub buffer: String,
     pub task: Option<JoinHandle<()>>,
     pub stop: Option<tokio::sync::oneshot::Sender<()>>,
+    pub selected_at: Option<Instant>,
 }
 
 #[derive(Default)]
@@ -215,6 +216,7 @@ pub struct WatchState {
     pub prewarm_started: bool,
     pub select_t0: Option<Instant>,
     pub ttfr_logged: bool,
+    pub ns_task: Option<JoinHandle<()>>,
 }
 
 // --------- Toasts ---------

@@ -8,9 +8,10 @@ use eframe::egui;
 #[cfg(feature = "dock")]
 use egui_dock as dock;
 use orka_api::{LiteEvent, OrkaApi, ResourceKind, Selector};
-use orka_core::LiteObj;
+use orka_core::{LiteObj, Uid};
 use orka_core::columns::{ColumnKind, ColumnSpec};
 use tracing::info;
+use metrics::{counter, histogram};
 use tokio::sync::Semaphore;
 
 mod util;
@@ -68,6 +69,15 @@ pub struct OrkaGuiApp {
     toasts: Vec<model::Toast>,
     // Stats modal/state
     stats: StatsState,
+    // Details cache (YAML + containers), TTL and cap
+    details_cache: HashMap<Uid, (Arc<String>, Option<Vec<String>>, Instant)>,
+    details_ttl_secs: u64,
+    details_cache_cap: usize,
+    // Adaptive idle repaint cadence
+    idle_repaint_fast_ms: u64,
+    idle_repaint_slow_ms: u64,
+    idle_fast_window_ms: u64,
+    last_activity: Option<Instant>,
 }
 
 impl OrkaGuiApp {
@@ -116,8 +126,8 @@ impl OrkaGuiApp {
                 filter: String::new(),
                 epoch: None,
             },
-            watch: WatchState { updates_rx: None, updates_tx: None, task: None, stop: None, loaded_idx: None, loaded_gvk_key: None, loaded_ns: None, prewarm_started: false, select_t0: None, ttfr_logged: false },
-            details: DetailsState { selected: None, buffer: String::new(), task: None, stop: None },
+            watch: WatchState { updates_rx: None, updates_tx: None, task: None, stop: None, loaded_idx: None, loaded_gvk_key: None, loaded_ns: None, prewarm_started: false, select_t0: None, ttfr_logged: false, ns_task: None },
+            details: DetailsState { selected: None, buffer: String::new(), task: None, stop: None, selected_at: None },
             logs: {
                 let cap = std::env::var("ORKA_LOGS_BACKLOG_CAP").ok().and_then(|s| s.parse().ok()).unwrap_or(2000);
                 LogsState { running: false, follow: true, grep: String::new(), backlog: std::collections::VecDeque::with_capacity(cap.min(256)), backlog_cap: cap, dropped: 0, recv: 0, containers: Vec::new(), container: None, tail_lines: None, since_seconds: None, task: None, cancel: None }
@@ -175,6 +185,13 @@ impl OrkaGuiApp {
                 let err_pct = std::env::var("ORKA_ERR_PCT").ok().and_then(|s| s.parse::<f32>().ok()).unwrap_or(0.95);
                 StatsState { open: false, loading: false, last_error: None, data: None, task: None, last_fetched: None, refresh_open_ms: open_ms, refresh_closed_ms: closed_ms, warn_pct, err_pct, index_bytes: None, index_docs: None }
             },
+            details_cache: HashMap::new(),
+            details_ttl_secs: std::env::var("ORKA_DETAILS_TTL_SECS").ok().and_then(|s| s.parse::<u64>().ok()).unwrap_or(60),
+            details_cache_cap: std::env::var("ORKA_DETAILS_CACHE_CAP").ok().and_then(|s| s.parse::<usize>().ok()).unwrap_or(128),
+            idle_repaint_fast_ms: std::env::var("ORKA_IDLE_FAST_MS").ok().and_then(|s| s.parse::<u64>().ok()).unwrap_or(8),
+            idle_repaint_slow_ms: std::env::var("ORKA_IDLE_SLOW_MS").ok().and_then(|s| s.parse::<u64>().ok()).unwrap_or(120),
+            idle_fast_window_ms: std::env::var("ORKA_IDLE_FAST_WINDOW_MS").ok().and_then(|s| s.parse::<u64>().ok()).unwrap_or(1000),
+            last_activity: None,
         };
         // Start prewarm watchers for curated built-ins immediately (without waiting for discovery)
         if !this.watch.prewarm_started {
@@ -444,17 +461,20 @@ impl eframe::App for OrkaGuiApp {
                         saw_batch = true;
                     }
                     Ok(UiUpdate::Event(LiteEvent::Applied(lo))) => {
-                        if let Some(idx) = self.results.index.get(&lo.uid).copied() {
+                        let uid = lo.uid;
+                        if let Some(idx) = self.results.index.get(&uid).copied() {
                             self.results.filter_cache.insert(lo.uid, self.build_filter_haystack(&lo));
                             self.results.display_cache.insert(lo.uid, self.build_display_row(&lo));
                             self.results.rows[idx] = lo;
                         } else {
                             let idx = self.results.rows.len();
-                            self.results.index.insert(lo.uid, idx);
-                            self.results.filter_cache.insert(lo.uid, self.build_filter_haystack(&lo));
-                            self.results.display_cache.insert(lo.uid, self.build_display_row(&lo));
+                            self.results.index.insert(uid, idx);
+                            self.results.filter_cache.insert(uid, self.build_filter_haystack(&lo));
+                            self.results.display_cache.insert(uid, self.build_display_row(&lo));
                             self.results.rows.push(lo);
                         }
+                        // Invalidate details cache on object change
+                        let _ = self.details_cache.remove(&uid);
                         // Don't log every event to avoid spam; tiny heartbeat below
                         self.results.sort_dirty = true;
                         processed += 1;
@@ -472,6 +492,8 @@ impl eframe::App for OrkaGuiApp {
                             self.results.filter_cache.remove(&lo.uid);
                             self.results.display_cache.remove(&lo.uid);
                         }
+                        // Invalidate details cache on delete
+                        let _ = self.details_cache.remove(&lo.uid);
                         self.results.sort_dirty = true;
                         processed += 1;
                     }
@@ -483,15 +505,34 @@ impl eframe::App for OrkaGuiApp {
                         pending_toasts.push((self.log.clone(), ToastKind::Error));
                         processed += 1;
                     }
-                    Ok(UiUpdate::Detail(text)) => {
+                    Ok(UiUpdate::Detail { uid, text, containers, produced_at }) => {
                         info!(chars = text.len(), "ui: details ready");
-                        self.details.buffer = text;
+                        self.details.buffer = text.clone();
+                        if let Some(t0) = self.details.selected_at.take() {
+                            let ms = t0.elapsed().as_millis();
+                            info!(ttfd_ms = %ms, "metric: time_to_first_details_ms");
+                        }
+                        let queue_ms = produced_at.elapsed().as_millis();
+                        info!(details_queue_ms = %queue_ms, "ui: details update queue time");
+                        // Cache details (bounded by cap)
+                        if self.details_cache.len() >= self.details_cache_cap { self.details_cache.clear(); }
+                        self.details_cache.insert(uid, (Arc::new(text), containers.clone(), Instant::now()));
                         // Initialize Edit buffer from details
                         self.edit.original = self.details.buffer.clone();
                         self.edit.buffer = self.details.buffer.clone();
                         self.edit.dirty = false;
                         self.edit.status.clear();
+                        // Apply containers if present (pod)
+                        if let Some(list) = containers {
+                            self.logs.containers = list.clone();
+                            if let Some(cur) = &self.logs.container {
+                                if !self.logs.containers.iter().any(|c| c == cur) { self.logs.container = self.logs.containers.get(0).cloned(); }
+                            } else { self.logs.container = self.logs.containers.get(0).cloned(); }
+                        }
                         processed += 1;
+                        // Force immediate flush/repaint for details
+                        saw_batch = true;
+                        ctx.request_repaint();
                     }
                     Ok(UiUpdate::PodContainers(list)) => {
                         info!(count = list.len(), "ui: pod containers ready");
@@ -653,12 +694,18 @@ impl eframe::App for OrkaGuiApp {
             }
             // Debounce repaint: flush on batch marker, size threshold, or elapsed time
             if processed > 0 {
+                // Mark activity to keep fast repaint cadence for a short window
+                self.last_activity = Some(Instant::now());
                 self.ui_debounce.pending_count += processed;
                 if self.ui_debounce.pending_since.is_none() { self.ui_debounce.pending_since = Some(Instant::now()); }
                 let elapsed_ms = self.ui_debounce.pending_since.map(|t| t.elapsed().as_millis() as u64).unwrap_or(0);
                 let should_flush = saw_batch || self.ui_debounce.pending_count >= 256 || elapsed_ms >= self.ui_debounce.ms;
                 if should_flush {
-                    info!(processed = self.ui_debounce.pending_count, total = self.results.rows.len(), "ui: flushed updates");
+                    let processed_now = self.ui_debounce.pending_count as u64;
+                    info!(processed = processed_now, total = self.results.rows.len(), "ui: flushed updates");
+                    // Metrics: per-flush processed count and debounce window
+                    counter!("ui_updates_processed_per_frame", processed_now);
+                    histogram!("ui_debounce_flush_ms", elapsed_ms as f64);
                     ctx.request_repaint();
                     self.ui_debounce.pending_count = 0;
                     self.ui_debounce.pending_since = None;
@@ -666,9 +713,14 @@ impl eframe::App for OrkaGuiApp {
             }
         }
 
-        // Periodic repaint to refresh Age column text
+        // Periodic repaint: refresh Age and bound queue latency with adaptive cadence
         if !self.results.rows.is_empty() || self.logs.running {
-            ctx.request_repaint_after(std::time::Duration::from_secs(1));
+            let fast = match self.last_activity {
+                Some(t) => (t.elapsed().as_millis() as u64) <= self.idle_fast_window_ms,
+                None => false,
+            };
+            let ms = if fast { self.idle_repaint_fast_ms } else { self.idle_repaint_slow_ms };
+            ctx.request_repaint_after(std::time::Duration::from_millis(ms));
         }
 
         // Global keybinding: Cmd-K / Ctrl-K opens palette

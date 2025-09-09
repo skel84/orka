@@ -24,3 +24,4 @@ smallvec = { workspace = true }
 orka-persist = { path = "../persist" }
 uuid = { workspace = true }
 tracing = { workspace = true }
+metrics = { workspace = true }

@@ -56,7 +56,33 @@ impl OrkaGuiApp {
         let (stop_tx, mut stop_rx) = tokio::sync::oneshot::channel::<()>();
         let k_cloned = k.clone();
         let ns_cloned = ns_opt.clone();
-        let should_fetch_namespaces = self.namespaces.is_empty();
+        // Start/refresh namespaces watcher subscription (single handle)
+        if let Some(h) = self.watch.ns_task.take() { h.abort(); }
+        {
+            let ns_tx = tx.clone();
+            let ns_api = self.api.clone();
+            let handle = tokio::spawn(async move {
+                let key_ns = "v1/Namespace|".to_string();
+                let ns_kind = ResourceKind { group: String::new(), version: "v1".into(), kind: "Namespace".into(), namespaced: false };
+                let sel = Selector { gvk: ns_kind, namespace: None };
+                match watch_hub_subscribe(ns_api.clone(), sel).await {
+                    Ok(mut rx) => {
+                        let mut last_sent: usize = 0;
+                        let mut send_list = || {
+                            let mut list: Vec<String> = watch_hub_snapshot(&key_ns).into_iter().map(|o| o.name).collect();
+                            list.sort();
+                            list.dedup();
+                            let len = list.len();
+                            if len != last_sent { let _ = ns_tx.send(UiUpdate::Namespaces(list)); last_sent = len; }
+                        };
+                        send_list();
+                        while let Ok(_) = rx.recv().await { send_list(); }
+                    }
+                    Err(_e) => { /* no-op; next selection will retry */ }
+                }
+            });
+            self.watch.ns_task = Some(handle);
+        }
         info!(gvk = %label, ns = %ns_cloned.as_deref().unwrap_or("(all)"), "watch: starting snapshot + watch");
         let task = tokio::spawn(async move {
             let load_t0 = Instant::now();
@@ -137,27 +163,7 @@ impl OrkaGuiApp {
                     }
                 }
             });
-            // Fetch namespaces list once (best-effort) if not already loaded
-            let ns_tx = tx.clone();
-            let ns_api = api.clone();
-            if should_fetch_namespaces {
-                tokio::spawn(async move {
-                    let t0 = Instant::now();
-                    info!("namespaces: fetch start");
-                    let ns_kind = ResourceKind { group: String::new(), version: "v1".into(), kind: "Namespace".into(), namespaced: false };
-                    let sel = Selector { gvk: ns_kind, namespace: None };
-                    match ns_api.snapshot(sel).await {
-                        Ok(resp) => {
-                            let mut list: Vec<String> = resp.data.items.into_iter().map(|o| o.name).collect();
-                            list.sort();
-                            list.dedup();
-                            info!(namespaces = list.len(), took_ms = %t0.elapsed().as_millis(), "namespaces: fetch ok");
-                            let _ = ns_tx.send(UiUpdate::Namespaces(list));
-                        }
-                        Err(e) => { info!(error = %e, took_ms = %t0.elapsed().as_millis(), "namespaces: fetch failed"); }
-                    }
-                });
-            }
+            // namespaces watcher is handled outside this task
             let _ = watch_fut.await;
             info!(took_ms = %load_t0.elapsed().as_millis(), "watch: stopped or stream ended");
         });

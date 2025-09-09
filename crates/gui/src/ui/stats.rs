@@ -45,6 +45,21 @@ pub(crate) fn ui_stats_modal(app: &mut OrkaGuiApp, ctx: &egui::Context) {
                     ui.separator();
                 }
 
+                ui.heading("Traffic (since start)");
+                ui.separator();
+                if let Some(s) = &app.stats.data {
+                    if let (Some(a), Some(b), Some(c)) = (s.traffic_snapshot_bytes, s.traffic_watch_bytes, s.traffic_details_bytes) {
+                        grid_kv(ui, "Snapshot bytes", &fmt_bytes(a));
+                        grid_kv(ui, "Watch bytes", &fmt_bytes(b));
+                        grid_kv(ui, "Details bytes", &fmt_bytes(c));
+                    } else {
+                        grid_kv(ui, "Snapshot bytes", "(n/a)");
+                        grid_kv(ui, "Watch bytes", "(n/a)");
+                        grid_kv(ui, "Details bytes", "(n/a)");
+                    }
+                    ui.separator();
+                }
+
                 ui.heading("UI Pressure");
                 ui.separator();
                 // Minimal local counters
@@ -105,4 +120,15 @@ fn grid_threshold(ui: &mut egui::Ui, k: &str, max: u64, cur_opt: Option<u64>, wa
         }
         None => grid_kv(ui, k, &format!("max {} (current n/a)", max)),
     }
+}
+
+fn fmt_bytes(v: u64) -> String {
+    const KB: f64 = 1024.0;
+    const MB: f64 = KB * 1024.0;
+    const GB: f64 = MB * 1024.0;
+    let f = v as f64;
+    if f >= GB { format!("{:.2} GiB", f / GB) }
+    else if f >= MB { format!("{:.2} MiB", f / MB) }
+    else if f >= KB { format!("{:.2} KiB", f / KB) }
+    else { format!("{} B", v) }
 }

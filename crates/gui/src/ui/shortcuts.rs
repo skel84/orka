@@ -37,9 +37,8 @@ pub(crate) fn handle_global_shortcuts(app: &mut OrkaGuiApp, ctx: &egui::Context)
     // Esc -> cancel active fetches (search/details/logs)
     if ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
         // Close overlays first
-        let mut handled = false;
-        if app.palette.open { app.palette.open = false; handled = true; }
-        if app.stats.open { app.stats.open = false; handled = true; }
+        if app.palette.open { app.palette.open = false; }
+        if app.stats.open { app.stats.open = false; }
         // Clear search overlay if populated
         if !app.search.query.is_empty() || !app.search.hits.is_empty() || !app.search.preview.is_empty() {
             app.search.query.clear();
@@ -48,14 +47,13 @@ pub(crate) fn handle_global_shortcuts(app: &mut OrkaGuiApp, ctx: &egui::Context)
             app.search.partial = false;
             app.search.preview.clear();
             app.search.preview_sel = None;
-            handled = true;
         }
         // Cancel search task
-        if app.search.task.is_some() { if let Some(stop) = app.search.stop.take() { let _ = stop.send(()); } app.search.task = None; app.toast("search: canceled", ToastKind::Info); handled = true; }
+        if app.search.task.is_some() { if let Some(stop) = app.search.stop.take() { let _ = stop.send(()); } app.search.task = None; app.toast("search: canceled", ToastKind::Info); }
         // Cancel details fetch
-        if let Some(stop) = app.details.stop.take() { let _ = stop.send(()); app.toast("details: canceled", ToastKind::Info); handled = true; }
+        if let Some(stop) = app.details.stop.take() { let _ = stop.send(()); app.toast("details: canceled", ToastKind::Info); }
         // Stop logs if running
-        if app.logs.running { app.stop_logs_task(); app.toast("logs: stopped", ToastKind::Info); handled = true; }
+        if app.logs.running { app.stop_logs_task(); app.toast("logs: stopped", ToastKind::Info); }
         // Do not exit the app on Esc — only close/cancel overlays/tasks.
     }
 }

@@ -3,6 +3,7 @@
 use eframe::egui;
 use std::time::Instant;
 use tracing::info;
+use metrics::histogram;
 
 use orka_api::ResourceRef;
 use orka_core::LiteObj;
@@ -218,7 +219,9 @@ impl OrkaGuiApp {
 
     pub(crate) fn select_row(&mut self, it: LiteObj) {
         info!(uid = ?it.uid, name = %it.name, ns = %it.namespace.as_deref().unwrap_or("-"), "details: selecting row");
-        self.details.selected = Some(it.uid);
+        let uid = it.uid;
+        self.details.selected = Some(uid);
+        self.details.selected_at = Some(Instant::now());
         self.details.buffer.clear();
         // Clear pod-specific logs metadata on selection change
         self.logs.containers.clear();
@@ -228,6 +231,20 @@ impl OrkaGuiApp {
             info!("details: cancelling previous task");
             let _ = stop.send(());
         }
+        // If details are cached and fresh, render immediately and skip fetch
+        let now = Instant::now();
+        if let Some((arc_text, maybe_cont, ts)) = self.details_cache.get(&uid).cloned() {
+            if now.duration_since(ts).as_secs() <= self.details_ttl_secs {
+                if let Some(tx) = self.watch.updates_tx.as_ref() {
+                    let _ = tx.send(UiUpdate::Detail { uid, text: (*arc_text).clone(), containers: maybe_cont.clone(), produced_at: Instant::now() });
+                }
+                return;
+            } else {
+                // expired
+                self.details_cache.remove(&uid);
+            }
+        }
+
         // need current kind (support both curated index selection and direct GVK selection)
         let Some(kind) = self.current_selected_kind().cloned() else { return; };
         // build reference
@@ -236,17 +253,24 @@ impl OrkaGuiApp {
         let tx_opt = self.watch.updates_tx.clone();
         let (stop_tx, mut stop_rx) = tokio::sync::oneshot::channel::<()>();
         self.details.stop = Some(stop_tx);
-        // spawn fetch task
+        // spawn fetch task (debounced)
+        let prefetch_ms: u64 = std::env::var("ORKA_DETAILS_PREFETCH_MS").ok().and_then(|s| s.parse::<u64>().ok()).unwrap_or(0);
         self.details.task = Some(tokio::spawn(async move {
             let t0 = Instant::now();
             info!(gvk = %gvk_label(&reference.gvk), name = %reference.name, ns = %reference.namespace.as_deref().unwrap_or("-"), "details: fetch start");
             let fetch = async {
+                // small debounce to avoid thrashing on rapid selection changes
+                tokio::time::sleep(std::time::Duration::from_millis(prefetch_ms)).await;
                 match api.get_raw(reference).await {
                     Ok(bytes) => {
                         // Parse JSON (if possible) both for YAML rendering and for extracting pod containers
+                        let p0 = Instant::now();
                         let (text, containers): (String, Option<Vec<String>>) = match serde_json::from_slice::<serde_json::Value>(&bytes) {
                             Ok(v) => {
+                                let parse_ms = p0.elapsed().as_millis() as f64;
+                                histogram!("details_json_parse_ms", parse_ms);
                                 // Extract pod containers if applicable
+                                let e0 = Instant::now();
                                 let mut names: Vec<String> = Vec::new();
                                 if v.get("kind").and_then(|k| k.as_str()).unwrap_or("") == "Pod" {
                                     if let Some(spec) = v.get("spec") {
@@ -261,16 +285,22 @@ impl OrkaGuiApp {
                                         }
                                     }
                                 }
+                                let extract_ms = e0.elapsed().as_millis() as f64;
+                                histogram!("details_containers_extract_ms", extract_ms);
                                 let mut uniq = std::collections::BTreeSet::new();
                                 let dedup: Vec<String> = names.into_iter().filter(|n| uniq.insert(n.clone())).collect();
+                                let y0 = Instant::now();
                                 let y = match serde_yaml::to_string(&v) { Ok(y) => y, Err(_) => String::from_utf8_lossy(&bytes).into_owned() };
+                                let yaml_ms = y0.elapsed().as_millis() as f64;
+                                histogram!("details_yaml_serialize_ms", yaml_ms);
+                                info!(parse_ms, extract_ms, yaml_ms, "details: json→yaml timings");
                                 (y, if dedup.is_empty() { None } else { Some(dedup) })
                             }
                             Err(_) => (String::from_utf8_lossy(&bytes).into_owned(), None),
                         };
                         info!(size = bytes.len(), took_ms = %t0.elapsed().as_millis(), "details: fetch ok");
                         if let Some(tx) = tx_opt.as_ref() {
-                            let _ = tx.send(UiUpdate::Detail(text));
+                            let _ = tx.send(UiUpdate::Detail { uid, text, containers: containers.clone(), produced_at: Instant::now() });
                             if let Some(v) = containers { let _ = tx.send(UiUpdate::PodContainers(v)); }
                         }
                     }

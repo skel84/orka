@@ -6,12 +6,19 @@ use std::sync::Arc;
 use once_cell::sync::Lazy;
 use std::sync::Mutex;
 use std::collections::HashMap;
+use metrics::{counter, histogram};
 
 static SYNTAX_SET: Lazy<syntect::parsing::SyntaxSet> = Lazy::new(|| syntect::parsing::SyntaxSet::load_defaults_newlines());
 static THEME_SET: Lazy<syntect::highlighting::ThemeSet> = Lazy::new(|| syntect::highlighting::ThemeSet::load_defaults());
 
 // Very small memoization to avoid rebuilding on identical text/theme pairs
 static LRU: Lazy<Mutex<HashMap<u64, Arc<egui::Galley>>>> = Lazy::new(|| Mutex::new(HashMap::new()));
+static LAYOUT_CAP: Lazy<usize> = Lazy::new(|| {
+    std::env::var("ORKA_YAML_LAYOUT_CACHE_CAP")
+        .ok()
+        .and_then(|s| s.parse::<usize>().ok())
+        .unwrap_or(128)
+});
 
 fn to_color32(c: syntect::highlighting::Color) -> Color32 {
     Color32::from_rgba_unmultiplied(c.r, c.g, c.b, c.a)
@@ -34,8 +41,10 @@ pub fn yaml_layouter() -> impl FnMut(&egui::Ui, &dyn egui::TextBuffer, f32) -> A
         let s = text.as_str();
         let key = hash_key(s, dark, wrap_width);
         if let Some(job) = LRU.lock().ok().and_then(|m| m.get(&key).cloned()) {
+            counter!("yaml_layout_cache_hit", 1u64);
             return job;
         }
+        counter!("yaml_layout_cache_miss", 1u64);
         let syn = SYNTAX_SET
             .find_syntax_by_extension("yaml")
             .or_else(|| SYNTAX_SET.find_syntax_by_extension("yml"))
@@ -44,6 +53,7 @@ pub fn yaml_layouter() -> impl FnMut(&egui::Ui, &dyn egui::TextBuffer, f32) -> A
         let theme_name = if dark { "Solarized (dark)" } else { "Solarized (light)" };
         let theme = THEME_SET.themes.get(theme_name).or_else(|| THEME_SET.themes.get("base16-ocean.dark")).or_else(|| THEME_SET.themes.get("InspiredGitHub"));
         let theme = theme.unwrap_or_else(|| THEME_SET.themes.values().next().unwrap());
+        let t0 = std::time::Instant::now();
         let mut h = syntect::easy::HighlightLines::new(syn, theme);
         let mut job = LayoutJob::default();
         job.wrap.max_width = wrap_width;
@@ -59,8 +69,10 @@ pub fn yaml_layouter() -> impl FnMut(&egui::Ui, &dyn egui::TextBuffer, f32) -> A
             if line.ends_with('\n') { job.append("\n", 0.0, TextFormat { font_id: mono.clone(), color: ui.visuals().text_color(), ..Default::default() }); }
         }
         let galley = ui.fonts(|f| f.layout_job(job));
+        let took_ms = t0.elapsed().as_millis() as f64;
+        histogram!("yaml_layout_build_ms", took_ms);
         if let Ok(mut m) = LRU.lock() {
-            if m.len() > 64 { m.clear(); }
+            if m.len() > *LAYOUT_CAP { m.clear(); }
             m.insert(key, galley.clone());
         }
         galley
