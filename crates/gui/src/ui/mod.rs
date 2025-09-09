@@ -7,3 +7,4 @@ pub mod actions;
 pub mod toasts;
 pub mod stats;
 pub mod shortcuts;
+pub mod term;

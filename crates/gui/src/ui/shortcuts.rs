@@ -54,6 +54,8 @@ pub(crate) fn handle_global_shortcuts(app: &mut OrkaGuiApp, ctx: &egui::Context)
         if let Some(stop) = app.details.stop.take() { let _ = stop.send(()); app.toast("details: canceled", ToastKind::Info); }
         // Stop logs if running
         if app.logs.running { app.stop_logs_task(); app.toast("logs: stopped", ToastKind::Info); }
+        // Stop exec if running
+        if app.exec.running { app.stop_exec_task(); app.toast("exec: stopped", ToastKind::Info); }
         // Do not exit the app on Esc — only close/cancel overlays/tasks.
     }
 }

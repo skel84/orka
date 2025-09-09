@@ -249,7 +249,34 @@ impl OrkaGuiApp {
             describe: DescribeState { running: false, text: String::new(), error: None, uid: None, task: None, stop: None },
             exec: {
                 let cap = std::env::var("ORKA_EXEC_BACKLOG_CAP").ok().and_then(|s| s.parse().ok()).unwrap_or(4000);
-                ExecState { running: false, pty: true, cmd: "/bin/sh".into(), container: None, backlog: std::collections::VecDeque::with_capacity(cap.min(256)), backlog_cap: cap, dropped: 0, recv: 0, stdin_buf: String::new(), task: None, cancel: None, input: None, resize: None }
+                ExecState {
+                    running: false,
+                    pty: true,
+                    cmd: "/bin/sh".into(),
+                    container: None,
+                    backlog: std::collections::VecDeque::with_capacity(cap.min(256)),
+                    backlog_cap: cap,
+                    dropped: 0,
+                    recv: 0,
+                    stdin_buf: String::new(),
+                    task: None,
+                    cancel: None,
+                    input: None,
+                    resize: None,
+                    last_cols: None,
+                    last_rows: None,
+                    term: None,
+                    focused: false,
+                    mode_oneshot: true,
+                    external_cmd: {
+                        #[cfg(target_os = "macos")]
+                        { "iTerm".to_string() }
+                        #[cfg(all(unix, not(target_os = "macos")))]
+                        { "alacritty".to_string() }
+                        #[cfg(target_os = "windows")]
+                        { "wt.exe".to_string() }
+                    },
+                }
             },
             logs: {
                 let cap_legacy = std::env::var("ORKA_LOGS_BACKLOG_CAP").ok().and_then(|s| s.parse().ok()).unwrap_or(2000);
@@ -952,6 +979,7 @@ impl eframe::App for OrkaGuiApp {
                     }
                     Ok(UiUpdate::ExecData(s)) => {
                         self.exec.recv += 1;
+                        if let Some(t) = self.exec.term.as_mut() { t.feed_bytes(s.as_bytes()); }
                         if self.exec.backlog.len() >= self.exec.backlog_cap { self.exec.backlog.pop_front(); self.exec.dropped += 1; }
                         self.exec.backlog.push_back(s);
                         processed += 1;
@@ -972,6 +1000,7 @@ impl eframe::App for OrkaGuiApp {
                         self.exec.cancel = None;
                         self.exec.input = None;
                         self.exec.resize = None;
+                        self.exec.focused = false;
                         pending_toasts.push(("exec: ended".to_string(), ToastKind::Info));
                         processed += 1;
                     }

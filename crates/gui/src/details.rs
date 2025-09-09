@@ -407,10 +407,12 @@ impl OrkaGuiApp {
     fn ui_exec(&mut self, ui: &mut egui::Ui) {
         if !self.selected_is_pod() { return; }
         egui::CollapsingHeader::new("Exec (Terminal)")
-            .default_open(false)
+            .default_open(true)
             .show(ui, |ui| {
                 // Controls
                 ui.horizontal(|ui| {
+                    ui.checkbox(&mut self.exec.mode_oneshot, "One-shot");
+                    ui.separator();
                     ui.checkbox(&mut self.exec.pty, "PTY");
                     ui.separator();
                     ui.label("Command:");
@@ -431,7 +433,11 @@ impl OrkaGuiApp {
                         if selected != current { self.exec.container = Some(selected); if self.exec.running && changed_container { self.stop_exec_task(); } }
                     }
                     if !self.exec.running {
-                        if ui.button("Start").clicked() { self.start_exec_task(); }
+                        if self.exec.mode_oneshot {
+                            if ui.button("Run").clicked() { self.start_exec_oneshot_task(); }
+                        } else {
+                            if ui.button("Start").clicked() { self.start_exec_task(); }
+                        }
                     } else {
                         if ui.button("Stop").clicked() { self.stop_exec_task(); }
                     }
@@ -439,41 +445,114 @@ impl OrkaGuiApp {
 
                 ui.add_space(4.0);
 
-                // Output area (simple text view for now)
-                let mut display = String::new();
-                let mut shown = 0usize;
-                let max_lines: usize = 1000;
-                for line in self.exec.backlog.iter().rev() {
-                    display.push_str(line);
-                    if !line.ends_with('\n') { display.push('\n'); }
-                    shown += 1;
-                    if shown >= max_lines { break; }
+                // Output area: use UiTerminal and compute rows/cols for PTY resize
+                let mut sent_resize = false;
+                if self.exec.mode_oneshot {
+                    // Render captured output (simple text view)
+                    let mut display = String::new();
+                    let mut shown = 0usize;
+                    let max_lines: usize = 5000;
+                    for line in self.exec.backlog.iter().rev() {
+                        display.push_str(line);
+                        if !line.ends_with('\n') { display.push('\n'); }
+                        shown += 1;
+                        if shown >= max_lines { break; }
+                    }
+                    let display = if shown == 0 { String::new() } else { display.lines().rev().collect::<Vec<_>>().join("\n") };
+                    let mut binding = display;
+                    let te = egui::TextEdit::multiline(&mut binding)
+                        .font(egui::TextStyle::Monospace)
+                        .desired_rows(20)
+                        .desired_width(f32::INFINITY)
+                        .interactive(false);
+                    ui.add(te);
+                } else {
+                    if self.exec.term.is_none() { self.exec.term = Some(crate::ui::term::UiTerminal::new()); }
+                    if let Some(term) = self.exec.term.as_mut() {
+                        let (cols, rows, is_focused) = term.ui(ui);
+                        // Update focus based on widget focus; allow Esc to unfocus
+                        self.exec.focused = is_focused && !ui.input(|i| i.key_pressed(egui::Key::Escape));
+                        if let Some(tx) = self.exec.resize.clone() {
+                            if self.exec.last_cols != Some(cols) || self.exec.last_rows != Some(rows) {
+                                let _ = tx.try_send((cols, rows));
+                                self.exec.last_cols = Some(cols);
+                                self.exec.last_rows = Some(rows);
+                                sent_resize = true;
+                            }
+                        }
+                    }
                 }
-                let display = if shown == 0 { String::new() } else { display.lines().rev().collect::<Vec<_>>().join("\n") };
-                let mut binding = display;
-                let te = egui::TextEdit::multiline(&mut binding)
-                    .font(egui::TextStyle::Monospace)
-                    .desired_rows(20)
-                    .desired_width(f32::INFINITY)
-                    .interactive(false);
-                ui.add(te);
 
                 ui.add_space(4.0);
 
-                // Input send line (basic)
+                // Input send line (basic) — only for interactive mode
+                if !self.exec.mode_oneshot {
+                    ui.horizontal(|ui| {
+                        let send_btn = ui.add_enabled(self.exec.running, egui::Button::new("Send"));
+                        let edit = ui.add_enabled(self.exec.running, egui::TextEdit::singleline(&mut self.exec.stdin_buf).desired_width(400.0));
+                        let want_send = send_btn.clicked() || (self.exec.running && edit.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)));
+                        if want_send {
+                            if let (Some(tx), s) = (self.exec.input.clone(), self.exec.stdin_buf.clone()) {
+                                let mut bytes = s.into_bytes(); bytes.push(b'\n');
+                                let _ = tx.try_send(bytes);
+                                self.exec.stdin_buf.clear();
+                            }
+                        }
+                    });
+                }
+                if self.exec.dropped > 0 { ui.colored_label(ui.visuals().warn_fg_color, format!("dropped: {}", self.exec.dropped)); }
+                if sent_resize { ui.colored_label(ui.visuals().weak_text_color(), "resized"); }
+                let hint = if self.exec.mode_oneshot {
+                    if self.exec.running { "running…" } else { "enter a command and click Run" }
+                } else if self.exec.running {
+                    if self.exec.focused { "typing active • Esc to release" } else { "click inside to type" }
+                } else { "press Start to open a shell" };
+                ui.colored_label(ui.visuals().weak_text_color(), hint);
+
+                ui.separator();
                 ui.horizontal(|ui| {
-                    let send_btn = ui.add_enabled(self.exec.running, egui::Button::new("Send"));
-                    let edit = ui.add_enabled(self.exec.running, egui::TextEdit::singleline(&mut self.exec.stdin_buf).desired_width(400.0));
-                    let want_send = send_btn.clicked() || (self.exec.running && edit.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)));
-                    if want_send {
-                        if let (Some(tx), s) = (self.exec.input.clone(), self.exec.stdin_buf.clone()) {
-                            let mut bytes = s.into_bytes(); bytes.push(b'\n');
-                            let _ = tx.try_send(bytes);
-                            self.exec.stdin_buf.clear();
+                    ui.label("External term:");
+                    ui.add(egui::TextEdit::singleline(&mut self.exec.external_cmd).desired_width(160.0));
+                    if ui.button("Browse…").clicked() {
+                        if let Some(path) = rfd::FileDialog::new().set_title("Choose terminal app or binary").pick_file() {
+                            self.exec.external_cmd = path.display().to_string();
                         }
                     }
+                    if ui.button("Open External").on_hover_text("Launch configured terminal with kubectl exec -it").clicked() { self.open_external_exec(); }
                 });
-                if self.exec.dropped > 0 { ui.colored_label(ui.visuals().warn_fg_color, format!("dropped: {}", self.exec.dropped)); }
+                // Key input mapping when focused
+                if self.exec.focused && self.exec.running {
+                    let mut to_send: Vec<u8> = Vec::new();
+                    ui.input(|i| {
+                        for ev in &i.events {
+                            match ev {
+                                egui::Event::Text(s) => { to_send.extend_from_slice(s.as_bytes()); }
+                                egui::Event::Key{ key, pressed: true, modifiers, .. } => {
+                                    match key {
+                                        egui::Key::Enter => to_send.push(b'\r'),
+                                        egui::Key::Tab => to_send.push(b'\t'),
+                                        egui::Key::Backspace => to_send.push(0x7f),
+                                        egui::Key::ArrowLeft => to_send.extend_from_slice(b"\x1b[D"),
+                                        egui::Key::ArrowRight => to_send.extend_from_slice(b"\x1b[C"),
+                                        egui::Key::ArrowUp => to_send.extend_from_slice(b"\x1b[A"),
+                                        egui::Key::ArrowDown => to_send.extend_from_slice(b"\x1b[B"),
+                                        egui::Key::Home => to_send.extend_from_slice(b"\x1b[H"),
+                                        egui::Key::End => to_send.extend_from_slice(b"\x1b[F"),
+                                        egui::Key::PageUp => to_send.extend_from_slice(b"\x1b[5~"),
+                                        egui::Key::PageDown => to_send.extend_from_slice(b"\x1b[6~"),
+                                        egui::Key::C if modifiers.ctrl => to_send.push(0x03),
+                                        egui::Key::Z if modifiers.ctrl => to_send.push(0x1a),
+                                        _ => {}
+                                    }
+                                }
+                                _ => {}
+                            }
+                        }
+                    });
+                    if !to_send.is_empty() {
+                        if let Some(tx) = self.exec.input.clone() { let _ = tx.try_send(to_send); }
+                    }
+                }
             });
     }
 

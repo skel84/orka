@@ -39,13 +39,17 @@ pub(crate) fn ui_actions_bar(app: &mut OrkaGuiApp, ui: &mut egui::Ui) {
 
         ui.separator();
 
-        // Exec (gated; not yet wired to a terminal UI)
-        let exec_ok = pod_sel && caps.as_ref().map(|c| c.pods_exec_create).unwrap_or(false);
-        if exec_ok {
-            if ui.button("Exec…").clicked() { info!("ui: exec click"); app.details.active_tab = crate::model::DetailsPaneTab::Exec; app.start_exec_task(); }
-        } else {
-            ui.add_enabled(false, egui::Button::new("Exec…")).on_hover_text("RBAC: pods/exec or Pod selection missing");
+    // Exec (gated; not yet wired to a terminal UI)
+    let exec_ok = pod_sel && caps.as_ref().map(|c| c.pods_exec_create).unwrap_or(false);
+    if exec_ok {
+        if ui.button("Exec…").clicked() { info!("ui: exec click"); app.details.active_tab = crate::model::DetailsPaneTab::Exec; app.start_exec_task(); }
+        if ui.button("Open in Terminal").on_hover_text("Launch external terminal (Alacritty preferred) with kubectl exec").clicked() {
+            info!("ui: exec external terminal click");
+            app.open_external_exec();
         }
+    } else {
+        ui.add_enabled(false, egui::Button::new("Exec…")).on_hover_text("RBAC: pods/exec or Pod selection missing");
+    }
 
         ui.separator();
 

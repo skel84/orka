@@ -181,6 +181,12 @@ pub struct ExecState {
     pub cancel: Option<orka_api::CancelHandle>,
     pub input: Option<tokio::sync::mpsc::Sender<Vec<u8>>>,
     pub resize: Option<tokio::sync::mpsc::Sender<(u16, u16)>>,
+    pub last_cols: Option<u16>,
+    pub last_rows: Option<u16>,
+    pub term: Option<crate::ui::term::UiTerminal>,
+    pub focused: bool,
+    pub mode_oneshot: bool,
+    pub external_cmd: String,
 }
 
 #[derive(Default)]

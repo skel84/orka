@@ -32,10 +32,15 @@ uuid = { workspace = true }
 kube = { workspace = true }
 k8s-openapi = { workspace = true }
 chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
+egui_term = { git = "https://github.com/Harzu/egui_term", branch = "main", optional = true }
+vte = "0.13"
+shell-escape = "0.1"
+rfd = "0.14"
 
 [features]
 default = ["dock"]
 dock = ["dep:egui_dock"]
 virtual_list = ["dep:egui_virtual_list"]
+term = ["dep:egui_term"]
 
 # GUI stack deps are now in [dependencies]
