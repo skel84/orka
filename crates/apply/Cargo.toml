@@ -15,4 +15,4 @@ k8s-openapi = { workspace = true }
 uuid = { workspace = true }
 orka-persist = { path = "../persist" }
 time = "0.3"
-
+orka-kubehub = { path = "../kubehub" }

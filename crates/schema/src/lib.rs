@@ -88,7 +88,7 @@ pub async fn fetch_crd_schema(gvk_key: &str) -> Result<Option<CrdSchema>> {
     use k8s_openapi::apiextensions_apiserver::pkg::apis::apiextensions::v1 as apiextv1;
     use kube::{Api, api::ListParams};
 
-    let client = Client::try_default().await?;
+    let client = orka_kubehub::get_kube_client().await?;
     // Parse key
     let parts: Vec<_> = gvk_key.split('/').collect();
     let (group, version, kind) = match parts.as_slice() {
@@ -278,7 +278,7 @@ pub mod validate {
         use k8s_openapi::apiextensions_apiserver::pkg::apis::apiextensions::v1 as apiextv1;
         use kube::{Api, api::ListParams};
 
-        let client = Client::try_default().await?;
+        let client = orka_kubehub::get_kube_client().await?;
         let parts: Vec<_> = gvk_key.split('/').collect();
         let (group, version, kind) = match parts.as_slice() {
             [version, kind] => ("", *version, *kind),

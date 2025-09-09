@@ -63,6 +63,9 @@ pub struct OrkaGuiApp {
     layout: LayoutState,
     // cached namespaces for dropdown
     namespaces: Vec<String>,
+    // kube contexts
+    contexts: Vec<String>,
+    current_context: Option<String>,
     // perf: debounce repaint requests
     ui_debounce: UiDebounce,
     // prewarm + ttfr are tracked inside watch
@@ -219,6 +222,8 @@ impl OrkaGuiApp {
             details_tabs_cap: std::env::var("ORKA_DETAILS_TABS_CAP").ok().and_then(|s| s.parse::<usize>().ok()).unwrap_or(8),
             layout: LayoutState { show_nav: true, show_details: true, show_log: true },
             namespaces: Vec::new(),
+            contexts: match orka_kubehub::list_contexts() { Ok(v) => v, Err(_) => Vec::new() },
+            current_context: match orka_kubehub::current_context() { Ok(v) => v, Err(_) => None },
             ui_debounce: UiDebounce { ms: std::env::var("ORKA_UI_DEBOUNCE_MS").ok().and_then(|s| s.parse::<u64>().ok()).unwrap_or(100), pending_count: 0, pending_since: None },
             palette: PaletteState { open: false, query: String::new(), results: Vec::new(), sel: None, changed_at: None, debounce_ms: 80, need_focus: false, width_hint: 560.0, mode_global: false, prime_task: None },
             ops: OpsState {
@@ -276,6 +281,46 @@ impl OrkaGuiApp {
             }
         }
         this
+    }
+
+    pub(crate) fn on_context_selected(&mut self, ctx_name: String) {
+        // Only act if it actually changed
+        if self.current_context.as_deref() == Some(ctx_name.as_str()) { return; }
+        self.log = format!("switching context: {}", ctx_name);
+        self.current_context = Some(ctx_name.clone());
+        // Stop any active watch task
+        if let Some(stop) = self.watch.stop.take() { let _ = stop.send(()); }
+        self.watch.task = None;
+        // Stop namespaces watcher if running
+        if let Some(h) = self.watch.ns_task.take() { let _ = h.abort(); }
+        // Reset watch hub and cached results
+        crate::watch::watch_hub_reset();
+        self.results.rows.clear();
+        self.results.index.clear();
+        self.results.filter_cache.clear();
+        self.results.display_cache.clear();
+        self.watch.loaded_idx = None;
+        self.watch.loaded_gvk_key = None;
+        self.watch.loaded_ns = None;
+        self.namespaces.clear();
+        self.selection.namespace.clear();
+        // Kick kubehub context switch
+        let name = ctx_name.clone();
+        tokio::spawn(async move { let _ = orka_kubehub::set_context(Some(name.as_str())).await; });
+        // Restart discovery
+        let (tx, rx) = std::sync::mpsc::channel::<Result<Vec<ResourceKind>, String>>();
+        let api_clone = self.api.clone();
+        let _ = tokio::spawn(async move {
+            let t0 = Instant::now();
+            let res = api_clone.discover().await.map_err(|e| e.to_string());
+            match &res {
+                Ok(v) => tracing::info!(took_ms = %t0.elapsed().as_millis(), kinds = v.len(), "discovery completed (after ctx switch)"),
+                Err(e) => tracing::info!(took_ms = %t0.elapsed().as_millis(), error = %e, "discovery failed (after ctx switch)"),
+            }
+            let _ = tx.send(res);
+        });
+        self.discovery.kinds.clear();
+        self.discovery.rx = Some(rx);
     }
 
     fn build_filter_haystack(&self, it: &LiteObj) -> String {

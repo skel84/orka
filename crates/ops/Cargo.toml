@@ -19,6 +19,7 @@ bytes = "1"
 tokio-util = { version = "0.7", features = ["io", "compat"] }
 crossterm = "0.27"
 chrono = { workspace = true }
+orka-kubehub = { path = "../kubehub" }
 
 [dev-dependencies]
 async-stream = "0.3"

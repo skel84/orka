@@ -12,6 +12,7 @@ use crate::util::gvk_label;
 struct WatchHub {
     map: Mutex<std::collections::HashMap<String, broadcast::Sender<LiteEvent>>>,
     cache: Mutex<std::collections::HashMap<String, std::collections::HashMap<Uid, LiteObj>>>,
+    tasks: Mutex<std::collections::HashMap<String, tokio::task::JoinHandle<()>>>,
 }
 
 static WATCH_HUB: OnceCell<WatchHub> = OnceCell::new();
@@ -20,6 +21,7 @@ fn watch_hub() -> &'static WatchHub {
     WATCH_HUB.get_or_init(|| WatchHub {
         map: Mutex::new(std::collections::HashMap::new()),
         cache: Mutex::new(std::collections::HashMap::new()),
+        tasks: Mutex::new(std::collections::HashMap::new()),
     })
 }
 
@@ -32,7 +34,8 @@ pub(crate) async fn watch_hub_subscribe(api: std::sync::Arc<dyn OrkaApi>, sel: S
     // Create sender and spawn underlying watcher task
     let (tx, rx) = broadcast::channel::<LiteEvent>(2048);
     watch_hub().map.lock().unwrap().insert(key.clone(), tx.clone());
-    tokio::spawn(async move {
+    let key_for_task = key.clone();
+    let handle = tokio::spawn(async move {
         match api.watch_lite(sel).await {
             Ok(mut sh) => {
                 loop {
@@ -40,13 +43,13 @@ pub(crate) async fn watch_hub_subscribe(api: std::sync::Arc<dyn OrkaApi>, sel: S
                         Some(LiteEvent::Applied(lo)) => {
                             // Update cache then broadcast
                             let mut cache = watch_hub().cache.lock().unwrap();
-                            let entry = cache.entry(key.clone()).or_insert_with(|| std::collections::HashMap::new());
+                            let entry = cache.entry(key_for_task.clone()).or_insert_with(|| std::collections::HashMap::new());
                             entry.insert(lo.uid, lo.clone());
                             let _ = tx.send(LiteEvent::Applied(lo));
                         }
                         Some(LiteEvent::Deleted(lo)) => {
                             let mut cache = watch_hub().cache.lock().unwrap();
-                            if let Some(map) = cache.get_mut(&key) { map.remove(&lo.uid); }
+                            if let Some(map) = cache.get_mut(&key_for_task) { map.remove(&lo.uid); }
                             let _ = tx.send(LiteEvent::Deleted(lo));
                         }
                         None => break,
@@ -56,6 +59,7 @@ pub(crate) async fn watch_hub_subscribe(api: std::sync::Arc<dyn OrkaApi>, sel: S
             Err(_e) => { /* keep map entry; clients may retry */ }
         }
     });
+    watch_hub().tasks.lock().unwrap().insert(key, handle);
     Ok(rx)
 }
 
@@ -88,4 +92,16 @@ pub(crate) fn watch_hub_snapshot_all() -> Vec<(String, LiteObj)> {
         }
     }
     out
+}
+
+/// Abort all underlying watcher tasks and clear hub state (used on context switch).
+pub(crate) fn watch_hub_reset() {
+    // Abort tasks
+    let mut tasks = watch_hub().tasks.lock().unwrap();
+    for (_k, h) in tasks.drain() {
+        let _ = h.abort();
+    }
+    // Clear senders and caches
+    watch_hub().map.lock().unwrap().clear();
+    watch_hub().cache.lock().unwrap().clear();
 }

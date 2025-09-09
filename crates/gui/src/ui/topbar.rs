@@ -30,37 +30,16 @@ pub(crate) fn ui_topbar(app: &mut OrkaGuiApp, ctx: &egui::Context) {
                 }
             }
             ui.separator();
-            // Namespace dropdown
-            if let Some(i) = app.selection.selected_idx {
-                if let Some(k) = app.discovery.kinds.get(i) {
-                    if k.namespaced {
-                        let current = if app.selection.namespace.is_empty() { "(all)".to_string() } else { app.selection.namespace.clone() };
-                        egui::ComboBox::from_label("Namespace")
-                            .selected_text(current)
-                            .show_ui(ui, |ui| {
-                                ui.selectable_value(&mut app.selection.namespace, String::new(), "(all)");
-                                for ns in &app.namespaces {
-                                    ui.selectable_value(&mut app.selection.namespace, ns.clone(), ns);
-                                }
-                            });
-                        ui.separator();
-                    }
-                }
-            }
-            // Kind dropdown (fallback when not using curated tree)
-            egui::ComboBox::from_label("Kind")
-                .selected_text(app.current_selected_kind().map(|k| crate::util::gvk_label(k)).unwrap_or_else(|| "(none)".into()))
+            // Kubernetes context selector (replaces Kind/Namespace selectors)
+            let current_ctx = app.current_context.clone().unwrap_or_else(|| "(default)".to_string());
+            egui::ComboBox::from_label("Context")
+                .selected_text(current_ctx)
                 .show_ui(ui, |ui| {
-                    for (i, k) in app.discovery.kinds.iter().enumerate() {
-                        let label = crate::util::gvk_label(k);
-                        let selected = app.selection.selected_idx == Some(i)
-                            || app
-                                .current_selected_kind()
-                                .map(|kk| crate::util::gvk_label(kk) == label)
-                                .unwrap_or(false);
-                        if ui.selectable_label(selected, label).clicked() {
-                            app.selection.selected_idx = Some(i);
-                            app.selection.selected_kind = None;
+                    let contexts = app.contexts.clone();
+                    for ctx_name in contexts {
+                        let selected = app.current_context.as_deref() == Some(ctx_name.as_str());
+                        if ui.selectable_label(selected, &ctx_name).clicked() {
+                            app.on_context_selected(ctx_name);
                         }
                     }
                 });

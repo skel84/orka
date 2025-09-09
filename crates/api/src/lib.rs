@@ -11,20 +11,11 @@ use std::time::Instant;
 use tracing::info;
 use std::sync::atomic::{AtomicU64, Ordering};
 use metrics::histogram;
-use tokio::sync::OnceCell;
-
-// Reuse a single kube Client across API calls to avoid costly TLS/config setup.
-static KUBE_CLIENT: OnceCell<kube::Client> = OnceCell::const_new();
-
+// Delegate kube client management to kubehub so GUI context switches are honored.
 async fn get_kube_client() -> OrkaResult<kube::Client> {
-    KUBE_CLIENT
-        .get_or_try_init(|| async {
-            kube::Client::try_default()
-                .await
-                .map_err(|e| OrkaError::Internal(e.to_string()))
-        })
+    orka_kubehub::get_kube_client()
         .await
-        .map(|c| c.clone())
+        .map_err(|e| OrkaError::Internal(e.to_string()))
 }
 
 pub use orka_ops::OrkaOps; // Re-export imperative ops trait
@@ -540,7 +531,7 @@ impl OrkaApi for InProcApi {
             let watch_task = tokio::spawn({
                 async move {
                     // We already have ApiResource; reuse to avoid discovery cost
-                    let client = match get_kube_client().await { Ok(c) => c, Err(_) => kube::Client::try_default().await.expect("client") };
+                    let client = match get_kube_client().await { Ok(c) => c, Err(_) => { return; } };
                     let _ = orka_kubehub::start_watcher_lite_with(client, ar, namespaced, ns.as_deref(), tx_internal).await;
                 }
             });

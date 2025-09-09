@@ -38,7 +38,7 @@ pub async fn edit_from_yaml(
         // We do not wire jsonschema here to avoid heavy deps in this crate. CLI will call into orka_schema feature if enabled.
     }
 
-    let client = Client::try_default().await?;
+    let client = orka_kubehub::get_kube_client().await?;
     let (ar, namespaced) = find_api_resource(client.clone(), &gvk).await?;
     let api: Api<DynamicObject> = if namespaced {
         match ns.as_deref() {
@@ -124,7 +124,7 @@ pub async fn edit_from_yaml(
 
 pub async fn diff_from_yaml(yaml: &str, ns_override: Option<&str>) -> Result<(DiffSummary, Option<DiffSummary>)> {
     let (json, gvk, name, ns) = parse_yaml_for_target(yaml, ns_override)?;
-    let client = Client::try_default().await?;
+    let client = orka_kubehub::get_kube_client().await?;
     let (ar, namespaced) = find_api_resource(client.clone(), &gvk).await?;
     let api: Api<DynamicObject> = if namespaced {
         match ns.as_deref() {

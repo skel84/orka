@@ -114,7 +114,7 @@ impl KubeOps {
     /// Discover imperative ops capabilities (subresources + RBAC) for current user.
     /// If `scale_gvk` is provided (e.g. "apps/v1/Deployment"), also probes Scale subresource.
     pub async fn discover_caps(namespace: Option<&str>, scale_gvk: Option<&str>) -> Result<OpsCaps> {
-        let client = Client::try_default().await?;
+        let client = orka_kubehub::get_kube_client().await?;
         let ns_owned = namespace.map(|s| s.to_string());
         // Pods subresources (namespace-scoped)
         let pods_log_get = KubeOps::ssar_check(client.clone(), namespace, "", "pods", Some("log"), "get").await.unwrap_or(false);
@@ -163,7 +163,7 @@ impl OrkaOps for KubeOps {
     async fn logs(&self, namespace: Option<&str>, pod: &str, container: Option<&str>, opts: LogOptions) -> Result<StreamHandle<LogChunk>> {
         use k8s_openapi::api::core::v1::Pod;
 
-        let client = Client::try_default().await?;
+        let client = orka_kubehub::get_kube_client().await?;
         let api: Api<Pod> = match namespace {
             Some(ns) => Api::namespaced(client, ns),
             None => return Err(anyhow!("namespace is required for pod logs")),
@@ -211,7 +211,7 @@ impl OrkaOps for KubeOps {
         impl Drop for RawGuard { fn drop(&mut self) { let _ = crossterm::terminal::disable_raw_mode(); } }
 
         let ns = namespace.ok_or_else(|| anyhow!("namespace is required for exec"))?;
-        let client = Client::try_default().await?;
+        let client = orka_kubehub::get_kube_client().await?;
         let api: Api<Pod> = Api::namespaced(client, ns);
         let mut ap = if pty { AttachParams::interactive_tty() } else { AttachParams::default() };
         if let Some(c) = container { ap = ap.container(c); }
@@ -309,7 +309,7 @@ impl OrkaOps for KubeOps {
 
     async fn scale(&self, gvk_key: &str, namespace: Option<&str>, name: &str, replicas: i32, use_subresource: bool) -> Result<()> {
         use kube::core::{DynamicObject, GroupVersionKind};
-        let client = Client::try_default().await?;
+        let client = orka_kubehub::get_kube_client().await?;
         let (group, version, kind) = parse_gvk_key(gvk_key)?;
         let gvk = GroupVersionKind { group, version, kind };
         let (ar, namespaced) = find_api_resource(client.clone(), &gvk).await?;
@@ -335,7 +335,7 @@ impl OrkaOps for KubeOps {
 
     async fn rollout_restart(&self, gvk_key: &str, namespace: Option<&str>, name: &str) -> Result<()> {
         use kube::{core::{DynamicObject, GroupVersionKind}};
-        let client = Client::try_default().await?;
+        let client = orka_kubehub::get_kube_client().await?;
         let (group, version, kind) = parse_gvk_key(gvk_key)?;
         let gvk = GroupVersionKind { group, version, kind };
         let (ar, namespaced) = find_api_resource(client.clone(), &gvk).await?;
@@ -353,7 +353,7 @@ impl OrkaOps for KubeOps {
 
     async fn delete_pod(&self, namespace: &str, pod: &str, grace_seconds: Option<i64>) -> Result<()> {
         use k8s_openapi::api::core::v1::Pod;
-        let client = Client::try_default().await?;
+        let client = orka_kubehub::get_kube_client().await?;
         let api: Api<Pod> = Api::namespaced(client, namespace);
         let dp = DeleteParams { grace_period_seconds: grace_seconds.map(|v| v as u32), ..Default::default() };
         let _ = api.delete(pod, &dp).await?;
@@ -362,7 +362,7 @@ impl OrkaOps for KubeOps {
 
     async fn cordon(&self, node: &str, on: bool) -> Result<()> {
         use k8s_openapi::api::core::v1::Node;
-        let client = Client::try_default().await?;
+        let client = orka_kubehub::get_kube_client().await?;
         let api: Api<Node> = Api::all(client);
         let pp = PatchParams::default();
         let patch = serde_json::json!({"spec": {"unschedulable": on}});
@@ -373,7 +373,7 @@ impl OrkaOps for KubeOps {
     async fn drain(&self, node: &str) -> Result<()> {
         use k8s_openapi::api::core::v1::Pod;
         use std::collections::HashSet;
-        let client = Client::try_default().await?;
+        let client = orka_kubehub::get_kube_client().await?;
         let all_pods: Api<Pod> = Api::all(client.clone());
         let lp = ListParams::default().fields(&format!("spec.nodeName={}", node));
 
@@ -459,7 +459,7 @@ impl KubeOps {
     async fn pf_internal(namespace: &str, pod: &str, local: u16, remote: u16) -> Result<StreamHandle<ForwardEvent>> {
         use k8s_openapi::api::core::v1::Pod;
         use tokio::net::TcpListener;
-        let client = Client::try_default().await?;
+        let client = orka_kubehub::get_kube_client().await?;
         let api: Api<Pod> = Api::namespaced(client, namespace);
         let mut pf = api.portforward(pod, &[remote]).await?;
         let (tx, rx) = mpsc::channel::<ForwardEvent>(16);

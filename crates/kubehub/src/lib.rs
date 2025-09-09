@@ -24,13 +24,23 @@ use std::path::PathBuf;
 use std::sync::RwLock;
 use tokio::sync::mpsc;
 use tokio::sync::OnceCell;
+use once_cell::sync::Lazy as StdLazy;
+use std::sync::RwLock as StdRwLock;
 use uuid::Uuid;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 // Reuse a single kube Client across this crate to avoid repeated setup costs.
 static KUBE_CLIENT: OnceCell<Client> = OnceCell::const_new();
+// Optional override client that can be swapped when the user selects a
+// different kubeconfig context. When set, this takes precedence over the
+// default `KUBE_CLIENT` above.
+static OVERRIDE_CLIENT: StdLazy<StdRwLock<Option<Client>>> = StdLazy::new(|| StdRwLock::new(None));
 
-async fn get_kube_client() -> Result<Client> {
+/// Get a kube client honoring the currently selected context if set.
+pub async fn get_kube_client() -> Result<Client> {
+    if let Some(c) = OVERRIDE_CLIENT.read().unwrap().as_ref() {
+        return Ok(c.clone());
+    }
     KUBE_CLIENT
         .get_or_try_init(|| async {
             Client::try_default()
@@ -39,6 +49,39 @@ async fn get_kube_client() -> Result<Client> {
         })
         .await
         .map(|c| c.clone())
+}
+
+/// List kubeconfig contexts available to the current process.
+pub fn list_contexts() -> Result<Vec<String>> {
+    use kube::config::Kubeconfig;
+    let kc = Kubeconfig::read()?;
+    let mut out: Vec<String> = kc.contexts.into_iter().map(|c| c.name).collect();
+    out.sort();
+    Ok(out)
+}
+
+/// Return the name of the current kubeconfig context, if any.
+pub fn current_context() -> Result<Option<String>> {
+    use kube::config::Kubeconfig;
+    let kc = Kubeconfig::read()?;
+    Ok(kc.current_context)
+}
+
+/// Set the active kube client to use a specific kubeconfig context.
+/// Passing `None` clears the override and reverts to the default context.
+pub async fn set_context(context: Option<&str>) -> Result<()> {
+    use kube::config::KubeConfigOptions;
+    if let Some(name) = context {
+        let opts = KubeConfigOptions { context: Some(name.to_string()), ..Default::default() };
+        let cfg = kube::Config::from_kubeconfig(&opts).await?;
+        let client = Client::try_from(cfg)?;
+        *OVERRIDE_CLIENT.write().unwrap() = Some(client);
+    } else {
+        *OVERRIDE_CLIENT.write().unwrap() = None;
+    }
+    // Clear discovery cache so subsequent lookups are correct for the new cluster
+    DISCOVERY_CACHE.write().unwrap().clear();
+    Ok(())
 }
 
 // ---- Traffic Measurement (optional) ----
