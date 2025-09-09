@@ -10,6 +10,7 @@ use orka_core::LiteObj;
 
 use crate::util::gvk_label;
 use super::{OrkaGuiApp, UiUpdate};
+use crate::model::DetailsPaneTab;
 
 impl OrkaGuiApp {
     fn ui_edit(&mut self, ui: &mut egui::Ui) {
@@ -168,51 +169,90 @@ impl OrkaGuiApp {
                 ui.add(te);
             });
     }
-    pub(crate) fn ui_explain(&mut self, ui: &mut egui::Ui) {
-        let has = self.search.explain.is_some();
-        egui::CollapsingHeader::new("Explain (Search)")
-            .default_open(false)
-            .show(ui, |ui| {
-                if let Some(ex) = &self.search.explain {
-                    ui.label(format!(
-                        "total={} ns={} label_keys={} labels={} anno_keys={} annos={} fields={}",
-                        ex.total, ex.after_ns, ex.after_label_keys, ex.after_labels, ex.after_anno_keys, ex.after_annos, ex.after_fields
-                    ));
-                    if self.search.partial {
-                        ui.label(egui::RichText::new("partial results — recovering from backlog/overflow").color(ui.visuals().warn_fg_color));
-                    }
-                } else {
-                    ui.label("Run a search to populate explain statistics.");
-                }
-            });
-        if has { ui.separator(); }
-    }
     pub(crate) fn ui_details(&mut self, ui: &mut egui::Ui) {
         ui.heading("Details");
+        // Detach/Reattach controls
+        ui.horizontal(|ui| {
+            if let Some(uid) = self.details.selected {
+                let id = egui::ViewportId::from_hash_of(("orka_details", uid));
+                let is_detached = self.detached.iter().any(|w| w.meta.id == id);
+                if is_detached {
+                    if ui.small_button("Reattach").on_hover_text("Close window and re-open as a tab").clicked() {
+                        #[cfg(feature = "dock")]
+                        {
+                            self.open_details_tab_for(uid);
+                        }
+                        #[cfg(not(feature = "dock"))]
+                        {
+                            self.layout.show_details = true;
+                        }
+                        ui.ctx().send_viewport_cmd_to(id, egui::ViewportCommand::Close);
+                        self.detached.retain(|w| w.meta.id != id);
+                    }
+                } else {
+                    if ui.small_button("Detach to Window").on_hover_text("Open this Details view in a separate OS window").clicked() {
+                        let ctx = ui.ctx();
+                        self.open_detached_for(ctx, uid);
+                        #[cfg(feature = "dock")]
+                        {
+                            // Queue closing the corresponding dock tab, if any
+                            self.dock_close_pending.push(uid);
+                        }
+                    }
+                }
+            } else {
+                if ui.small_button("Detach to Window").clicked() {
+                    self.toast("details: select a row first", crate::model::ToastKind::Info);
+                }
+            }
+        });
+        // Tab bar inside the Details pane (Edit | Logs | Describe)
+        ui.horizontal(|ui| {
+            let tab = self.details.active_tab;
+            let mut set_tab = |t| { self.details.active_tab = t; };
+            if ui.selectable_label(matches!(tab, DetailsPaneTab::Edit), "Edit").clicked() { set_tab(DetailsPaneTab::Edit); }
+            if ui.selectable_label(matches!(tab, DetailsPaneTab::Logs), "Logs").clicked() { set_tab(DetailsPaneTab::Logs); }
+            if ui.selectable_label(matches!(tab, DetailsPaneTab::Describe), "Describe").clicked() { set_tab(DetailsPaneTab::Describe); }
+        });
+        ui.separator();
         egui::ScrollArea::vertical()
             .id_salt("details_scroll")
             .show(ui, |ui| {
                 // Contextual actions bar (logs, exec, pf, scale, etc.)
                 crate::ui::actions::ui_actions_bar(self, ui);
                 ui.separator();
-                // Explain section (collapsed by default)
-                self.ui_explain(ui);
-                // Edit section
-                self.ui_edit(ui);
-                // Logs section (Pods only)
-                self.ui_logs(ui);
-                if self.details.buffer.is_empty() {
-                    ui.label("Select a row to view details");
-                } else {
-                    // Read-only YAML with syntect highlighting
-                    let mut layouter = crate::util::highlight::yaml_layouter();
-                    let te = egui::TextEdit::multiline(&mut self.details.buffer)
-                        .font(egui::TextStyle::Monospace)
-                        .desired_rows(24)
-                        .desired_width(f32::INFINITY)
-                        .interactive(false)
-                        .layouter(&mut layouter);
-                    ui.add(te);
+                match self.details.active_tab {
+                    DetailsPaneTab::Edit => {
+                        self.ui_edit(ui);
+                        if self.details.buffer.is_empty() && self.edit.buffer.is_empty() {
+                            ui.label("Select a row to view details");
+                        }
+                    }
+                    DetailsPaneTab::Logs => {
+                        self.ui_logs(ui);
+                    }
+                    DetailsPaneTab::Describe => {
+                        ui.horizontal(|ui| {
+                            if ui.small_button("Refresh").clicked() {
+                                if let Some(uid) = self.details.selected { self.start_describe_task(uid); }
+                            }
+                            if self.describe.running { ui.add(egui::Spinner::new()); }
+                            if let Some(err) = &self.describe.error { ui.colored_label(ui.visuals().error_fg_color, err); }
+                        });
+                        ui.add_space(4.0);
+                        // Auto-fetch on first open or when selection changed
+                        if self.details.selected.is_some() {
+                            let need_fetch = match (self.describe.uid, self.details.selected) { (Some(u0), Some(u1)) => u0 != u1, _ => true };
+                            if need_fetch && !self.describe.running { if let Some(uid) = self.details.selected { self.start_describe_task(uid); } }
+                        }
+                        let mut text = if self.describe.text.is_empty() { String::from("(no output yet)") } else { self.describe.text.clone() };
+                        let te = egui::TextEdit::multiline(&mut text)
+                            .font(egui::TextStyle::Monospace)
+                            .desired_rows(24)
+                            .desired_width(f32::INFINITY)
+                            .interactive(false);
+                        ui.add(te);
+                    }
                 }
             });
     }
@@ -236,6 +276,13 @@ impl OrkaGuiApp {
             info!("details: cancelling previous task");
             let _ = stop.send(());
         }
+        // cancel describe task and reset output
+        if let Some(task) = self.describe.task.take() { task.abort(); }
+        if let Some(stop) = self.describe.stop.take() { let _ = stop.send(()); }
+        self.describe.running = false;
+        self.describe.text.clear();
+        self.describe.error = None;
+        self.describe.uid = None;
         // If details are cached and fresh, render immediately and skip fetch
         let now = Instant::now();
         if let Some((arc_text, maybe_cont, ts)) = self.details_cache.get(&uid).cloned() {

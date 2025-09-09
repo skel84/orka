@@ -77,6 +77,24 @@ pub(crate) fn ui_stats_modal(app: &mut OrkaGuiApp, ctx: &egui::Context) {
                 grid_kv_colored(ui, "Rows (current)", &format!("{} / {}", app.results.rows.len(), app.results.soft_cap), color);
 
                 ui.separator();
+                ui.heading("Explain (Search)");
+                ui.separator();
+                if let Some(ex) = &app.search.explain {
+                    grid_kv(ui, "Total hits", &ex.total.to_string());
+                    grid_kv(ui, "After namespace", &ex.after_ns.to_string());
+                    grid_kv(ui, "After label keys", &ex.after_label_keys.to_string());
+                    grid_kv(ui, "After labels", &ex.after_labels.to_string());
+                    grid_kv(ui, "After anno keys", &ex.after_anno_keys.to_string());
+                    grid_kv(ui, "After annotations", &ex.after_annos.to_string());
+                    grid_kv(ui, "After fields", &ex.after_fields.to_string());
+                    if app.search.partial {
+                        ui.label(egui::RichText::new("partial results — recovering from backlog/overflow").color(ui.visuals().warn_fg_color));
+                    }
+                } else {
+                    ui.label("Run a search to populate explain statistics.");
+                }
+
+                ui.separator();
                 ui.horizontal(|ui| {
                     if ui.button("Refresh").clicked() { app.start_stats_task(); }
                     if ui.button("Close").clicked() { app.stats.open = false; }

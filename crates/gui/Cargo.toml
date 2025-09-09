@@ -28,6 +28,8 @@ fuzzy-matcher = "0.3"
 regex = { workspace = true }
 syntect = "5"
 metrics = { workspace = true }
+uuid = { workspace = true }
+kube = { workspace = true }
 
 [features]
 default = ["dock"]

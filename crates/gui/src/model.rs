@@ -1,6 +1,7 @@
 #![forbid(unsafe_code)]
 
 use std::time::Instant;
+use eframe::egui;
 
 use orka_api::LiteEvent;
 use orka_core::{LiteObj, Uid};
@@ -45,6 +46,14 @@ pub enum UiUpdate {
     PfEnded,
     // Stats updates
     StatsReady(orka_api::Stats),
+    // Detached windows: per-window details ready/error
+    DetachedDetail { id: egui::ViewportId, uid: Uid, text: String, produced_at: Instant },
+    DetachedDetailError { id: egui::ViewportId, error: String },
+    // Detached -> Reattach request
+    ReattachDetached { id: egui::ViewportId, uid: Uid },
+    // Describe output for Details pane
+    DescribeReady { uid: Uid, text: String },
+    DescribeError { uid: Uid, error: String },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -132,6 +141,14 @@ pub struct DetailsState {
     pub task: Option<JoinHandle<()>>,
     pub stop: Option<tokio::sync::oneshot::Sender<()>>,
     pub selected_at: Option<Instant>,
+    pub active_tab: DetailsPaneTab,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DetailsPaneTab { Edit, Logs, Describe }
+
+impl Default for DetailsPaneTab {
+    fn default() -> Self { DetailsPaneTab::Describe }
 }
 
 #[derive(Default)]
@@ -196,6 +213,39 @@ pub struct UiDebounce {
     pub ms: u64,
     pub pending_count: usize,
     pub pending_since: Option<Instant>,
+}
+
+// --------- Detached Details ---------
+
+#[derive(Clone)]
+pub struct DetachedDetailsWindowMeta {
+    pub id: egui::ViewportId,
+    pub uid: Uid,
+    pub title: String,
+    pub gvk: orka_api::ResourceKind,
+    pub namespace: Option<String>,
+    pub name: String,
+}
+
+pub struct DetachedDetailsWindowState {
+    pub buffer: String,
+    pub last_error: Option<String>,
+    pub opened_at: Instant,
+}
+
+pub struct DetachedDetailsWindow {
+    pub meta: DetachedDetailsWindowMeta,
+    pub state: DetachedDetailsWindowState,
+}
+
+#[derive(Default)]
+pub struct DescribeState {
+    pub running: bool,
+    pub text: String,
+    pub error: Option<String>,
+    pub uid: Option<Uid>,
+    pub task: Option<JoinHandle<()>>,
+    pub stop: Option<tokio::sync::oneshot::Sender<()>>,
 }
 
 #[derive(Default)]

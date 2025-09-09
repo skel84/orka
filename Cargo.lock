@@ -3712,6 +3712,7 @@ dependencies = [
  "egui_table",
  "egui_virtual_list",
  "fuzzy-matcher",
+ "kube",
  "metrics 0.21.1",
  "once_cell",
  "orka-core",
@@ -3724,6 +3725,7 @@ dependencies = [
  "syntect",
  "tokio",
  "tracing",
+ "uuid",
 ]
 
 [[package]]

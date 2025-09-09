@@ -24,6 +24,8 @@ mod ui;
 mod tasks;
 pub use model::{UiUpdate, VirtualMode, SearchExplain, PaletteItem, PaletteState, LayoutState};
 use model::{ResultsState, SearchState, DetailsState, SelectionState, UiDebounce, DiscoveryState, WatchState, LogsState, EditState, OpsState, ToastKind, StatsState};
+use model::{DetailsPaneTab, DescribeState};
+use model::{DetachedDetailsWindow, DetachedDetailsWindowMeta, DetachedDetailsWindowState};
 use util::{gvk_label, parse_gvk_key_to_kind};
 use watch::{watch_hub_subscribe, watch_hub_prime};
 
@@ -46,6 +48,7 @@ pub struct OrkaGuiApp {
     details: DetailsState,
     logs: LogsState,
     edit: EditState,
+    describe: DescribeState,
     // status
     last_error: Option<String>,
     // scratch
@@ -87,6 +90,10 @@ pub struct OrkaGuiApp {
     idle_repaint_slow_ms: u64,
     idle_fast_window_ms: u64,
     last_activity: Option<Instant>,
+    // Detached details windows
+    detached: Vec<DetachedDetailsWindow>,
+    #[cfg(feature = "dock")]
+    dock_close_pending: Vec<Uid>,
 }
 
 impl OrkaGuiApp {
@@ -94,6 +101,50 @@ impl OrkaGuiApp {
     fn open_details_tab_for(&mut self, uid: Uid) {
         // Defer dock mutations to after DockArea render to avoid borrow conflicts
         self.dock_pending.push(uid);
+    }
+
+    /// Open a detached OS window to show details for the given UID.
+    fn open_detached_for(&mut self, ctx: &egui::Context, uid: Uid) {
+        // If already opened, focus it by re-showing; otherwise create meta/state and start fetch.
+        if self.detached.iter().any(|w| w.meta.uid == uid) {
+            return;
+        }
+        // Resolve row info for title and reference
+        let (ns, name) = if let Some(i) = self.results.index.get(&uid).copied() {
+            if let Some(row) = self.results.rows.get(i) { (row.namespace.clone(), row.name.clone()) } else { (None, String::from("")) }
+        } else { (None, String::from("")) };
+        let gvk = match self.current_selected_kind() { Some(k) => k.clone(), None => return };
+        let title = match &ns { Some(ns) => format!("Details: {}/{}", ns, name), None => format!("Details: {}", name) };
+        let id = egui::ViewportId::from_hash_of(("orka_details", uid));
+        let meta = DetachedDetailsWindowMeta { id, uid, title, gvk: gvk.clone(), namespace: ns.clone(), name: name.clone() };
+        let state = DetachedDetailsWindowState { buffer: String::new(), last_error: None, opened_at: Instant::now() };
+        self.detached.push(DetachedDetailsWindow { meta: meta.clone(), state });
+        // Kick an async fetch for this window (similar to select_row)
+        let api = self.api.clone();
+        let tx_opt = self.watch.updates_tx.clone();
+        let reference = orka_api::ResourceRef { cluster: None, gvk, namespace: ns, name };
+        tokio::spawn(async move {
+            let t0 = Instant::now();
+            match api.get_raw(reference).await {
+                Ok(bytes) => {
+                    // Try to parse as JSON for YAML rendering
+                    let text: String = match serde_json::from_slice::<serde_json::Value>(&bytes) {
+                        Ok(v) => match serde_yaml::to_string(&v) { Ok(y) => y, Err(_) => String::from_utf8_lossy(&bytes).into_owned() },
+                        Err(_) => String::from_utf8_lossy(&bytes).into_owned(),
+                    };
+                    if let Some(tx) = tx_opt.as_ref() {
+                        let _ = tx.send(model::UiUpdate::DetachedDetail { id, uid, text, produced_at: t0 });
+                    }
+                }
+                Err(e) => {
+                    if let Some(tx) = tx_opt.as_ref() {
+                        let _ = tx.send(model::UiUpdate::DetachedDetailError { id, error: e.to_string() });
+                    }
+                }
+            }
+        });
+        // Ensure OS knows about the new viewport right away
+        ctx.request_repaint();
     }
 
     #[cfg(feature = "dock")]
@@ -185,7 +236,8 @@ impl OrkaGuiApp {
                 epoch: None,
             },
             watch: WatchState { updates_rx: None, updates_tx: None, task: None, stop: None, loaded_idx: None, loaded_gvk_key: None, loaded_ns: None, prewarm_started: false, select_t0: None, ttfr_logged: false, ns_task: None },
-            details: DetailsState { selected: None, buffer: String::new(), task: None, stop: None, selected_at: None },
+            details: DetailsState { selected: None, buffer: String::new(), task: None, stop: None, selected_at: None, active_tab: DetailsPaneTab::Describe },
+            describe: DescribeState { running: false, text: String::new(), error: None, uid: None, task: None, stop: None },
             logs: {
                 let cap = std::env::var("ORKA_LOGS_BACKLOG_CAP").ok().and_then(|s| s.parse().ok()).unwrap_or(2000);
                 LogsState { running: false, follow: true, grep: String::new(), backlog: std::collections::VecDeque::with_capacity(cap.min(256)), backlog_cap: cap, dropped: 0, recv: 0, containers: Vec::new(), container: None, tail_lines: None, since_seconds: None, task: None, cancel: None }
@@ -257,6 +309,9 @@ impl OrkaGuiApp {
             idle_repaint_slow_ms: std::env::var("ORKA_IDLE_SLOW_MS").ok().and_then(|s| s.parse::<u64>().ok()).unwrap_or(120),
             idle_fast_window_ms: std::env::var("ORKA_IDLE_FAST_WINDOW_MS").ok().and_then(|s| s.parse::<u64>().ok()).unwrap_or(1000),
             last_activity: None,
+            detached: Vec::new(),
+            #[cfg(feature = "dock")]
+            dock_close_pending: Vec::new(),
         };
         // Start prewarm watchers for curated built-ins immediately (without waiting for discovery)
         if !this.watch.prewarm_started {
@@ -522,6 +577,7 @@ impl eframe::App for OrkaGuiApp {
         let mut processed = 0usize;
         let mut saw_batch = false; // treat snapshot as a batch marker
         let mut pending_toasts: Vec<(String, ToastKind)> = Vec::new();
+        let mut reattach_requests: Vec<(egui::ViewportId, Uid)> = Vec::new();
         if let Some(rx) = &self.watch.updates_rx {
             while processed < 256 {
                 match rx.try_recv() {
@@ -678,6 +734,28 @@ impl eframe::App for OrkaGuiApp {
                         self.namespaces = list;
                         processed += 1;
                     }
+                    Ok(UiUpdate::DetachedDetail { id, uid: _uid, text, produced_at: _t0 }) => {
+                        // Update buffer for the matching detached window
+                        if let Some(w) = self.detached.iter_mut().find(|w| w.meta.id == id) {
+                            w.state.buffer = text;
+                            w.state.last_error = None;
+                        }
+                        processed += 1;
+                        // Repaint so detached window updates quickly
+                        ctx.request_repaint();
+                    }
+                    Ok(UiUpdate::DetachedDetailError { id, error }) => {
+                        if let Some(w) = self.detached.iter_mut().find(|w| w.meta.id == id) {
+                            w.state.last_error = Some(error);
+                        }
+                        processed += 1;
+                        ctx.request_repaint();
+                    }
+                    Ok(UiUpdate::ReattachDetached { id, uid }) => {
+                        // Defer reattach actions until after draining rx to avoid borrow conflicts
+                        reattach_requests.push((id, uid));
+                        processed += 1;
+                    }
                     Ok(UiUpdate::Epoch(e)) => {
                         self.results.epoch = Some(e);
                         processed += 1;
@@ -733,6 +811,26 @@ impl eframe::App for OrkaGuiApp {
                         self.logs.cancel = None;
                         pending_toasts.push(("logs: ended".to_string(), ToastKind::Info));
                         processed += 1;
+                    }
+                    Ok(UiUpdate::DescribeReady { uid, text }) => {
+                        // Only update current selection's describe
+                        if self.details.selected == Some(uid) {
+                            self.describe.text = text;
+                            self.describe.error = None;
+                            self.describe.running = false;
+                            self.describe.uid = Some(uid);
+                            processed += 1;
+                            ctx.request_repaint();
+                        }
+                    }
+                    Ok(UiUpdate::DescribeError { uid, error }) => {
+                        if self.details.selected == Some(uid) {
+                            self.describe.error = Some(error);
+                            self.describe.running = false;
+                            self.describe.uid = Some(uid);
+                            processed += 1;
+                            ctx.request_repaint();
+                        }
                     }
                     Ok(UiUpdate::EditStatus(s)) => {
                         self.edit.status = s;
@@ -806,6 +904,28 @@ impl eframe::App for OrkaGuiApp {
                         self.watch.updates_rx = None;
                         break;
                     }
+                }
+            }
+            // Apply any reattach requests now that rx borrow is dropped
+            if !reattach_requests.is_empty() {
+                for (id, uid) in reattach_requests.drain(..) {
+                    #[cfg(feature = "dock")]
+                    {
+                        self.open_details_tab_for(uid);
+                    }
+                    #[cfg(not(feature = "dock"))]
+                    {
+                        self.layout.show_details = true;
+                    }
+                    if let Some(i) = self.results.index.get(&uid).copied() {
+                        if let Some(row) = self.results.rows.get(i).cloned() {
+                            self.select_row(row);
+                        }
+                    } else {
+                        self.toast("reattach: item not in current results", ToastKind::Warn);
+                    }
+                    self.detached.retain(|w| w.meta.id != id);
+                    ctx.request_repaint();
                 }
             }
             // Debounce repaint: flush on batch marker, size threshold, or elapsed time
@@ -911,9 +1031,15 @@ impl eframe::App for OrkaGuiApp {
                         let mut viewer = Viewer { app: self };
                         dock::DockArea::new(&mut ds).show_inside(ui, &mut viewer);
                     }
-                    // After rendering, apply any queued dock operations (e.g., open details tabs)
+                    // After rendering, apply any queued dock operations (e.g., open/close details tabs)
                     while let Some(pending) = self.dock_pending.pop() {
                         self.ensure_details_tab_in(&mut ds, pending);
+                    }
+                    while let Some(close_uid) = self.dock_close_pending.pop() {
+                        if let Some((node, tab_index)) = ds.find_main_surface_tab(&Tab::DetailsFor(close_uid)) {
+                            let surface = dock::SurfaceIndex::main();
+                            let _ = ds.remove_tab((surface, node, tab_index));
+                        }
                     }
                     // Sync selection to the currently focused Details tab (if any) to avoid thrash
                     {
@@ -956,6 +1082,89 @@ impl eframe::App for OrkaGuiApp {
         self.ensure_watch_for_selection();
         // Refresh ops caps when selection/namespace changes
         self.ensure_caps_for_selection();
+
+        // Render any detached details viewports (OS-managed windows)
+        {
+            let close_reqs: std::rc::Rc<std::cell::RefCell<Vec<egui::ViewportId>>> = Default::default();
+            for w in &self.detached {
+                let id = w.meta.id;
+                let title = w.meta.title.clone();
+                let cr = close_reqs.clone();
+                let api = self.api.clone();
+                let tx_opt = self.watch.updates_tx.clone();
+                let reference = orka_api::ResourceRef { cluster: None, gvk: w.meta.gvk.clone(), namespace: w.meta.namespace.clone(), name: w.meta.name.clone() };
+                let buffer = w.state.buffer.clone();
+                let uid = w.meta.uid;
+                let last_error = w.state.last_error.clone();
+                ctx.show_viewport_immediate(
+                    id,
+                    egui::ViewportBuilder::default()
+                        .with_title(title)
+                        .with_inner_size([780.0, 600.0])
+                        .with_decorations(true),
+                    move |ctx, _class| {
+                        // Handle OS close button
+                        if ctx.input(|i| i.viewport().close_requested()) {
+                            cr.borrow_mut().push(id);
+                            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                            return;
+                        }
+                        egui::CentralPanel::default().show(ctx, |ui| {
+                            ui.horizontal(|ui| {
+                                if ui.small_button("Refresh").clicked() {
+                                    // Fire a new fetch for this window
+                                    let api = api.clone();
+                                    let tx_opt = tx_opt.clone();
+                                    let reference = reference.clone();
+                                    tokio::spawn(async move {
+                                        let t0 = Instant::now();
+                                        match api.get_raw(reference).await {
+                                            Ok(bytes) => {
+                                                let text: String = match serde_json::from_slice::<serde_json::Value>(&bytes) {
+                                                    Ok(v) => match serde_yaml::to_string(&v) { Ok(y) => y, Err(_) => String::from_utf8_lossy(&bytes).into_owned() },
+                                                    Err(_) => String::from_utf8_lossy(&bytes).into_owned(),
+                                                };
+                                                if let Some(tx) = tx_opt.as_ref() { let _ = tx.send(model::UiUpdate::DetachedDetail { id, uid:  [0u8; 16], text, produced_at: t0 }); }
+                                            }
+                                            Err(e) => { if let Some(tx) = tx_opt.as_ref() { let _ = tx.send(model::UiUpdate::DetachedDetailError { id, error: e.to_string() }); } }
+                                        }
+                                    });
+                                }
+                                if ui.small_button("Reattach").clicked() {
+                                    if let Some(tx) = tx_opt.as_ref() {
+                                        let _ = tx.send(model::UiUpdate::ReattachDetached { id, uid });
+                                    }
+                                    cr.borrow_mut().push(id);
+                                    ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                                }
+                                if ui.small_button("Close").clicked() {
+                                    cr.borrow_mut().push(id);
+                                    ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                                }
+                            });
+                            ui.separator();
+                            // Render details content
+                            if let Some(err) = &last_error { ui.colored_label(ui.visuals().error_fg_color, format!("error: {}", err)); }
+                            let mut layouter = crate::util::highlight::yaml_layouter();
+                            let mut buf = buffer.clone();
+                            if buf.is_empty() { buf = String::from("Loading…"); }
+                            let te = egui::TextEdit::multiline(&mut buf)
+                                .font(egui::TextStyle::Monospace)
+                                .desired_rows(24)
+                                .desired_width(f32::INFINITY)
+                                .interactive(false)
+                                .layouter(&mut layouter);
+                            ui.add(te);
+                        });
+                    },
+                );
+            }
+            // Remove any windows that requested close
+            let to_close = close_reqs.borrow().clone();
+            if !to_close.is_empty() {
+                self.detached.retain(|w| !to_close.iter().any(|id| *id == w.meta.id));
+            }
+        }
     }
 }
 
