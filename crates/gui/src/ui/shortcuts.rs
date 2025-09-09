@@ -25,7 +25,7 @@ pub(crate) fn handle_global_shortcuts(app: &mut OrkaGuiApp, ctx: &egui::Context)
     // Exec (E)
     if ctx.input(|i| i.key_pressed(egui::Key::E)) {
         let can_exec = app.selected_is_pod() && app.ops.caps.as_ref().map(|c| c.pods_exec_create).unwrap_or(false);
-        if can_exec { app.last_error = Some("Exec UI is not implemented yet".into()); app.toast("exec: UI not implemented", ToastKind::Warn); }
+        if can_exec { app.details.active_tab = crate::model::DetailsPaneTab::Exec; app.start_exec_task(); }
         else { app.toast("exec: unavailable (select Pod or RBAC)", ToastKind::Warn); }
     }
 

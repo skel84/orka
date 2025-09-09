@@ -42,7 +42,7 @@ pub(crate) fn ui_actions_bar(app: &mut OrkaGuiApp, ui: &mut egui::Ui) {
         // Exec (gated; not yet wired to a terminal UI)
         let exec_ok = pod_sel && caps.as_ref().map(|c| c.pods_exec_create).unwrap_or(false);
         if exec_ok {
-            if ui.button("Exec…").clicked() { info!("ui: exec click"); app.last_error = Some("Exec UI is not implemented yet".into()); }
+            if ui.button("Exec…").clicked() { info!("ui: exec click"); app.details.active_tab = crate::model::DetailsPaneTab::Exec; app.start_exec_task(); }
         } else {
             ui.add_enabled(false, egui::Button::new("Exec…")).on_hover_text("RBAC: pods/exec or Pod selection missing");
         }

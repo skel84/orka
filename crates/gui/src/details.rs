@@ -345,13 +345,14 @@ impl OrkaGuiApp {
                 }
             }
         });
-        // Tab bar inside the Details pane (Edit | Logs | Describe)
+        // Tab bar inside the Details pane (Edit | Logs | Svc Logs | Exec | Describe)
         ui.horizontal(|ui| {
             let tab = self.details.active_tab;
             let is_svc = self.selected_is_service();
             if ui.selectable_label(matches!(tab, DetailsPaneTab::Edit), "Edit").clicked() { self.details.active_tab = DetailsPaneTab::Edit; }
             if ui.selectable_label(matches!(tab, DetailsPaneTab::Logs), "Logs").clicked() { self.details.active_tab = DetailsPaneTab::Logs; }
             if is_svc { if ui.selectable_label(matches!(tab, DetailsPaneTab::SvcLogs), "Svc Logs").clicked() { self.details.active_tab = DetailsPaneTab::SvcLogs; } }
+            if self.selected_is_pod() { if ui.selectable_label(matches!(tab, DetailsPaneTab::Exec), "Exec").clicked() { self.details.active_tab = DetailsPaneTab::Exec; } }
             if ui.selectable_label(matches!(tab, DetailsPaneTab::Describe), "Describe").clicked() { self.details.active_tab = DetailsPaneTab::Describe; }
         });
         ui.separator();
@@ -373,6 +374,9 @@ impl OrkaGuiApp {
                     }
                     DetailsPaneTab::SvcLogs => {
                         self.ui_service_logs(ui);
+                    }
+                    DetailsPaneTab::Exec => {
+                        self.ui_exec(ui);
                     }
                     DetailsPaneTab::Describe => {
                         ui.horizontal(|ui| {
@@ -397,6 +401,79 @@ impl OrkaGuiApp {
                         ui.add(te);
                     }
                 }
+            });
+    }
+
+    fn ui_exec(&mut self, ui: &mut egui::Ui) {
+        if !self.selected_is_pod() { return; }
+        egui::CollapsingHeader::new("Exec (Terminal)")
+            .default_open(false)
+            .show(ui, |ui| {
+                // Controls
+                ui.horizontal(|ui| {
+                    ui.checkbox(&mut self.exec.pty, "PTY");
+                    ui.separator();
+                    ui.label("Command:");
+                    ui.add(egui::TextEdit::singleline(&mut self.exec.cmd).desired_width(220.0));
+                    ui.separator();
+                    ui.label("Container:");
+                    if self.logs.containers.is_empty() {
+                        ui.label(egui::RichText::new("(none)").weak());
+                    } else {
+                        let current = self.exec.container.clone().unwrap_or_else(|| self.logs.containers.get(0).cloned().unwrap_or_default());
+                        let mut selected = current.clone();
+                        let mut changed_container = false;
+                        egui::ComboBox::from_id_salt("exec_container_select")
+                            .selected_text(selected.clone())
+                            .show_ui(ui, |ui| {
+                                for name in &self.logs.containers { if ui.selectable_value(&mut selected, name.clone(), name).changed() { changed_container = true; } }
+                            });
+                        if selected != current { self.exec.container = Some(selected); if self.exec.running && changed_container { self.stop_exec_task(); } }
+                    }
+                    if !self.exec.running {
+                        if ui.button("Start").clicked() { self.start_exec_task(); }
+                    } else {
+                        if ui.button("Stop").clicked() { self.stop_exec_task(); }
+                    }
+                });
+
+                ui.add_space(4.0);
+
+                // Output area (simple text view for now)
+                let mut display = String::new();
+                let mut shown = 0usize;
+                let max_lines: usize = 1000;
+                for line in self.exec.backlog.iter().rev() {
+                    display.push_str(line);
+                    if !line.ends_with('\n') { display.push('\n'); }
+                    shown += 1;
+                    if shown >= max_lines { break; }
+                }
+                let display = if shown == 0 { String::new() } else { display.lines().rev().collect::<Vec<_>>().join("\n") };
+                let mut binding = display;
+                let te = egui::TextEdit::multiline(&mut binding)
+                    .font(egui::TextStyle::Monospace)
+                    .desired_rows(20)
+                    .desired_width(f32::INFINITY)
+                    .interactive(false);
+                ui.add(te);
+
+                ui.add_space(4.0);
+
+                // Input send line (basic)
+                ui.horizontal(|ui| {
+                    let send_btn = ui.add_enabled(self.exec.running, egui::Button::new("Send"));
+                    let edit = ui.add_enabled(self.exec.running, egui::TextEdit::singleline(&mut self.exec.stdin_buf).desired_width(400.0));
+                    let want_send = send_btn.clicked() || (self.exec.running && edit.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)));
+                    if want_send {
+                        if let (Some(tx), s) = (self.exec.input.clone(), self.exec.stdin_buf.clone()) {
+                            let mut bytes = s.into_bytes(); bytes.push(b'\n');
+                            let _ = tx.try_send(bytes);
+                            self.exec.stdin_buf.clear();
+                        }
+                    }
+                });
+                if self.exec.dropped > 0 { ui.colored_label(ui.visuals().warn_fg_color, format!("dropped: {}", self.exec.dropped)); }
             });
     }
 

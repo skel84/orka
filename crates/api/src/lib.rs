@@ -26,6 +26,7 @@ pub use orka_ops::StreamHandle as OpsStreamHandle;
 pub use orka_ops::ForwardEvent as OpsForwardEvent;
 pub use orka_ops::OpsCaps as OpsCaps;
 pub use orka_ops::ScaleCaps as OpsScaleCaps;
+pub use orka_ops::ExecChunk as OpsExecChunk;
 pub use orka_schema::CrdSchema; // Re-export schema type
 pub use orka_persist::LastApplied; // Re-export last-applied row
 use std::collections::HashMap;
@@ -637,6 +638,14 @@ impl std::fmt::Debug for CancelHandle {
 /// Generic stream handle used by API streaming endpoints.
 pub struct StreamHandle<T> { pub rx: tokio::sync::mpsc::Receiver<T>, pub cancel: CancelHandle }
 
+/// Exec streaming handle exposed to frontends.
+pub struct ExecStreamHandle {
+    pub rx: tokio::sync::mpsc::Receiver<orka_ops::ExecChunk>,
+    pub input: tokio::sync::mpsc::Sender<Vec<u8>>,
+    pub resize: Option<tokio::sync::mpsc::Sender<(u16, u16)>>,
+    pub cancel: CancelHandle,
+}
+
 // ----------------- Ops Facade (API-level) -----------------
 
 /// Lightweight facade over imperative ops, returning API-level stream handles
@@ -683,6 +692,38 @@ impl ApiOps {
         pty: bool,
     ) -> OrkaResult<()> {
         self.inner.exec(namespace, pod, container, cmd, pty).await.map_err(|e| OrkaError::Internal(e.to_string()))
+    }
+
+    /// Start an interactive exec session returning a duplex handle.
+    pub async fn exec_stream(
+        &self,
+        namespace: Option<&str>,
+        pod: &str,
+        container: Option<&str>,
+        cmd: &[String],
+        pty: bool,
+    ) -> OrkaResult<ExecStreamHandle> {
+        // Bridge ops-level duplex to API-level handle
+        let cap = std::env::var("ORKA_OPS_QUEUE_CAP").ok().and_then(|s| s.parse().ok()).unwrap_or(1024);
+        let (tx, rx) = tokio::sync::mpsc::channel::<orka_ops::ExecChunk>(cap);
+        let res = self
+            .inner
+            .exec_stream(namespace, pod, container, cmd, pty)
+            .await
+            .map_err(|e| OrkaError::Internal(e.to_string()))?;
+        struct OpsCancelGuard { inner: Option<OpsCancelHandle> }
+        impl Drop for OpsCancelGuard { fn drop(&mut self) { if let Some(c) = self.inner.take() { c.cancel(); } } }
+        let mut rx_ops = res.rx;
+        let guard = OpsCancelGuard { inner: Some(res.cancel) };
+        let input = res.stdin_tx;
+        let resize = res.resize_tx;
+        let task = tokio::spawn(async move {
+            let _g = guard;
+            while let Some(chunk) = rx_ops.recv().await {
+                let _ = tx.try_send(chunk);
+            }
+        });
+        Ok(ExecStreamHandle { rx, input, resize, cancel: CancelHandle { task: Some(task) } })
     }
 
     /// Port-forward from local to a pod port. Returns API-level event stream.

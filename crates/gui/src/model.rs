@@ -37,6 +37,15 @@ pub enum UiUpdate {
     SvcLogLine(String),
     SvcLogError(String),
     SvcLogEnded,
+    // Exec streaming updates
+    ExecStarted {
+        cancel: orka_api::CancelHandle,
+        input: tokio::sync::mpsc::Sender<Vec<u8>>,
+        resize: Option<tokio::sync::mpsc::Sender<(u16, u16)>>,
+    },
+    ExecData(String),
+    ExecError(String),
+    ExecEnded,
     // Pod-specific metadata
     PodContainers(Vec<String>),
     // Edit tab updates
@@ -151,10 +160,27 @@ pub struct DetailsState {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum DetailsPaneTab { Edit, Logs, SvcLogs, Describe }
+pub enum DetailsPaneTab { Edit, Logs, SvcLogs, Exec, Describe }
 
 impl Default for DetailsPaneTab {
     fn default() -> Self { DetailsPaneTab::Describe }
+}
+
+#[derive(Default)]
+pub struct ExecState {
+    pub running: bool,
+    pub pty: bool,
+    pub cmd: String,
+    pub container: Option<String>,
+    pub backlog: std::collections::VecDeque<String>,
+    pub backlog_cap: usize,
+    pub dropped: usize,
+    pub recv: usize,
+    pub stdin_buf: String,
+    pub task: Option<JoinHandle<()>>,
+    pub cancel: Option<orka_api::CancelHandle>,
+    pub input: Option<tokio::sync::mpsc::Sender<Vec<u8>>>,
+    pub resize: Option<tokio::sync::mpsc::Sender<(u16, u16)>>,
 }
 
 #[derive(Default)]

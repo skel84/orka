@@ -24,7 +24,7 @@ mod ui;
 mod tasks;
 mod logs;
 pub use model::{UiUpdate, VirtualMode, SearchExplain, PaletteItem, PaletteState, LayoutState};
-use model::{ResultsState, SearchState, DetailsState, SelectionState, UiDebounce, DiscoveryState, WatchState, LogsState, ServiceLogsState, EditState, OpsState, ToastKind, StatsState, PrefixTheme};
+use model::{ResultsState, SearchState, DetailsState, SelectionState, UiDebounce, DiscoveryState, WatchState, LogsState, ServiceLogsState, EditState, OpsState, ToastKind, StatsState, PrefixTheme, ExecState};
 use model::{DetailsPaneTab, DescribeState};
 use model::{DetachedDetailsWindow, DetachedDetailsWindowMeta, DetachedDetailsWindowState};
 use util::{gvk_label, parse_gvk_key_to_kind};
@@ -50,6 +50,7 @@ pub struct OrkaGuiApp {
     logs: LogsState,
     svc_logs: ServiceLogsState,
     edit: EditState,
+    exec: ExecState,
     describe: DescribeState,
     // status
     last_error: Option<String>,
@@ -246,6 +247,10 @@ impl OrkaGuiApp {
             watch: WatchState { updates_rx: None, updates_tx: None, task: None, stop: None, loaded_idx: None, loaded_gvk_key: None, loaded_ns: None, prewarm_started: false, select_t0: None, ttfr_logged: false, ns_task: None },
             details: DetailsState { selected: None, buffer: String::new(), task: None, stop: None, selected_at: None, active_tab: DetailsPaneTab::Describe },
             describe: DescribeState { running: false, text: String::new(), error: None, uid: None, task: None, stop: None },
+            exec: {
+                let cap = std::env::var("ORKA_EXEC_BACKLOG_CAP").ok().and_then(|s| s.parse().ok()).unwrap_or(4000);
+                ExecState { running: false, pty: true, cmd: "/bin/sh".into(), container: None, backlog: std::collections::VecDeque::with_capacity(cap.min(256)), backlog_cap: cap, dropped: 0, recv: 0, stdin_buf: String::new(), task: None, cancel: None, input: None, resize: None }
+            },
             logs: {
                 let cap_legacy = std::env::var("ORKA_LOGS_BACKLOG_CAP").ok().and_then(|s| s.parse().ok()).unwrap_or(2000);
                 let ring_cap = std::env::var("ORKA_LOGS_RING_CAP").ok().and_then(|s| s.parse().ok()).unwrap_or(10_000);
@@ -935,6 +940,39 @@ impl eframe::App for OrkaGuiApp {
                         self.svc_logs.running = false;
                         self.svc_logs.task = None;
                         pending_toasts.push(("service logs: ended".to_string(), ToastKind::Info));
+                        processed += 1;
+                    }
+                    Ok(UiUpdate::ExecStarted { cancel, input, resize }) => {
+                        self.exec.cancel = Some(cancel);
+                        self.exec.input = Some(input);
+                        self.exec.resize = resize;
+                        self.exec.running = true;
+                        pending_toasts.push(("exec: started".to_string(), ToastKind::Info));
+                        processed += 1;
+                    }
+                    Ok(UiUpdate::ExecData(s)) => {
+                        self.exec.recv += 1;
+                        if self.exec.backlog.len() >= self.exec.backlog_cap { self.exec.backlog.pop_front(); self.exec.dropped += 1; }
+                        self.exec.backlog.push_back(s);
+                        processed += 1;
+                    }
+                    Ok(UiUpdate::ExecError(err)) => {
+                        self.last_error = Some(err.clone());
+                        self.exec.running = false;
+                        self.exec.task = None;
+                        self.exec.cancel = None;
+                        self.exec.input = None;
+                        self.exec.resize = None;
+                        pending_toasts.push((format!("exec: {}", err), ToastKind::Error));
+                        processed += 1;
+                    }
+                    Ok(UiUpdate::ExecEnded) => {
+                        self.exec.running = false;
+                        self.exec.task = None;
+                        self.exec.cancel = None;
+                        self.exec.input = None;
+                        self.exec.resize = None;
+                        pending_toasts.push(("exec: ended".to_string(), ToastKind::Info));
                         processed += 1;
                     }
                     Ok(UiUpdate::LogEnded) => {

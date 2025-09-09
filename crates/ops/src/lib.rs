@@ -45,6 +45,21 @@ pub struct StreamHandle<T> {
     pub cancel: CancelHandle,
 }
 
+/// Exec output chunk. When `stderr` is true, the bytes came from stderr.
+#[derive(Debug, Clone)]
+pub struct ExecChunk {
+    pub bytes: bytes::Bytes,
+    pub stderr: bool,
+}
+
+/// Duplex handle for an exec session: output stream + input and resize senders.
+pub struct ExecDuplexHandle {
+    pub rx: mpsc::Receiver<ExecChunk>,
+    pub stdin_tx: mpsc::Sender<Vec<u8>>, // send bytes to remote stdin
+    pub resize_tx: Option<mpsc::Sender<(u16, u16)>>, // (cols, rows)
+    pub cancel: CancelHandle,
+}
+
 /// Imperative ops trait. Methods may stream or perform one-shot mutations.
 #[allow(unused_variables)]
 #[async_trait::async_trait]
@@ -54,6 +69,8 @@ pub trait OrkaOps: Send + Sync {
 
     // Stubs for upcoming ops in this milestone
     async fn exec(&self, namespace: Option<&str>, pod: &str, container: Option<&str>, cmd: &[String], pty: bool) -> Result<()> { Err(anyhow!("exec: not implemented yet")) }
+    /// Start an interactive exec session returning a duplex handle.
+    async fn exec_stream(&self, namespace: Option<&str>, pod: &str, container: Option<&str>, cmd: &[String], pty: bool) -> Result<ExecDuplexHandle> { Err(anyhow!("exec_stream: not implemented yet")) }
     async fn port_forward(&self, namespace: Option<&str>, pod: &str, local: u16, remote: u16) -> Result<StreamHandle<ForwardEvent>> { Err(anyhow!("port-forward: not implemented yet")) }
     async fn scale(&self, gvk_key: &str, namespace: Option<&str>, name: &str, replicas: i32, use_subresource: bool) -> Result<()>;
     async fn rollout_restart(&self, gvk_key: &str, namespace: Option<&str>, name: &str) -> Result<()>;
@@ -300,6 +317,91 @@ impl OrkaOps for KubeOps {
         if let Some(t) = resize_task { let _ = t.await; }
         drop(_raw_guard); // ensure raw mode disabled
         Ok(())
+    }
+
+    async fn exec_stream(&self, namespace: Option<&str>, pod: &str, container: Option<&str>, cmd: &[String], pty: bool) -> Result<ExecDuplexHandle> {
+        use k8s_openapi::api::core::v1::Pod;
+        use kube::api::{AttachParams, TerminalSize};
+        use futures::SinkExt;
+
+        let ns = namespace.ok_or_else(|| anyhow!("namespace is required for exec"))?;
+        let client = orka_kubehub::get_kube_client().await?;
+        let api: Api<Pod> = Api::namespaced(client, ns);
+        let mut ap = if pty { AttachParams::interactive_tty() } else { AttachParams::default() };
+        if let Some(c) = container { ap = ap.container(c); }
+        if pty { ap = ap.stderr(false); } else { ap = ap.stdout(true).stderr(true); }
+
+        let mut attached = api.exec(pod, cmd.to_vec(), &ap).await?;
+
+        // Output channel to caller
+        let cap = std::env::var("ORKA_OPS_QUEUE_CAP").ok().and_then(|s| s.parse().ok()).unwrap_or(1024);
+        let (tx_out, rx_out) = mpsc::channel::<ExecChunk>(cap);
+        let (cancel_tx, cancel_rx) = oneshot::channel::<()>();
+        let cancel = CancelHandle { tx: Some(cancel_tx) };
+
+        // stdin pump: caller sends bytes here
+        let (stdin_tx, mut stdin_rx) = mpsc::channel::<Vec<u8>>(64);
+        if let Some(mut writer) = attached.stdin() {
+            tokio::spawn(async move {
+                while let Some(buf) = stdin_rx.recv().await {
+                    if buf.is_empty() { break; }
+                    if tokio::io::AsyncWriteExt::write_all(&mut writer, &buf).await.is_err() { break; }
+                }
+            });
+        }
+
+        // stdout pump
+        if let Some(stdout_reader) = attached.stdout() {
+            let mut stream = tokio_util::io::ReaderStream::new(stdout_reader);
+            let tx = tx_out.clone();
+            tokio::spawn(async move {
+                while let Some(item) = stream.next().await {
+                    match item {
+                        Ok(bytes) => { let _ = tx.try_send(ExecChunk { bytes, stderr: false }); },
+                        Err(_) => break,
+                    }
+                }
+            });
+        }
+        // stderr pump (only non-pty)
+        if !pty {
+            if let Some(stderr_reader) = attached.stderr() {
+                let mut stream = tokio_util::io::ReaderStream::new(stderr_reader);
+                let tx = tx_out.clone();
+                tokio::spawn(async move {
+                    while let Some(item) = stream.next().await {
+                        match item {
+                            Ok(bytes) => { let _ = tx.try_send(ExecChunk { bytes, stderr: true }); },
+                            Err(_) => break,
+                        }
+                    }
+                });
+            }
+        }
+
+        // resize channel (if pty)
+        let resize_tx = if pty {
+            if let Some(mut term_size_tx) = attached.terminal_size() {
+                let (tx, mut rx) = mpsc::channel::<(u16, u16)>(8);
+                tokio::spawn(async move {
+                    while let Some((cols, rows)) = rx.recv().await {
+                        let _ = term_size_tx.send(TerminalSize { width: cols, height: rows }).await;
+                    }
+                });
+                Some(tx)
+            } else { None }
+        } else { None };
+
+        // Join or cancel watcher: dropping this task closes the session
+        tokio::spawn(async move {
+            tokio::select! {
+                _ = attached.join() => { /* remote exited */ }
+                _ = cancel_rx => { /* cancel requested -> drop attached */ }
+            }
+            // dropping attached ends IO pumps
+        });
+
+        Ok(ExecDuplexHandle { rx: rx_out, stdin_tx, resize_tx, cancel })
     }
 
     async fn port_forward(&self, namespace: Option<&str>, pod: &str, local: u16, remote: u16) -> Result<StreamHandle<ForwardEvent>> {

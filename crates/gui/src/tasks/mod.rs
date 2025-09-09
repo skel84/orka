@@ -8,3 +8,4 @@ pub mod edit;
 pub mod describe;
 pub mod ops;
 pub mod stats;
+pub mod exec;
