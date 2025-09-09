@@ -46,12 +46,12 @@ pub(crate) fn ui_statusbar(app: &mut OrkaGuiApp, ctx: &egui::Context) {
                 }
                 if app.logs.dropped > 0 || (app.logs.running && app.logs.recv > 0) {
                     ui.separator();
-                    // backlog usage (threshold)
-                    let used = app.logs.backlog.len();
-                    let cap = app.logs.backlog_cap.max(1);
+                    // logs ring usage (threshold)
+                    let used = app.logs.ring.len();
+                    let cap = app.logs.ring_cap.max(1);
                     let pct = (used as f32) / (cap as f32);
                     let col = if pct >= app.stats.err_pct { ui.visuals().error_fg_color } else if pct >= app.stats.warn_pct { ui.visuals().warn_fg_color } else { ui.visuals().text_color() };
-                    ui.colored_label(col, format!("backlog: {}/{}", used, cap));
+                    ui.colored_label(col, format!("logs: {}/{}", used, cap));
                     if app.logs.recv > 0 { ui.separator(); ui.label(format!("logs recv: {}", app.logs.recv)); }
                     if app.logs.dropped > 0 { ui.separator(); ui.colored_label(ui.visuals().error_fg_color, format!("dropped: {}", app.logs.dropped)); }
                 }

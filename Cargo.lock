@@ -3706,12 +3706,14 @@ dependencies = [
 name = "orka_gui"
 version = "0.0.0"
 dependencies = [
+ "chrono",
  "eframe",
  "egui 0.32.2",
  "egui_dock",
  "egui_table",
  "egui_virtual_list",
  "fuzzy-matcher",
+ "k8s-openapi",
  "kube",
  "metrics 0.21.1",
  "once_cell",

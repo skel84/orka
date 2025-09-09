@@ -113,12 +113,47 @@ impl OrkaGuiApp {
         egui::CollapsingHeader::new("Logs (Pod)")
             .default_open(false)
             .show(ui, |ui| {
+                // Controls
                 ui.horizontal(|ui| {
                     ui.checkbox(&mut self.logs.follow, "Follow");
+                    ui.separator();
+                    ui.label("Wrap:");
+                    ui.checkbox(&mut self.logs.wrap, "");
+                    ui.separator();
+                    ui.label("Colorize:");
+                    ui.checkbox(&mut self.logs.colorize, "");
+                    // Prefix theme mapping
+                    ui.separator();
+                    ui.label("Prefix:");
+                    let mut theme = self.logs.prefix_theme;
+                    egui::ComboBox::from_id_salt("logs_prefix_theme")
+                        .selected_text(match theme { crate::model::PrefixTheme::Bright => "Bright", crate::model::PrefixTheme::Basic => "Basic", crate::model::PrefixTheme::Gray => "Gray", crate::model::PrefixTheme::None => "None" })
+                        .show_ui(ui, |ui| {
+                            ui.selectable_value(&mut theme, crate::model::PrefixTheme::Bright, "Bright");
+                            ui.selectable_value(&mut theme, crate::model::PrefixTheme::Basic, "Basic");
+                            ui.selectable_value(&mut theme, crate::model::PrefixTheme::Gray, "Gray");
+                            ui.selectable_value(&mut theme, crate::model::PrefixTheme::None, "None");
+                        });
+                    if theme != self.logs.prefix_theme { self.logs.prefix_theme = theme; if self.logs.running && matches!(self.logs.container.as_deref(), Some("(all)")) { self.start_logs_task(); } }
+                    ui.separator();
+                    ui.label("Visible:");
+                    let mut vis = self.logs.visible_follow_limit as i32;
+                    if ui.add(egui::DragValue::new(&mut vis).range(100..=self.logs.ring_cap as i32)).on_hover_text("Max visible lines when following").changed() {
+                        self.logs.visible_follow_limit = vis.max(100) as usize;
+                    }
+                    ui.separator();
+                    ui.label("Since(s):");
+                    let mut since = self.logs.since_seconds.unwrap_or(0);
+                    if ui.add(egui::DragValue::new(&mut since).range(0..=86_400)).on_hover_text("Only show lines newer than N seconds; 0 disables").changed() {
+                        self.logs.since_seconds = if since <= 0 { None } else { Some(since as i64) };
+                        if self.logs.running { self.start_logs_task(); }
+                    }
+                    ui.separator();
                     ui.label("Tail:");
                     let mut tail = self.logs.tail_lines.unwrap_or(0);
                     if ui.add(egui::DragValue::new(&mut tail).range(0..=10000)).on_hover_text("Tail last N lines; 0 disables").changed() {
                         self.logs.tail_lines = if tail <= 0 { None } else { Some(tail as i64) };
+                        if self.logs.running { self.start_logs_task(); }
                     }
                     ui.separator();
                     ui.label("Container:");
@@ -127,19 +162,48 @@ impl OrkaGuiApp {
                     } else {
                         let current = self.logs.container.clone().unwrap_or_else(|| self.logs.containers.get(0).cloned().unwrap_or_default());
                         let mut selected = current.clone();
+                        let mut changed_container = false;
                         egui::ComboBox::from_id_salt("logs_container_select")
                             .selected_text(selected.clone())
                             .show_ui(ui, |ui| {
+                                // Aggregated: All containers option
+                                if ui.selectable_value(&mut selected, "(all)".to_string(), "(all)").changed() { changed_container = true; }
                                 for name in &self.logs.containers {
-                                    ui.selectable_value(&mut selected, name.clone(), name);
+                                    if ui.selectable_value(&mut selected, name.clone(), name).changed() { changed_container = true; }
                                 }
                             });
-                        if selected != current { self.logs.container = Some(selected); }
+                        if selected != current {
+                            self.logs.container = Some(selected);
+                            if self.logs.running && changed_container { self.start_logs_task(); }
+                        }
                     }
-                    ui.separator();
+                });
+                ui.horizontal(|ui| {
                     ui.label("Grep:");
-                    ui.add(egui::TextEdit::singleline(&mut self.logs.grep).desired_width(160.0));
-                    if ui.button("Clear").on_hover_text("Clear backlog").clicked() { self.logs.backlog.clear(); }
+                    let resp = ui.add(egui::TextEdit::singleline(&mut self.logs.grep).desired_width(200.0));
+                    if resp.changed() {
+                        // Recompile regex on change
+                        let text = self.logs.grep.trim().to_string();
+                        if text.is_empty() {
+                            self.logs.grep_cache = None;
+                            self.logs.grep_error = None;
+                        } else if let Ok(re) = regex::Regex::new(&text) {
+                            self.logs.grep_cache = Some((text, re));
+                            self.logs.grep_error = None;
+                        } else {
+                            self.logs.grep_cache = None;
+                            self.logs.grep_error = Some("invalid regex".into());
+                        }
+                    }
+                    if let Some(err) = &self.logs.grep_error { ui.colored_label(ui.visuals().warn_fg_color, err); }
+                    if self.logs.dropped > 0 {
+                        ui.separator();
+                        ui.colored_label(ui.visuals().error_fg_color, format!("dropped: {}", self.logs.dropped));
+                    }
+                    if ui.button("Clear").on_hover_text("Clear backlog").clicked() {
+                        self.logs.ring.clear();
+                        self.logs.backlog.clear();
+                    }
                     if !self.logs.running {
                         if ui.button("Start").on_hover_text("Start streaming logs").clicked() { self.start_logs_task(); }
                     } else {
@@ -147,26 +211,101 @@ impl OrkaGuiApp {
                     }
                 });
                 ui.add_space(4.0);
-                // Render log lines
-                let re: Option<regex::Regex> = if self.logs.grep.trim().is_empty() { None } else { regex::Regex::new(&self.logs.grep).ok() };
-                let mut buf = String::new();
-                let mut shown = 0usize;
-                let max_lines: usize = 1000; // cap per paint for perf
-                for line in self.logs.backlog.iter().rev() {
-                    if let Some(r) = &re { if !r.is_match(line) { continue; } }
-                    buf.push_str(line);
-                    if !line.ends_with('\n') { buf.push('\n'); }
-                    shown += 1;
-                    if shown >= max_lines { break; }
+
+                // Fallback path when v2 is disabled or wrap is ON (multi-line breaks fixed-height rows)
+                if !self.logs.v2 || self.logs.wrap {
+                    let re_opt = self.logs.grep_cache.as_ref().map(|(_, r)| r);
+                    let mut buf = String::new();
+                    let mut shown = 0usize;
+                    let max_lines: usize = 1000;
+                    if self.logs.v2 {
+                        // Use ring raw lines when v2 is enabled but wrapping is requested
+                        for p in self.logs.ring.iter().rev() {
+                            if let Some(r) = re_opt { if !r.is_match(&p.raw) { continue; } }
+                            buf.push_str(&p.raw);
+                            if !p.raw.ends_with('\n') { buf.push('\n'); }
+                            shown += 1;
+                            if shown >= max_lines { break; }
+                        }
+                    } else {
+                        for line in self.logs.backlog.iter().rev() {
+                            if let Some(r) = re_opt { if !r.is_match(line) { continue; } }
+                            buf.push_str(line);
+                            if !line.ends_with('\n') { buf.push('\n'); }
+                            shown += 1;
+                            if shown >= max_lines { break; }
+                        }
+                    }
+                    let display = if shown == 0 { String::new() } else { buf.lines().rev().collect::<Vec<_>>().join("\n") };
+                    let mut binding = display;
+                    let te = egui::TextEdit::multiline(&mut binding)
+                        .font(egui::TextStyle::Monospace)
+                        .desired_rows(20)
+                        .desired_width(f32::INFINITY)
+                        .interactive(false);
+                    ui.add(te);
+                    return;
                 }
-                let display = if shown == 0 { String::new() } else { buf.lines().rev().collect::<Vec<_>>().join("\n") };
-                let mut binding = display;
-                let te = egui::TextEdit::multiline(&mut binding)
-                    .font(egui::TextStyle::Monospace)
-                    .desired_rows(20)
-                    .desired_width(f32::INFINITY)
-                    .interactive(false);
-                ui.add(te);
+
+                // Build visible indices with grep filter and follow/paused logic
+                let mut indices: Vec<usize> = if let Some((_text, re)) = &self.logs.grep_cache {
+                    self.logs.ring.iter().enumerate().filter_map(|(i, p)| if re.is_match(&p.raw) { Some(i) } else { None }).collect()
+                } else {
+                    (0..self.logs.ring.len()).collect()
+                };
+
+                if !self.logs.follow && self.logs.order_by_ts_when_paused {
+                    indices.sort_by(|&a, &b| {
+                        let ta = self.logs.ring.get(a).and_then(|p| p.timestamp.clone());
+                        let tb = self.logs.ring.get(b).and_then(|p| p.timestamp.clone());
+                        match (ta, tb) {
+                            (Some(x), Some(y)) => x.cmp(&y),
+                            (Some(_), None) => std::cmp::Ordering::Less,
+                            (None, Some(_)) => std::cmp::Ordering::Greater,
+                            (None, None) => a.cmp(&b),
+                        }
+                    });
+                }
+
+                if self.logs.follow {
+                    let len = indices.len();
+                    let take = self.logs.visible_follow_limit.min(len);
+                    indices = indices.split_off(len - take);
+                }
+
+                let row_h = ui.text_style_height(&egui::TextStyle::Monospace);
+                let rows = indices.len();
+                let paint_start = std::time::Instant::now();
+                egui::ScrollArea::vertical()
+                    .id_salt("logs_scroll")
+                    .stick_to_bottom(self.logs.follow)
+                    .auto_shrink([false, false])
+                    .show_rows(ui, row_h, if self.logs.follow { rows + self.logs.follow_pad_rows } else { rows }, |ui, range| {
+                        for local_row in range.clone() {
+                            // Add bottom pad rows when following
+                            if self.logs.follow && local_row >= rows {
+                                ui.add_space(row_h);
+                                continue;
+                            }
+                            if let Some(&ring_idx) = indices.get(local_row) {
+                                if let Some(p) = self.logs.ring.get(ring_idx) {
+                                    // Fixed height row: render one line
+                                    let widget = if self.logs.wrap {
+                                        egui::Label::new(p.job.clone()).wrap()
+                                    } else {
+                                        egui::Label::new(p.job.clone()).truncate()
+                                    };
+                                    ui.add(widget);
+                                }
+                            }
+                        }
+                    });
+                let ms = paint_start.elapsed().as_millis() as f64;
+                histogram!("ui_logs_paint_ms", ms);
+                histogram!("ui_logs_rows_per_paint", rows as f64);
+                if !self.logs.follow && self.logs.order_by_ts_when_paused {
+                    ui.colored_label(ui.visuals().weak_text_color(), "sorted by timestamp");
+                }
             });
     }
     pub(crate) fn ui_details(&mut self, ui: &mut egui::Ui) {
@@ -209,10 +348,11 @@ impl OrkaGuiApp {
         // Tab bar inside the Details pane (Edit | Logs | Describe)
         ui.horizontal(|ui| {
             let tab = self.details.active_tab;
-            let mut set_tab = |t| { self.details.active_tab = t; };
-            if ui.selectable_label(matches!(tab, DetailsPaneTab::Edit), "Edit").clicked() { set_tab(DetailsPaneTab::Edit); }
-            if ui.selectable_label(matches!(tab, DetailsPaneTab::Logs), "Logs").clicked() { set_tab(DetailsPaneTab::Logs); }
-            if ui.selectable_label(matches!(tab, DetailsPaneTab::Describe), "Describe").clicked() { set_tab(DetailsPaneTab::Describe); }
+            let is_svc = self.selected_is_service();
+            if ui.selectable_label(matches!(tab, DetailsPaneTab::Edit), "Edit").clicked() { self.details.active_tab = DetailsPaneTab::Edit; }
+            if ui.selectable_label(matches!(tab, DetailsPaneTab::Logs), "Logs").clicked() { self.details.active_tab = DetailsPaneTab::Logs; }
+            if is_svc { if ui.selectable_label(matches!(tab, DetailsPaneTab::SvcLogs), "Svc Logs").clicked() { self.details.active_tab = DetailsPaneTab::SvcLogs; } }
+            if ui.selectable_label(matches!(tab, DetailsPaneTab::Describe), "Describe").clicked() { self.details.active_tab = DetailsPaneTab::Describe; }
         });
         ui.separator();
         egui::ScrollArea::vertical()
@@ -230,6 +370,9 @@ impl OrkaGuiApp {
                     }
                     DetailsPaneTab::Logs => {
                         self.ui_logs(ui);
+                    }
+                    DetailsPaneTab::SvcLogs => {
+                        self.ui_service_logs(ui);
                     }
                     DetailsPaneTab::Describe => {
                         ui.horizontal(|ui| {
@@ -253,6 +396,106 @@ impl OrkaGuiApp {
                             .interactive(false);
                         ui.add(te);
                     }
+                }
+            });
+    }
+
+    fn ui_service_logs(&mut self, ui: &mut egui::Ui) {
+        if !self.selected_is_service() { return; }
+        egui::CollapsingHeader::new("Logs (Service)")
+            .default_open(false)
+            .show(ui, |ui| {
+                // Controls
+                ui.horizontal(|ui| {
+                    ui.checkbox(&mut self.svc_logs.follow, "Follow");
+                    ui.separator();
+                    ui.label("Visible:");
+                    let mut vis = self.svc_logs.visible_follow_limit as i32;
+                    if ui.add(egui::DragValue::new(&mut vis).range(100..=self.svc_logs.ring_cap as i32)).on_hover_text("Max visible lines when following").changed() {
+                        self.svc_logs.visible_follow_limit = vis.max(100) as usize;
+                    }
+                    ui.separator();
+                    // Prefix theme selector
+                    ui.label("Prefix:");
+                    let mut theme = self.svc_logs.prefix_theme;
+                    egui::ComboBox::from_id_salt("svc_logs_prefix_theme")
+                        .selected_text(match theme { crate::model::PrefixTheme::Bright => "Bright", crate::model::PrefixTheme::Basic => "Basic", crate::model::PrefixTheme::Gray => "Gray", crate::model::PrefixTheme::None => "None" })
+                        .show_ui(ui, |ui| {
+                            ui.selectable_value(&mut theme, crate::model::PrefixTheme::Bright, "Bright");
+                            ui.selectable_value(&mut theme, crate::model::PrefixTheme::Basic, "Basic");
+                            ui.selectable_value(&mut theme, crate::model::PrefixTheme::Gray, "Gray");
+                            ui.selectable_value(&mut theme, crate::model::PrefixTheme::None, "None");
+                        });
+                    if theme != self.svc_logs.prefix_theme { self.svc_logs.prefix_theme = theme; if self.svc_logs.running { self.start_service_logs_task(); } }
+                    ui.separator();
+                    ui.label("Since(s):");
+                    let mut since = self.svc_logs.since_seconds.unwrap_or(0);
+                    if ui.add(egui::DragValue::new(&mut since).range(0..=86_400)).on_hover_text("Only show lines newer than N seconds; 0 disables").changed() {
+                        self.svc_logs.since_seconds = if since <= 0 { None } else { Some(since as i64) };
+                        if self.svc_logs.running { self.start_service_logs_task(); }
+                    }
+                    ui.separator();
+                    ui.label("Tail:");
+                    let mut tail = self.svc_logs.tail_lines.unwrap_or(0);
+                    if ui.add(egui::DragValue::new(&mut tail).range(0..=10000)).on_hover_text("Tail last N lines; 0 disables").changed() {
+                        self.svc_logs.tail_lines = if tail <= 0 { None } else { Some(tail as i64) };
+                        if self.svc_logs.running { self.start_service_logs_task(); }
+                    }
+                });
+                ui.horizontal(|ui| {
+                    ui.label("Grep:");
+                    let resp = ui.add(egui::TextEdit::singleline(&mut self.svc_logs.grep).desired_width(200.0));
+                    if resp.changed() {
+                        let text = self.svc_logs.grep.trim().to_string();
+                        if text.is_empty() { self.svc_logs.grep_cache = None; self.svc_logs.grep_error = None; }
+                        else if let Ok(re) = regex::Regex::new(&text) { self.svc_logs.grep_cache = Some((text, re)); self.svc_logs.grep_error = None; }
+                        else { self.svc_logs.grep_cache = None; self.svc_logs.grep_error = Some("invalid regex".into()); }
+                    }
+                    if let Some(err) = &self.svc_logs.grep_error { ui.colored_label(ui.visuals().warn_fg_color, err); }
+                    if self.svc_logs.dropped > 0 { ui.separator(); ui.colored_label(ui.visuals().error_fg_color, format!("dropped: {}", self.svc_logs.dropped)); }
+                    if ui.button("Clear").clicked() { self.svc_logs.ring.clear(); }
+                    if !self.svc_logs.running { if ui.button("Start").clicked() { self.start_service_logs_task(); } }
+                    else { if ui.button("Stop").clicked() { self.stop_service_logs_task(); } }
+                });
+                ui.add_space(4.0);
+
+                // Build indices with grep
+                let mut indices: Vec<usize> = if let Some((_t, re)) = &self.svc_logs.grep_cache {
+                    self.svc_logs.ring.iter().enumerate().filter_map(|(i, p)| if re.is_match(&p.raw) { Some(i) } else { None }).collect()
+                } else { (0..self.svc_logs.ring.len()).collect() };
+                if !self.svc_logs.follow && self.svc_logs.order_by_ts_when_paused {
+                    indices.sort_by(|&a, &b| {
+                        let ta = self.svc_logs.ring.get(a).and_then(|p| p.timestamp.clone());
+                        let tb = self.svc_logs.ring.get(b).and_then(|p| p.timestamp.clone());
+                        match (ta, tb) {
+                            (Some(x), Some(y)) => x.cmp(&y),
+                            (Some(_), None) => std::cmp::Ordering::Less,
+                            (None, Some(_)) => std::cmp::Ordering::Greater,
+                            (None, None) => a.cmp(&b),
+                        }
+                    });
+                }
+                if self.svc_logs.follow { let len = indices.len(); let take = self.svc_logs.visible_follow_limit.min(len); indices = indices.split_off(len - take); }
+
+                let row_h = ui.text_style_height(&egui::TextStyle::Monospace);
+                let rows = indices.len();
+                egui::ScrollArea::vertical()
+                    .id_salt("svc_logs_scroll")
+                    .stick_to_bottom(self.svc_logs.follow)
+                    .auto_shrink([false, false])
+                    .show_rows(ui, row_h, if self.svc_logs.follow { rows + self.svc_logs.follow_pad_rows } else { rows }, |ui, range| {
+                        for local_row in range.clone() {
+                            if self.svc_logs.follow && local_row >= rows { ui.add_space(row_h); continue; }
+                            if let Some(&ring_idx) = indices.get(local_row) {
+                                if let Some(p) = self.svc_logs.ring.get(ring_idx) {
+                                    let widget = egui::Label::new(p.job.clone()).truncate();
+                                    ui.add(widget);
+                                }
+                            }
+                        }
+                    });
+                if !self.svc_logs.follow && self.svc_logs.order_by_ts_when_paused {
+                    ui.colored_label(ui.visuals().weak_text_color(), "sorted by timestamp");
                 }
             });
     }

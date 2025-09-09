@@ -30,6 +30,8 @@ syntect = "5"
 metrics = { workspace = true }
 uuid = { workspace = true }
 kube = { workspace = true }
+k8s-openapi = { workspace = true }
+chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
 
 [features]
 default = ["dock"]

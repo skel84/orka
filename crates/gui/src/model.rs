@@ -2,6 +2,7 @@
 
 use std::time::Instant;
 use eframe::egui;
+use chrono::{DateTime, Utc};
 
 use orka_api::LiteEvent;
 use orka_core::{LiteObj, Uid};
@@ -31,6 +32,11 @@ pub enum UiUpdate {
     LogLine(String),
     LogError(String),
     LogEnded,
+    // Service logs streaming updates
+    SvcLogStarted,
+    SvcLogLine(String),
+    SvcLogError(String),
+    SvcLogEnded,
     // Pod-specific metadata
     PodContainers(Vec<String>),
     // Edit tab updates
@@ -145,7 +151,7 @@ pub struct DetailsState {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum DetailsPaneTab { Edit, Logs, Describe }
+pub enum DetailsPaneTab { Edit, Logs, SvcLogs, Describe }
 
 impl Default for DetailsPaneTab {
     fn default() -> Self { DetailsPaneTab::Describe }
@@ -167,6 +173,7 @@ pub struct LogsState {
     pub running: bool,
     pub follow: bool,
     pub grep: String,
+    // Legacy string backlog (kept for fallback path, not used in v2 renderer)
     pub backlog: std::collections::VecDeque<String>,
     pub backlog_cap: usize,
     pub dropped: usize,
@@ -177,6 +184,58 @@ pub struct LogsState {
     pub since_seconds: Option<i64>,
     pub task: Option<JoinHandle<()>>,
     pub cancel: Option<orka_api::CancelHandle>,
+    // Logs v2 ring buffer with pre-parsed layout jobs
+    pub ring: std::collections::VecDeque<ParsedLine>,
+    pub ring_cap: usize,
+    // UI controls
+    pub wrap: bool,
+    pub colorize: bool,
+    pub visible_follow_limit: usize,
+    pub order_by_ts_when_paused: bool,
+    pub follow_pad_rows: usize,
+    pub prefix_theme: PrefixTheme,
+    // Cached grep regex compiled when the input changes
+    pub grep_cache: Option<(String, regex::Regex)>,
+    pub grep_error: Option<String>,
+    // Feature switch to keep old textarea fallback
+    pub v2: bool,
+}
+
+#[derive(Default)]
+pub struct ServiceLogsState {
+    pub running: bool,
+    pub follow: bool,
+    pub grep: String,
+    pub grep_cache: Option<(String, regex::Regex)>,
+    pub grep_error: Option<String>,
+    pub ring: std::collections::VecDeque<ParsedLine>,
+    pub ring_cap: usize,
+    pub recv: usize,
+    pub dropped: usize,
+    pub tail_lines: Option<i64>,
+    pub since_seconds: Option<i64>,
+    pub task: Option<JoinHandle<()>>,
+    pub cancel: Option<orka_api::CancelHandle>,
+    pub visible_follow_limit: usize,
+    pub colorize: bool,
+    pub order_by_ts_when_paused: bool,
+    pub follow_pad_rows: usize,
+    pub v2: bool,
+    pub prefix_theme: PrefixTheme,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PrefixTheme { Bright, Basic, Gray, None }
+
+impl Default for PrefixTheme {
+    fn default() -> Self { PrefixTheme::Bright }
+}
+
+#[derive(Clone)]
+pub struct ParsedLine {
+    pub raw: String,
+    pub job: egui::text::LayoutJob,
+    pub timestamp: Option<DateTime<Utc>>,
 }
 
 #[derive(Default)]

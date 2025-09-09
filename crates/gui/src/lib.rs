@@ -11,7 +11,7 @@ use orka_api::{LiteEvent, OrkaApi, ResourceKind, Selector};
 use orka_core::{LiteObj, Uid};
 use orka_core::columns::{ColumnKind, ColumnSpec};
 use tracing::info;
-use metrics::{counter, histogram};
+use metrics::{counter, gauge, histogram};
 use tokio::sync::Semaphore;
 
 mod util;
@@ -22,8 +22,9 @@ mod details;
 mod model;
 mod ui;
 mod tasks;
+mod logs;
 pub use model::{UiUpdate, VirtualMode, SearchExplain, PaletteItem, PaletteState, LayoutState};
-use model::{ResultsState, SearchState, DetailsState, SelectionState, UiDebounce, DiscoveryState, WatchState, LogsState, EditState, OpsState, ToastKind, StatsState};
+use model::{ResultsState, SearchState, DetailsState, SelectionState, UiDebounce, DiscoveryState, WatchState, LogsState, ServiceLogsState, EditState, OpsState, ToastKind, StatsState, PrefixTheme};
 use model::{DetailsPaneTab, DescribeState};
 use model::{DetachedDetailsWindow, DetachedDetailsWindowMeta, DetachedDetailsWindowState};
 use util::{gvk_label, parse_gvk_key_to_kind};
@@ -47,6 +48,7 @@ pub struct OrkaGuiApp {
     selection: SelectionState,
     details: DetailsState,
     logs: LogsState,
+    svc_logs: ServiceLogsState,
     edit: EditState,
     describe: DescribeState,
     // status
@@ -196,6 +198,12 @@ impl OrkaGuiApp {
             None => false,
         }
     }
+    pub(crate) fn selected_is_service(&self) -> bool {
+        match self.current_selected_kind() {
+            Some(k) => k.group.is_empty() && k.version == "v1" && k.kind == "Service",
+            None => false,
+        }
+    }
     pub(crate) fn selected_is_node(&self) -> bool {
         match self.current_selected_kind() {
             Some(k) => k.group.is_empty() && k.version == "v1" && k.kind == "Node",
@@ -239,8 +247,81 @@ impl OrkaGuiApp {
             details: DetailsState { selected: None, buffer: String::new(), task: None, stop: None, selected_at: None, active_tab: DetailsPaneTab::Describe },
             describe: DescribeState { running: false, text: String::new(), error: None, uid: None, task: None, stop: None },
             logs: {
-                let cap = std::env::var("ORKA_LOGS_BACKLOG_CAP").ok().and_then(|s| s.parse().ok()).unwrap_or(2000);
-                LogsState { running: false, follow: true, grep: String::new(), backlog: std::collections::VecDeque::with_capacity(cap.min(256)), backlog_cap: cap, dropped: 0, recv: 0, containers: Vec::new(), container: None, tail_lines: None, since_seconds: None, task: None, cancel: None }
+                let cap_legacy = std::env::var("ORKA_LOGS_BACKLOG_CAP").ok().and_then(|s| s.parse().ok()).unwrap_or(2000);
+                let ring_cap = std::env::var("ORKA_LOGS_RING_CAP").ok().and_then(|s| s.parse().ok()).unwrap_or(10_000);
+                let vis_limit = std::env::var("ORKA_LOGS_VISIBLE_FOLLOW_LIMIT").ok().and_then(|s| s.parse().ok()).unwrap_or(1000);
+                let colorize = std::env::var("ORKA_LOGS_COLORIZE").ok().and_then(|s| s.parse::<i32>().ok()).unwrap_or(1) != 0;
+                let wrap = std::env::var("ORKA_LOGS_WRAP").ok().and_then(|s| s.parse::<i32>().ok()).unwrap_or(0) != 0;
+                let order_paused = std::env::var("ORKA_LOGS_ORDER_BY_TS_WHEN_PAUSED").ok().and_then(|s| s.parse::<i32>().ok()).unwrap_or(1) != 0;
+                let v2 = std::env::var("ORKA_LOGS_V2").ok().and_then(|s| s.parse::<i32>().ok()).unwrap_or(1) != 0;
+                let pad_rows = std::env::var("ORKA_LOGS_FOLLOW_PAD_ROWS").ok().and_then(|s| s.parse::<usize>().ok()).unwrap_or(1);
+                let prefix_theme = match std::env::var("ORKA_LOGS_PREFIX_THEME").ok().unwrap_or_else(|| "bright".to_string()).to_ascii_lowercase().as_str() {
+                    "basic" => PrefixTheme::Basic,
+                    "gray" | "grey" => PrefixTheme::Gray,
+                    "none" => PrefixTheme::None,
+                    _ => PrefixTheme::Bright,
+                };
+                LogsState {
+                    running: false,
+                    follow: true,
+                    grep: String::new(),
+                    backlog: std::collections::VecDeque::with_capacity(cap_legacy.min(256)),
+                    backlog_cap: cap_legacy,
+                    dropped: 0,
+                    recv: 0,
+                    containers: Vec::new(),
+                    container: None,
+                    tail_lines: None,
+                    since_seconds: None,
+                    task: None,
+                    cancel: None,
+                    ring: std::collections::VecDeque::with_capacity(ring_cap.min(256)),
+                    ring_cap,
+                    wrap,
+                    colorize,
+                    visible_follow_limit: vis_limit,
+                    order_by_ts_when_paused: order_paused,
+                    follow_pad_rows: pad_rows,
+                    prefix_theme,
+                    grep_cache: None,
+                    grep_error: None,
+                    v2,
+                }
+            },
+            svc_logs: {
+                let ring_cap = std::env::var("ORKA_LOGS_RING_CAP").ok().and_then(|s| s.parse().ok()).unwrap_or(10_000);
+                let vis_limit = std::env::var("ORKA_LOGS_VISIBLE_FOLLOW_LIMIT").ok().and_then(|s| s.parse().ok()).unwrap_or(1000);
+                let colorize = std::env::var("ORKA_LOGS_COLORIZE").ok().and_then(|s| s.parse::<i32>().ok()).unwrap_or(1) != 0;
+                let order_paused = std::env::var("ORKA_LOGS_ORDER_BY_TS_WHEN_PAUSED").ok().and_then(|s| s.parse::<i32>().ok()).unwrap_or(1) != 0;
+                let v2 = std::env::var("ORKA_LOGS_V2").ok().and_then(|s| s.parse::<i32>().ok()).unwrap_or(1) != 0;
+                let pad_rows = std::env::var("ORKA_LOGS_FOLLOW_PAD_ROWS").ok().and_then(|s| s.parse::<usize>().ok()).unwrap_or(1);
+                let prefix_theme = match std::env::var("ORKA_LOGS_PREFIX_THEME").ok().unwrap_or_else(|| "bright".to_string()).to_ascii_lowercase().as_str() {
+                    "basic" => PrefixTheme::Basic,
+                    "gray" | "grey" => PrefixTheme::Gray,
+                    "none" => PrefixTheme::None,
+                    _ => PrefixTheme::Bright,
+                };
+                ServiceLogsState {
+                    running: false,
+                    follow: true,
+                    grep: String::new(),
+                    grep_cache: None,
+                    grep_error: None,
+                    ring: std::collections::VecDeque::with_capacity(ring_cap.min(256)),
+                    ring_cap,
+                    recv: 0,
+                    dropped: 0,
+                    tail_lines: None,
+                    since_seconds: None,
+                    task: None,
+                    cancel: None,
+                    visible_follow_limit: vis_limit,
+                    colorize,
+                    order_by_ts_when_paused: order_paused,
+                    follow_pad_rows: pad_rows,
+                    v2,
+                    prefix_theme,
+                }
             },
             edit: EditState { buffer: String::new(), original: String::new(), dirty: false, running: false, status: String::new(), task: None, stop: None },
             last_error: None,
@@ -790,10 +871,26 @@ impl eframe::App for OrkaGuiApp {
                         processed += 1;
                     }
                     Ok(UiUpdate::LogLine(line)) => {
-                        // Append to backlog with cap; count drops
                         self.logs.recv += 1;
-                        if self.logs.backlog.len() >= self.logs.backlog_cap { self.logs.backlog.pop_front(); self.logs.dropped += 1; }
-                        self.logs.backlog.push_back(line);
+                        counter!("logs_recv_total", 1);
+                        if self.logs.v2 {
+                            // Append to ring with cap; count drops. Pre-parse to LayoutJob.
+                            let color = ctx.style().visuals.text_color();
+                            let t0 = Instant::now();
+                            let job = crate::logs::parser::parse_line_to_job(&line, color, self.logs.colorize);
+                            let ts = crate::logs::parser::parse_timestamp_utc(&line);
+                            let parse_ms = t0.elapsed().as_micros() as f64 / 1000.0;
+                            histogram!("logs_parse_ms", parse_ms);
+                            let parsed = crate::model::ParsedLine { raw: line, job, timestamp: ts };
+                            if self.logs.ring.len() >= self.logs.ring_cap { self.logs.ring.pop_front(); self.logs.dropped += 1; counter!("logs_dropped_total", 1); }
+                            self.logs.ring.push_back(parsed);
+                            gauge!("logs_ring_len", self.logs.ring.len() as f64);
+                        } else {
+                            // Legacy path: simple string backlog
+                            if self.logs.backlog.len() >= self.logs.backlog_cap { self.logs.backlog.pop_front(); self.logs.dropped += 1; counter!("logs_dropped_total", 1); }
+                            self.logs.backlog.push_back(line);
+                            gauge!("logs_ring_len", self.logs.backlog.len() as f64);
+                        }
                         processed += 1;
                     }
                     Ok(UiUpdate::LogError(err)) => {
@@ -803,6 +900,41 @@ impl eframe::App for OrkaGuiApp {
                         self.logs.task = None;
                         self.logs.cancel = None;
                         pending_toasts.push((format!("logs: {}", err), ToastKind::Error));
+                        processed += 1;
+                    }
+                    Ok(UiUpdate::SvcLogStarted) => {
+                        self.svc_logs.running = true;
+                        pending_toasts.push(("service logs: started".to_string(), ToastKind::Info));
+                        processed += 1;
+                    }
+                    Ok(UiUpdate::SvcLogLine(line)) => {
+                        self.svc_logs.recv += 1;
+                        counter!("svc_logs_recv_total", 1);
+                        if self.svc_logs.v2 {
+                            let color = ctx.style().visuals.text_color();
+                            let t0 = Instant::now();
+                            let job = crate::logs::parser::parse_line_to_job(&line, color, self.svc_logs.colorize);
+                            let ts = crate::logs::parser::parse_timestamp_utc(&line);
+                            let parse_ms = t0.elapsed().as_micros() as f64 / 1000.0;
+                            histogram!("svc_logs_parse_ms", parse_ms);
+                            let parsed = crate::model::ParsedLine { raw: line, job, timestamp: ts };
+                            if self.svc_logs.ring.len() >= self.svc_logs.ring_cap { self.svc_logs.ring.pop_front(); self.svc_logs.dropped += 1; counter!("svc_logs_dropped_total", 1); }
+                            self.svc_logs.ring.push_back(parsed);
+                            gauge!("svc_logs_ring_len", self.svc_logs.ring.len() as f64);
+                        }
+                        processed += 1;
+                    }
+                    Ok(UiUpdate::SvcLogError(err)) => {
+                        self.last_error = Some(err.clone());
+                        self.svc_logs.running = false;
+                        self.svc_logs.task = None;
+                        pending_toasts.push((format!("service logs: {}", err), ToastKind::Error));
+                        processed += 1;
+                    }
+                    Ok(UiUpdate::SvcLogEnded) => {
+                        self.svc_logs.running = false;
+                        self.svc_logs.task = None;
+                        pending_toasts.push(("service logs: ended".to_string(), ToastKind::Info));
                         processed += 1;
                     }
                     Ok(UiUpdate::LogEnded) => {
