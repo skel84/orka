@@ -122,30 +122,6 @@ impl OrkaGuiApp {
         let meta = DetachedDetailsWindowMeta { id, uid, title, gvk: gvk.clone(), namespace: ns.clone(), name: name.clone() };
         let state = DetachedDetailsWindowState { buffer: String::new(), last_error: None, opened_at: Instant::now() };
         self.detached.push(DetachedDetailsWindow { meta: meta.clone(), state });
-        // Kick an async fetch for this window (similar to select_row)
-        let api = self.api.clone();
-        let tx_opt = self.watch.updates_tx.clone();
-        let reference = orka_api::ResourceRef { cluster: None, gvk, namespace: ns, name };
-        tokio::spawn(async move {
-            let t0 = Instant::now();
-            match api.get_raw(reference).await {
-                Ok(bytes) => {
-                    // Try to parse as JSON for YAML rendering
-                    let text: String = match serde_json::from_slice::<serde_json::Value>(&bytes) {
-                        Ok(v) => match serde_yaml::to_string(&v) { Ok(y) => y, Err(_) => String::from_utf8_lossy(&bytes).into_owned() },
-                        Err(_) => String::from_utf8_lossy(&bytes).into_owned(),
-                    };
-                    if let Some(tx) = tx_opt.as_ref() {
-                        let _ = tx.send(model::UiUpdate::DetachedDetail { id, uid, text, produced_at: t0 });
-                    }
-                }
-                Err(e) => {
-                    if let Some(tx) = tx_opt.as_ref() {
-                        let _ = tx.send(model::UiUpdate::DetachedDetailError { id, error: e.to_string() });
-                    }
-                }
-            }
-        });
         // Ensure OS knows about the new viewport right away
         ctx.request_repaint();
     }
@@ -1282,26 +1258,24 @@ impl eframe::App for OrkaGuiApp {
         // Refresh ops caps when selection/namespace changes
         self.ensure_caps_for_selection();
 
-        // Render any detached details viewports (OS-managed windows)
+        // Render any detached details viewports (OS-managed windows) with full Details UI
         {
+            // Snapshot metadata to avoid borrow conflicts while drawing with &mut self
+            let windows: Vec<(egui::ViewportId, String, Uid)> = self
+                .detached
+                .iter()
+                .map(|w| (w.meta.id, w.meta.title.clone(), w.meta.uid))
+                .collect();
             let close_reqs: std::rc::Rc<std::cell::RefCell<Vec<egui::ViewportId>>> = Default::default();
-            for w in &self.detached {
-                let id = w.meta.id;
-                let title = w.meta.title.clone();
+            for (id, title, uid) in windows.into_iter() {
                 let cr = close_reqs.clone();
-                let api = self.api.clone();
-                let tx_opt = self.watch.updates_tx.clone();
-                let reference = orka_api::ResourceRef { cluster: None, gvk: w.meta.gvk.clone(), namespace: w.meta.namespace.clone(), name: w.meta.name.clone() };
-                let buffer = w.state.buffer.clone();
-                let uid = w.meta.uid;
-                let last_error = w.state.last_error.clone();
                 ctx.show_viewport_immediate(
                     id,
                     egui::ViewportBuilder::default()
                         .with_title(title)
-                        .with_inner_size([780.0, 600.0])
+                        .with_inner_size([980.0, 720.0])
                         .with_decorations(true),
-                    move |ctx, _class| {
+                    |ctx, _class| {
                         // Handle OS close button
                         if ctx.input(|i| i.viewport().close_requested()) {
                             cr.borrow_mut().push(id);
@@ -1309,51 +1283,16 @@ impl eframe::App for OrkaGuiApp {
                             return;
                         }
                         egui::CentralPanel::default().show(ctx, |ui| {
-                            ui.horizontal(|ui| {
-                                if ui.small_button("Refresh").clicked() {
-                                    // Fire a new fetch for this window
-                                    let api = api.clone();
-                                    let tx_opt = tx_opt.clone();
-                                    let reference = reference.clone();
-                                    tokio::spawn(async move {
-                                        let t0 = Instant::now();
-                                        match api.get_raw(reference).await {
-                                            Ok(bytes) => {
-                                                let text: String = match serde_json::from_slice::<serde_json::Value>(&bytes) {
-                                                    Ok(v) => match serde_yaml::to_string(&v) { Ok(y) => y, Err(_) => String::from_utf8_lossy(&bytes).into_owned() },
-                                                    Err(_) => String::from_utf8_lossy(&bytes).into_owned(),
-                                                };
-                                                if let Some(tx) = tx_opt.as_ref() { let _ = tx.send(model::UiUpdate::DetachedDetail { id, uid:  [0u8; 16], text, produced_at: t0 }); }
-                                            }
-                                            Err(e) => { if let Some(tx) = tx_opt.as_ref() { let _ = tx.send(model::UiUpdate::DetachedDetailError { id, error: e.to_string() }); } }
-                                        }
-                                    });
-                                }
-                                if ui.small_button("Reattach").clicked() {
-                                    if let Some(tx) = tx_opt.as_ref() {
-                                        let _ = tx.send(model::UiUpdate::ReattachDetached { id, uid });
+                            // When this window is focused, drive global selection to this UID
+                            let is_focused = ctx.input(|i| i.viewport().focused);
+                            if is_focused.unwrap_or(false) && self.details.selected != Some(uid) {
+                                if let Some(i) = self.results.index.get(&uid).copied() {
+                                    if let Some(row) = self.results.rows.get(i).cloned() {
+                                        self.select_row(row);
                                     }
-                                    cr.borrow_mut().push(id);
-                                    ctx.send_viewport_cmd(egui::ViewportCommand::Close);
                                 }
-                                if ui.small_button("Close").clicked() {
-                                    cr.borrow_mut().push(id);
-                                    ctx.send_viewport_cmd(egui::ViewportCommand::Close);
-                                }
-                            });
-                            ui.separator();
-                            // Render details content
-                            if let Some(err) = &last_error { ui.colored_label(ui.visuals().error_fg_color, format!("error: {}", err)); }
-                            let mut layouter = crate::util::highlight::yaml_layouter();
-                            let mut buf = buffer.clone();
-                            if buf.is_empty() { buf = String::from("Loading…"); }
-                            let te = egui::TextEdit::multiline(&mut buf)
-                                .font(egui::TextStyle::Monospace)
-                                .desired_rows(24)
-                                .desired_width(f32::INFINITY)
-                                .interactive(false)
-                                .layouter(&mut layouter);
-                            ui.add(te);
+                            }
+                            self.ui_details(ui);
                         });
                     },
                 );

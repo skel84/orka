@@ -14,105 +14,99 @@ use crate::model::DetailsPaneTab;
 
 impl OrkaGuiApp {
     fn ui_edit(&mut self, ui: &mut egui::Ui) {
-        egui::CollapsingHeader::new("Edit")
-            .default_open(false)
-            .show(ui, |ui| {
-                // Toolbar
-                ui.horizontal(|ui| {
-                    if ui.button("Reset to live").on_hover_text("Reset editor to current Details").clicked() {
-                        self.edit.buffer = self.edit.original.clone();
-                        self.edit.dirty = false;
-                        self.edit.status.clear();
-                    }
-                    if ui.button("Dry-run").on_hover_text("Server-side dry-run; show diff summary").clicked() {
-                        self.start_edit_dry_run_task();
-                    }
-                    if ui.button("Diff").on_hover_text("Compute diff vs live and last-applied").clicked() {
-                        self.start_edit_diff_task();
-                    }
-                    if ui.button("Apply").on_hover_text("Server-side apply (SSA)").clicked() {
-                        self.start_edit_apply_task();
-                    }
-                    if self.edit.running { ui.add(egui::Spinner::new()); }
-                    if !self.edit.status.is_empty() {
-                        ui.separator();
-                        ui.label(&self.edit.status);
-                    }
-                });
-                ui.add_space(4.0);
-                // Editor
-                // Editor with line numbers and indent guides.
-                let lines_count = self.edit.buffer.lines().count().max(1);
-                let digits = ((lines_count as f32).log10().floor() as usize + 1).max(2);
-                let mono = egui::TextStyle::Monospace;
-                let row_h = ui.text_style_height(&mono);
-                let gutter_w = 8.0 + digits as f32 * 8.0;
-                egui::ScrollArea::horizontal().id_salt("edit_scroll_h").show(ui, |ui| {
-                    ui.horizontal(|ui| {
-                        // Left gutter with line numbers
-                        let mut nums = String::with_capacity(digits * lines_count + lines_count);
-                        for i in 1..=lines_count { let _ = std::fmt::write(&mut nums, format_args!("{i:>width$}\n", width = digits)); }
-                        let total_h = (lines_count as f32) * row_h + 8.0;
-                        let (rect, _resp) = ui.allocate_exact_size(egui::vec2(gutter_w, total_h), egui::Sense::hover());
-                        ui.painter().rect_filled(rect, 0.0, ui.visuals().extreme_bg_color);
-                        ui.painter().text(
-                            rect.left_top() + egui::vec2(4.0, 4.0),
-                            egui::Align2::LEFT_TOP,
-                            nums,
-                            mono.resolve(ui.style()),
-                            ui.visuals().weak_text_color(),
+        // Toolbar
+        ui.horizontal(|ui| {
+            if ui.button("Reset to live").on_hover_text("Reset editor to current Details").clicked() {
+                self.edit.buffer = self.edit.original.clone();
+                self.edit.dirty = false;
+                self.edit.status.clear();
+            }
+            if ui.button("Dry-run").on_hover_text("Server-side dry-run; show diff summary").clicked() {
+                self.start_edit_dry_run_task();
+            }
+            if ui.button("Diff").on_hover_text("Compute diff vs live and last-applied").clicked() {
+                self.start_edit_diff_task();
+            }
+            if ui.button("Apply").on_hover_text("Server-side apply (SSA)").clicked() {
+                self.start_edit_apply_task();
+            }
+            if self.edit.running { ui.add(egui::Spinner::new()); }
+            if !self.edit.status.is_empty() {
+                ui.separator();
+                ui.label(&self.edit.status);
+            }
+        });
+        ui.add_space(4.0);
+        // Editor
+        // Editor with line numbers and indent guides.
+        let lines_count = self.edit.buffer.lines().count().max(1);
+        let digits = ((lines_count as f32).log10().floor() as usize + 1).max(2);
+        let mono = egui::TextStyle::Monospace;
+        let row_h = ui.text_style_height(&mono);
+        let gutter_w = 8.0 + digits as f32 * 8.0;
+        egui::ScrollArea::horizontal().id_salt("edit_scroll_h").show(ui, |ui| {
+            ui.horizontal(|ui| {
+                // Left gutter with line numbers
+                let mut nums = String::with_capacity(digits * lines_count + lines_count);
+                for i in 1..=lines_count { let _ = std::fmt::write(&mut nums, format_args!("{i:>width$}\n", width = digits)); }
+                let total_h = (lines_count as f32) * row_h + 8.0;
+                let (rect, _resp) = ui.allocate_exact_size(egui::vec2(gutter_w, total_h), egui::Sense::hover());
+                ui.painter().rect_filled(rect, 0.0, ui.visuals().extreme_bg_color);
+                ui.painter().text(
+                    rect.left_top() + egui::vec2(4.0, 4.0),
+                    egui::Align2::LEFT_TOP,
+                    nums,
+                    mono.resolve(ui.style()),
+                    ui.visuals().weak_text_color(),
+                );
+
+                // Right text editor
+                let mut layouter = crate::util::highlight::yaml_layouter();
+                let id = ui.make_persistent_id("edit_text");
+                let out = egui::TextEdit::multiline(&mut self.edit.buffer)
+                    .id(id)
+                    .font(egui::TextStyle::Monospace)
+                    .desired_rows(lines_count)
+                    .desired_width(f32::INFINITY)
+                    .frame(true)
+                    .layouter(&mut layouter)
+                    .show(ui);
+                if out.response.changed() { self.edit.dirty = self.edit.buffer != self.edit.original; }
+
+                // Current line highlight (based on caret position)
+                if let Some(cr) = out.cursor_range {
+                    let idx = cr.primary.index.min(self.edit.buffer.len());
+                    let line_idx = self.edit.buffer[..idx].chars().filter(|&c| c == '\n').count();
+                    let y = rect.top() + 4.0 + (line_idx as f32) * row_h;
+                    let bg = ui.visuals().widgets.inactive.bg_fill.linear_multiply(0.35);
+                    let hl_rect = egui::Rect::from_min_size(egui::pos2(rect.left(), y), egui::vec2(rect.width(), row_h));
+                    ui.painter().rect_filled(hl_rect, 0.0, bg);
+                }
+
+                // Indent guides overlay
+                let rect = out.response.rect;
+                let space_w = ui.fonts(|f| f.glyph_width(&mono.resolve(ui.style()), ' '));
+                let step = (2.0 * space_w).max(2.0);
+                let mut y = rect.top() + 4.0;
+                for line in self.edit.buffer.split_inclusive('\n') {
+                    let spaces = line.chars().take_while(|&c| c == ' ').count();
+                    let levels = (spaces as f32 / 2.0).floor() as usize;
+                    for lvl in 1..=levels {
+                        let x = rect.left() + 4.0 + (lvl as f32) * step;
+                        ui.painter().line_segment(
+                            [egui::pos2(x, y), egui::pos2(x, y + row_h - 2.0)],
+                            egui::Stroke::new(1.0, ui.visuals().faint_bg_color),
                         );
-
-                        // Right text editor
-                        let mut layouter = crate::util::highlight::yaml_layouter();
-                        let id = ui.make_persistent_id("edit_text");
-                        let out = egui::TextEdit::multiline(&mut self.edit.buffer)
-                            .id(id)
-                            .font(egui::TextStyle::Monospace)
-                            .desired_rows(lines_count)
-                            .desired_width(f32::INFINITY)
-                            .frame(true)
-                            .layouter(&mut layouter)
-                            .show(ui);
-                        if out.response.changed() { self.edit.dirty = self.edit.buffer != self.edit.original; }
-
-                        // Current line highlight (based on caret position)
-                        if let Some(cr) = out.cursor_range {
-                            let idx = cr.primary.index.min(self.edit.buffer.len());
-                            let line_idx = self.edit.buffer[..idx].chars().filter(|&c| c == '\n').count();
-                            let y = rect.top() + 4.0 + (line_idx as f32) * row_h;
-                            let bg = ui.visuals().widgets.inactive.bg_fill.linear_multiply(0.35);
-                            let hl_rect = egui::Rect::from_min_size(egui::pos2(rect.left(), y), egui::vec2(rect.width(), row_h));
-                            ui.painter().rect_filled(hl_rect, 0.0, bg);
-                        }
-
-                        // Indent guides overlay
-                        let rect = out.response.rect;
-                        let space_w = ui.fonts(|f| f.glyph_width(&mono.resolve(ui.style()), ' '));
-                        let step = (2.0 * space_w).max(2.0);
-                        let mut y = rect.top() + 4.0;
-                        for line in self.edit.buffer.split_inclusive('\n') {
-                            let spaces = line.chars().take_while(|&c| c == ' ').count();
-                            let levels = (spaces as f32 / 2.0).floor() as usize;
-                            for lvl in 1..=levels {
-                                let x = rect.left() + 4.0 + (lvl as f32) * step;
-                                ui.painter().line_segment(
-                                    [egui::pos2(x, y), egui::pos2(x, y + row_h - 2.0)],
-                                    egui::Stroke::new(1.0, ui.visuals().faint_bg_color),
-                                );
-                            }
-                            y += row_h;
-                        }
-                    });
-                });
+                    }
+                    y += row_h;
+                }
             });
+        });
     }
 
     fn ui_logs(&mut self, ui: &mut egui::Ui) {
         if !self.selected_is_pod() { return; }
-        egui::CollapsingHeader::new("Logs (Pod)")
-            .default_open(false)
-            .show(ui, |ui| {
+        // Show logs content directly without a collapsing header
                 // Controls
                 ui.horizontal(|ui| {
                     ui.checkbox(&mut self.logs.follow, "Follow");
@@ -306,7 +300,6 @@ impl OrkaGuiApp {
                 if !self.logs.follow && self.logs.order_by_ts_when_paused {
                     ui.colored_label(ui.visuals().weak_text_color(), "sorted by timestamp");
                 }
-            });
     }
     pub(crate) fn ui_details(&mut self, ui: &mut egui::Ui) {
         ui.heading("Details");
@@ -406,11 +399,9 @@ impl OrkaGuiApp {
 
     fn ui_exec(&mut self, ui: &mut egui::Ui) {
         if !self.selected_is_pod() { return; }
-        egui::CollapsingHeader::new("Exec (Terminal)")
-            .default_open(true)
-            .show(ui, |ui| {
-                // Controls
-                ui.horizontal(|ui| {
+        // Show exec content directly without a collapsing header
+        // Controls
+        ui.horizontal(|ui| {
                     ui.checkbox(&mut self.exec.mode_oneshot, "One-shot");
                     ui.separator();
                     ui.checkbox(&mut self.exec.pty, "PTY");
@@ -443,7 +434,7 @@ impl OrkaGuiApp {
                     }
                 });
 
-                ui.add_space(4.0);
+        ui.add_space(4.0);
 
                 // Output area: use UiTerminal and compute rows/cols for PTY resize
                 let mut sent_resize = false;
@@ -483,7 +474,7 @@ impl OrkaGuiApp {
                     }
                 }
 
-                ui.add_space(4.0);
+        ui.add_space(4.0);
 
                 // Input send line (basic) — only for interactive mode
                 if !self.exec.mode_oneshot {
@@ -500,69 +491,66 @@ impl OrkaGuiApp {
                         }
                     });
                 }
-                if self.exec.dropped > 0 { ui.colored_label(ui.visuals().warn_fg_color, format!("dropped: {}", self.exec.dropped)); }
-                if sent_resize { ui.colored_label(ui.visuals().weak_text_color(), "resized"); }
-                let hint = if self.exec.mode_oneshot {
-                    if self.exec.running { "running…" } else { "enter a command and click Run" }
-                } else if self.exec.running {
-                    if self.exec.focused { "typing active • Esc to release" } else { "click inside to type" }
-                } else { "press Start to open a shell" };
-                ui.colored_label(ui.visuals().weak_text_color(), hint);
+        if self.exec.dropped > 0 { ui.colored_label(ui.visuals().warn_fg_color, format!("dropped: {}", self.exec.dropped)); }
+        if sent_resize { ui.colored_label(ui.visuals().weak_text_color(), "resized"); }
+        let hint = if self.exec.mode_oneshot {
+            if self.exec.running { "running…" } else { "enter a command and click Run" }
+        } else if self.exec.running {
+            if self.exec.focused { "typing active • Esc to release" } else { "click inside to type" }
+        } else { "press Start to open a shell" };
+        ui.colored_label(ui.visuals().weak_text_color(), hint);
 
-                ui.separator();
-                ui.horizontal(|ui| {
-                    ui.label("External term:");
-                    ui.add(egui::TextEdit::singleline(&mut self.exec.external_cmd).desired_width(160.0));
-                    if ui.button("Browse…").clicked() {
-                        if let Some(path) = rfd::FileDialog::new().set_title("Choose terminal app or binary").pick_file() {
-                            self.exec.external_cmd = path.display().to_string();
-                        }
-                    }
-                    if ui.button("Open External").on_hover_text("Launch configured terminal with kubectl exec -it").clicked() { self.open_external_exec(); }
-                });
-                // Key input mapping when focused
-                if self.exec.focused && self.exec.running {
-                    let mut to_send: Vec<u8> = Vec::new();
-                    ui.input(|i| {
-                        for ev in &i.events {
-                            match ev {
-                                egui::Event::Text(s) => { to_send.extend_from_slice(s.as_bytes()); }
-                                egui::Event::Key{ key, pressed: true, modifiers, .. } => {
-                                    match key {
-                                        egui::Key::Enter => to_send.push(b'\r'),
-                                        egui::Key::Tab => to_send.push(b'\t'),
-                                        egui::Key::Backspace => to_send.push(0x7f),
-                                        egui::Key::ArrowLeft => to_send.extend_from_slice(b"\x1b[D"),
-                                        egui::Key::ArrowRight => to_send.extend_from_slice(b"\x1b[C"),
-                                        egui::Key::ArrowUp => to_send.extend_from_slice(b"\x1b[A"),
-                                        egui::Key::ArrowDown => to_send.extend_from_slice(b"\x1b[B"),
-                                        egui::Key::Home => to_send.extend_from_slice(b"\x1b[H"),
-                                        egui::Key::End => to_send.extend_from_slice(b"\x1b[F"),
-                                        egui::Key::PageUp => to_send.extend_from_slice(b"\x1b[5~"),
-                                        egui::Key::PageDown => to_send.extend_from_slice(b"\x1b[6~"),
-                                        egui::Key::C if modifiers.ctrl => to_send.push(0x03),
-                                        egui::Key::Z if modifiers.ctrl => to_send.push(0x1a),
-                                        _ => {}
-                                    }
-                                }
+        ui.separator();
+        ui.horizontal(|ui| {
+            ui.label("External term:");
+            ui.add(egui::TextEdit::singleline(&mut self.exec.external_cmd).desired_width(160.0));
+            if ui.button("Browse…").clicked() {
+                if let Some(path) = rfd::FileDialog::new().set_title("Choose terminal app or binary").pick_file() {
+                    self.exec.external_cmd = path.display().to_string();
+                }
+            }
+            if ui.button("Open External").on_hover_text("Launch configured terminal with kubectl exec -it").clicked() { self.open_external_exec(); }
+        });
+        // Key input mapping when focused
+        if self.exec.focused && self.exec.running {
+            let mut to_send: Vec<u8> = Vec::new();
+            ui.input(|i| {
+                for ev in &i.events {
+                    match ev {
+                        egui::Event::Text(s) => { to_send.extend_from_slice(s.as_bytes()); }
+                        egui::Event::Key{ key, pressed: true, modifiers, .. } => {
+                            match key {
+                                egui::Key::Enter => to_send.push(b'\r'),
+                                egui::Key::Tab => to_send.push(b'\t'),
+                                egui::Key::Backspace => to_send.push(0x7f),
+                                egui::Key::ArrowLeft => to_send.extend_from_slice(b"\x1b[D"),
+                                egui::Key::ArrowRight => to_send.extend_from_slice(b"\x1b[C"),
+                                egui::Key::ArrowUp => to_send.extend_from_slice(b"\x1b[A"),
+                                egui::Key::ArrowDown => to_send.extend_from_slice(b"\x1b[B"),
+                                egui::Key::Home => to_send.extend_from_slice(b"\x1b[H"),
+                                egui::Key::End => to_send.extend_from_slice(b"\x1b[F"),
+                                egui::Key::PageUp => to_send.extend_from_slice(b"\x1b[5~"),
+                                egui::Key::PageDown => to_send.extend_from_slice(b"\x1b[6~"),
+                                egui::Key::C if modifiers.ctrl => to_send.push(0x03),
+                                egui::Key::Z if modifiers.ctrl => to_send.push(0x1a),
                                 _ => {}
                             }
                         }
-                    });
-                    if !to_send.is_empty() {
-                        if let Some(tx) = self.exec.input.clone() { let _ = tx.try_send(to_send); }
+                        _ => {}
                     }
                 }
             });
+            if !to_send.is_empty() {
+                if let Some(tx) = self.exec.input.clone() { let _ = tx.try_send(to_send); }
+            }
+        }
     }
 
     fn ui_service_logs(&mut self, ui: &mut egui::Ui) {
         if !self.selected_is_service() { return; }
-        egui::CollapsingHeader::new("Logs (Service)")
-            .default_open(false)
-            .show(ui, |ui| {
-                // Controls
-                ui.horizontal(|ui| {
+        // Show service logs content directly without a collapsing header
+        // Controls
+        ui.horizontal(|ui| {
                     ui.checkbox(&mut self.svc_logs.follow, "Follow");
                     ui.separator();
                     ui.label("Visible:");
@@ -613,7 +601,7 @@ impl OrkaGuiApp {
                     if !self.svc_logs.running { if ui.button("Start").clicked() { self.start_service_logs_task(); } }
                     else { if ui.button("Stop").clicked() { self.stop_service_logs_task(); } }
                 });
-                ui.add_space(4.0);
+        ui.add_space(4.0);
 
                 // Build indices with grep
                 let mut indices: Vec<usize> = if let Some((_t, re)) = &self.svc_logs.grep_cache {
@@ -633,27 +621,26 @@ impl OrkaGuiApp {
                 }
                 if self.svc_logs.follow { let len = indices.len(); let take = self.svc_logs.visible_follow_limit.min(len); indices = indices.split_off(len - take); }
 
-                let row_h = ui.text_style_height(&egui::TextStyle::Monospace);
-                let rows = indices.len();
-                egui::ScrollArea::vertical()
-                    .id_salt("svc_logs_scroll")
-                    .stick_to_bottom(self.svc_logs.follow)
-                    .auto_shrink([false, false])
-                    .show_rows(ui, row_h, if self.svc_logs.follow { rows + self.svc_logs.follow_pad_rows } else { rows }, |ui, range| {
-                        for local_row in range.clone() {
-                            if self.svc_logs.follow && local_row >= rows { ui.add_space(row_h); continue; }
-                            if let Some(&ring_idx) = indices.get(local_row) {
-                                if let Some(p) = self.svc_logs.ring.get(ring_idx) {
-                                    let widget = egui::Label::new(p.job.clone()).truncate();
-                                    ui.add(widget);
-                                }
-                            }
+        let row_h = ui.text_style_height(&egui::TextStyle::Monospace);
+        let rows = indices.len();
+        egui::ScrollArea::vertical()
+            .id_salt("svc_logs_scroll")
+            .stick_to_bottom(self.svc_logs.follow)
+            .auto_shrink([false, false])
+            .show_rows(ui, row_h, if self.svc_logs.follow { rows + self.svc_logs.follow_pad_rows } else { rows }, |ui, range| {
+                for local_row in range.clone() {
+                    if self.svc_logs.follow && local_row >= rows { ui.add_space(row_h); continue; }
+                    if let Some(&ring_idx) = indices.get(local_row) {
+                        if let Some(p) = self.svc_logs.ring.get(ring_idx) {
+                            let widget = egui::Label::new(p.job.clone()).truncate();
+                            ui.add(widget);
                         }
-                    });
-                if !self.svc_logs.follow && self.svc_logs.order_by_ts_when_paused {
-                    ui.colored_label(ui.visuals().weak_text_color(), "sorted by timestamp");
+                    }
                 }
             });
+        if !self.svc_logs.follow && self.svc_logs.order_by_ts_when_paused {
+            ui.colored_label(ui.visuals().weak_text_color(), "sorted by timestamp");
+        }
     }
 
     pub(crate) fn select_row(&mut self, it: LiteObj) {
