@@ -95,6 +95,12 @@ pub struct OrkaGuiApp {
     last_activity: Option<Instant>,
     // Detached details windows
     detached: Vec<DetachedDetailsWindow>,
+    // Which window is currently being rendered (None => main pane)
+    rendering_window_id: Option<egui::ViewportId>,
+    // Ownership of streaming subsystems (route updates)
+    logs_owner: Option<egui::ViewportId>,
+    exec_owner: Option<egui::ViewportId>,
+    svc_logs_owner: Option<egui::ViewportId>,
     #[cfg(feature = "dock")]
     dock_close_pending: Vec<Uid>,
 }
@@ -120,7 +126,82 @@ impl OrkaGuiApp {
         let title = match &ns { Some(ns) => format!("Details: {}/{}", ns, name), None => format!("Details: {}", name) };
         let id = egui::ViewportId::from_hash_of(("orka_details", uid));
         let meta = DetachedDetailsWindowMeta { id, uid, title, gvk: gvk.clone(), namespace: ns.clone(), name: name.clone() };
-        let state = DetachedDetailsWindowState { buffer: String::new(), last_error: None, opened_at: Instant::now() };
+        let state = DetachedDetailsWindowState {
+            buffer: String::new(),
+            last_error: None,
+            opened_at: Instant::now(),
+            active_tab: self.details.active_tab,
+            edit_ui: model::EditUi {
+                buffer: self.edit.buffer.clone(),
+                original: self.edit.original.clone(),
+                dirty: self.edit.dirty,
+                running: self.edit.running,
+                status: self.edit.status.clone(),
+            },
+            logs: {
+                let mut l = LogsState::default();
+                l.follow = self.logs.follow;
+                l.grep = String::new();
+                l.backlog = std::collections::VecDeque::with_capacity(self.logs.backlog_cap.min(256));
+                l.backlog_cap = self.logs.backlog_cap;
+                l.dropped = 0;
+                l.recv = 0;
+                l.containers = self.logs.containers.clone();
+                l.container = self.logs.container.clone();
+                l.tail_lines = self.logs.tail_lines;
+                l.since_seconds = self.logs.since_seconds;
+                l.ring = std::collections::VecDeque::with_capacity(self.logs.ring_cap.min(256));
+                l.ring_cap = self.logs.ring_cap;
+                l.wrap = self.logs.wrap;
+                l.colorize = self.logs.colorize;
+                l.visible_follow_limit = self.logs.visible_follow_limit;
+                l.order_by_ts_when_paused = self.logs.order_by_ts_when_paused;
+                l.follow_pad_rows = self.logs.follow_pad_rows;
+                l.prefix_theme = self.logs.prefix_theme;
+                l.grep_cache = None;
+                l.grep_error = None;
+                l.v2 = self.logs.v2;
+                l
+            },
+            exec: {
+                let mut e = ExecState::default();
+                e.pty = self.exec.pty;
+                e.cmd = self.exec.cmd.clone();
+                e.container = self.exec.container.clone();
+                e.backlog = std::collections::VecDeque::with_capacity(self.exec.backlog_cap.min(256));
+                e.backlog_cap = self.exec.backlog_cap;
+                e.dropped = 0;
+                e.recv = 0;
+                e.stdin_buf = String::new();
+                e.last_cols = None;
+                e.last_rows = None;
+                e.term = None;
+                e.focused = false;
+                e.mode_oneshot = self.exec.mode_oneshot;
+                e.external_cmd = self.exec.external_cmd.clone();
+                e
+            },
+            svc_logs: {
+                let mut s = ServiceLogsState::default();
+                s.follow = self.svc_logs.follow;
+                s.grep = String::new();
+                s.grep_cache = None;
+                s.grep_error = None;
+                s.ring = std::collections::VecDeque::with_capacity(self.svc_logs.ring_cap.min(256));
+                s.ring_cap = self.svc_logs.ring_cap;
+                s.recv = 0;
+                s.dropped = 0;
+                s.tail_lines = self.svc_logs.tail_lines;
+                s.since_seconds = self.svc_logs.since_seconds;
+                s.visible_follow_limit = self.svc_logs.visible_follow_limit;
+                s.colorize = self.svc_logs.colorize;
+                s.order_by_ts_when_paused = self.svc_logs.order_by_ts_when_paused;
+                s.follow_pad_rows = self.svc_logs.follow_pad_rows;
+                s.v2 = self.svc_logs.v2;
+                s.prefix_theme = self.svc_logs.prefix_theme;
+                s
+            },
+        };
         self.detached.push(DetachedDetailsWindow { meta: meta.clone(), state });
         // Ensure OS knows about the new viewport right away
         ctx.request_repaint();
@@ -399,6 +480,10 @@ impl OrkaGuiApp {
             idle_fast_window_ms: std::env::var("ORKA_IDLE_FAST_WINDOW_MS").ok().and_then(|s| s.parse::<u64>().ok()).unwrap_or(1000),
             last_activity: None,
             detached: Vec::new(),
+            rendering_window_id: None,
+            logs_owner: None,
+            exec_owner: None,
+            svc_logs_owner: None,
             #[cfg(feature = "dock")]
             dock_close_pending: Vec::new(),
         };
@@ -873,13 +958,42 @@ impl eframe::App for OrkaGuiApp {
                         pending_toasts.push(("search: error".to_string(), ToastKind::Error));
                     }
                     Ok(UiUpdate::LogStarted(cancel)) => {
-                        self.logs.cancel = Some(cancel);
-                        self.logs.running = true;
+                        if let Some(owner) = self.logs_owner {
+                            if let Some(w) = self.detached.iter_mut().find(|w| w.meta.id == owner) {
+                                w.state.logs.cancel = Some(cancel);
+                                w.state.logs.running = true;
+                            }
+                        } else {
+                            self.logs.cancel = Some(cancel);
+                            self.logs.running = true;
+                        }
                         pending_toasts.push(("logs: started".to_string(), ToastKind::Info));
                         processed += 1;
                     }
                     Ok(UiUpdate::LogLine(line)) => {
-                        self.logs.recv += 1;
+                        let target_logs = if let Some(owner) = self.logs_owner { None::<usize>.or_else(|| self.detached.iter().position(|w| w.meta.id == owner)) } else { None };
+                        if let Some(idx) = target_logs {
+                            let logs = &mut self.detached[idx].state.logs;
+                            logs.recv += 1;
+                            counter!("logs_recv_total", 1);
+                            if logs.v2 {
+                                let color = ctx.style().visuals.text_color();
+                                let t0 = Instant::now();
+                                let job = crate::logs::parser::parse_line_to_job(&line, color, logs.colorize);
+                                let ts = crate::logs::parser::parse_timestamp_utc(&line);
+                                let parse_ms = t0.elapsed().as_micros() as f64 / 1000.0;
+                                histogram!("logs_parse_ms", parse_ms);
+                                let parsed = crate::model::ParsedLine { raw: line, job, timestamp: ts };
+                                if logs.ring.len() >= logs.ring_cap { logs.ring.pop_front(); logs.dropped += 1; counter!("logs_dropped_total", 1); }
+                                logs.ring.push_back(parsed);
+                                gauge!("logs_ring_len", logs.ring.len() as f64);
+                            } else {
+                                if logs.backlog.len() >= logs.backlog_cap { logs.backlog.pop_front(); logs.dropped += 1; counter!("logs_dropped_total", 1); }
+                                logs.backlog.push_back(line);
+                                gauge!("logs_ring_len", logs.backlog.len() as f64);
+                            }
+                        } else {
+                            self.logs.recv += 1;
                         counter!("logs_recv_total", 1);
                         if self.logs.v2 {
                             // Append to ring with cap; count drops. Pre-parse to LayoutJob.
@@ -899,91 +1013,189 @@ impl eframe::App for OrkaGuiApp {
                             self.logs.backlog.push_back(line);
                             gauge!("logs_ring_len", self.logs.backlog.len() as f64);
                         }
+                        }
                         processed += 1;
                     }
                     Ok(UiUpdate::LogError(err)) => {
                         self.last_error = Some(err.clone());
                         self.log = format!("logs: {}", err);
-                        self.logs.running = false;
-                        self.logs.task = None;
-                        self.logs.cancel = None;
+                        if let Some(owner) = self.logs_owner {
+                            if let Some(w) = self.detached.iter_mut().find(|w| w.meta.id == owner) {
+                                w.state.logs.running = false;
+                                w.state.logs.task = None;
+                                w.state.logs.cancel = None;
+                            }
+                        } else {
+                            self.logs.running = false;
+                            self.logs.task = None;
+                            self.logs.cancel = None;
+                        }
                         pending_toasts.push((format!("logs: {}", err), ToastKind::Error));
                         processed += 1;
                     }
                     Ok(UiUpdate::SvcLogStarted) => {
-                        self.svc_logs.running = true;
+                        if let Some(owner) = self.svc_logs_owner {
+                            if let Some(w) = self.detached.iter_mut().find(|w| w.meta.id == owner) {
+                                w.state.svc_logs.running = true;
+                            }
+                        } else {
+                            self.svc_logs.running = true;
+                        }
                         pending_toasts.push(("service logs: started".to_string(), ToastKind::Info));
                         processed += 1;
                     }
                     Ok(UiUpdate::SvcLogLine(line)) => {
-                        self.svc_logs.recv += 1;
                         counter!("svc_logs_recv_total", 1);
-                        if self.svc_logs.v2 {
-                            let color = ctx.style().visuals.text_color();
-                            let t0 = Instant::now();
-                            let job = crate::logs::parser::parse_line_to_job(&line, color, self.svc_logs.colorize);
-                            let ts = crate::logs::parser::parse_timestamp_utc(&line);
-                            let parse_ms = t0.elapsed().as_micros() as f64 / 1000.0;
-                            histogram!("svc_logs_parse_ms", parse_ms);
-                            let parsed = crate::model::ParsedLine { raw: line, job, timestamp: ts };
-                            if self.svc_logs.ring.len() >= self.svc_logs.ring_cap { self.svc_logs.ring.pop_front(); self.svc_logs.dropped += 1; counter!("svc_logs_dropped_total", 1); }
-                            self.svc_logs.ring.push_back(parsed);
-                            gauge!("svc_logs_ring_len", self.svc_logs.ring.len() as f64);
+                        if let Some(owner) = self.svc_logs_owner {
+                            if let Some(w) = self.detached.iter_mut().find(|w| w.meta.id == owner) {
+                                let sl = &mut w.state.svc_logs;
+                                sl.recv += 1;
+                                if sl.v2 {
+                                    let color = ctx.style().visuals.text_color();
+                                    let t0 = Instant::now();
+                                    let job = crate::logs::parser::parse_line_to_job(&line, color, sl.colorize);
+                                    let ts = crate::logs::parser::parse_timestamp_utc(&line);
+                                    let parse_ms = t0.elapsed().as_micros() as f64 / 1000.0;
+                                    histogram!("svc_logs_parse_ms", parse_ms);
+                                    let parsed = crate::model::ParsedLine { raw: line, job, timestamp: ts };
+                                    if sl.ring.len() >= sl.ring_cap { sl.ring.pop_front(); sl.dropped += 1; counter!("svc_logs_dropped_total", 1); }
+                                    sl.ring.push_back(parsed);
+                                    gauge!("svc_logs_ring_len", sl.ring.len() as f64);
+                                }
+                            }
+                        } else {
+                            self.svc_logs.recv += 1;
+                            if self.svc_logs.v2 {
+                                let color = ctx.style().visuals.text_color();
+                                let t0 = Instant::now();
+                                let job = crate::logs::parser::parse_line_to_job(&line, color, self.svc_logs.colorize);
+                                let ts = crate::logs::parser::parse_timestamp_utc(&line);
+                                let parse_ms = t0.elapsed().as_micros() as f64 / 1000.0;
+                                histogram!("svc_logs_parse_ms", parse_ms);
+                                let parsed = crate::model::ParsedLine { raw: line, job, timestamp: ts };
+                                if self.svc_logs.ring.len() >= self.svc_logs.ring_cap { self.svc_logs.ring.pop_front(); self.svc_logs.dropped += 1; counter!("svc_logs_dropped_total", 1); }
+                                self.svc_logs.ring.push_back(parsed);
+                                gauge!("svc_logs_ring_len", self.svc_logs.ring.len() as f64);
+                            }
                         }
                         processed += 1;
                     }
                     Ok(UiUpdate::SvcLogError(err)) => {
                         self.last_error = Some(err.clone());
-                        self.svc_logs.running = false;
-                        self.svc_logs.task = None;
+                        if let Some(owner) = self.svc_logs_owner {
+                            if let Some(w) = self.detached.iter_mut().find(|w| w.meta.id == owner) {
+                                w.state.svc_logs.running = false;
+                                w.state.svc_logs.task = None;
+                            }
+                        } else {
+                            self.svc_logs.running = false;
+                            self.svc_logs.task = None;
+                        }
                         pending_toasts.push((format!("service logs: {}", err), ToastKind::Error));
                         processed += 1;
                     }
                     Ok(UiUpdate::SvcLogEnded) => {
-                        self.svc_logs.running = false;
-                        self.svc_logs.task = None;
+                        if let Some(owner) = self.svc_logs_owner.take() {
+                            if let Some(w) = self.detached.iter_mut().find(|w| w.meta.id == owner) {
+                                w.state.svc_logs.running = false;
+                                w.state.svc_logs.task = None;
+                            }
+                        } else {
+                            self.svc_logs.running = false;
+                            self.svc_logs.task = None;
+                        }
                         pending_toasts.push(("service logs: ended".to_string(), ToastKind::Info));
                         processed += 1;
                     }
                     Ok(UiUpdate::ExecStarted { cancel, input, resize }) => {
-                        self.exec.cancel = Some(cancel);
-                        self.exec.input = Some(input);
-                        self.exec.resize = resize;
-                        self.exec.running = true;
+                        if let Some(owner) = self.exec_owner {
+                            if let Some(w) = self.detached.iter_mut().find(|w| w.meta.id == owner) {
+                                w.state.exec.cancel = Some(cancel);
+                                w.state.exec.input = Some(input);
+                                w.state.exec.resize = resize;
+                                w.state.exec.running = true;
+                            }
+                        } else {
+                            self.exec.cancel = Some(cancel);
+                            self.exec.input = Some(input);
+                            self.exec.resize = resize;
+                            self.exec.running = true;
+                        }
                         pending_toasts.push(("exec: started".to_string(), ToastKind::Info));
                         processed += 1;
                     }
                     Ok(UiUpdate::ExecData(s)) => {
-                        self.exec.recv += 1;
-                        if let Some(t) = self.exec.term.as_mut() { t.feed_bytes(s.as_bytes()); }
-                        if self.exec.backlog.len() >= self.exec.backlog_cap { self.exec.backlog.pop_front(); self.exec.dropped += 1; }
-                        self.exec.backlog.push_back(s);
+                        if let Some(owner) = self.exec_owner {
+                            if let Some(w) = self.detached.iter_mut().find(|w| w.meta.id == owner) {
+                                let exec = &mut w.state.exec;
+                                exec.recv += 1;
+                                if let Some(t) = exec.term.as_mut() { t.feed_bytes(s.as_bytes()); }
+                                if exec.backlog.len() >= exec.backlog_cap { exec.backlog.pop_front(); exec.dropped += 1; }
+                                exec.backlog.push_back(s);
+                            }
+                        } else {
+                            self.exec.recv += 1;
+                            if let Some(t) = self.exec.term.as_mut() { t.feed_bytes(s.as_bytes()); }
+                            if self.exec.backlog.len() >= self.exec.backlog_cap { self.exec.backlog.pop_front(); self.exec.dropped += 1; }
+                            self.exec.backlog.push_back(s);
+                        }
                         processed += 1;
                     }
                     Ok(UiUpdate::ExecError(err)) => {
                         self.last_error = Some(err.clone());
-                        self.exec.running = false;
-                        self.exec.task = None;
-                        self.exec.cancel = None;
-                        self.exec.input = None;
-                        self.exec.resize = None;
+                        if let Some(owner) = self.exec_owner {
+                            if let Some(w) = self.detached.iter_mut().find(|w| w.meta.id == owner) {
+                                let exec = &mut w.state.exec;
+                                exec.running = false;
+                                exec.task = None;
+                                exec.cancel = None;
+                                exec.input = None;
+                                exec.resize = None;
+                            }
+                        } else {
+                            self.exec.running = false;
+                            self.exec.task = None;
+                            self.exec.cancel = None;
+                            self.exec.input = None;
+                            self.exec.resize = None;
+                        }
                         pending_toasts.push((format!("exec: {}", err), ToastKind::Error));
                         processed += 1;
                     }
                     Ok(UiUpdate::ExecEnded) => {
-                        self.exec.running = false;
-                        self.exec.task = None;
-                        self.exec.cancel = None;
-                        self.exec.input = None;
-                        self.exec.resize = None;
-                        self.exec.focused = false;
+                        if let Some(owner) = self.exec_owner.take() {
+                            if let Some(w) = self.detached.iter_mut().find(|w| w.meta.id == owner) {
+                                let exec = &mut w.state.exec;
+                                exec.running = false;
+                                exec.task = None;
+                                exec.cancel = None;
+                                exec.input = None;
+                                exec.resize = None;
+                                exec.focused = false;
+                            }
+                        } else {
+                            self.exec.running = false;
+                            self.exec.task = None;
+                            self.exec.cancel = None;
+                            self.exec.input = None;
+                            self.exec.resize = None;
+                            self.exec.focused = false;
+                        }
                         pending_toasts.push(("exec: ended".to_string(), ToastKind::Info));
                         processed += 1;
                     }
                     Ok(UiUpdate::LogEnded) => {
-                        self.logs.running = false;
-                        self.logs.task = None;
-                        self.logs.cancel = None;
+                        if let Some(owner) = self.logs_owner.take() {
+                            if let Some(w) = self.detached.iter_mut().find(|w| w.meta.id == owner) {
+                                w.state.logs.running = false;
+                                w.state.logs.task = None;
+                                w.state.logs.cancel = None;
+                            }
+                        } else {
+                            self.logs.running = false;
+                            self.logs.task = None;
+                            self.logs.cancel = None;
+                        }
                         pending_toasts.push(("logs: ended".to_string(), ToastKind::Info));
                         processed += 1;
                     }
@@ -1278,21 +1490,122 @@ impl eframe::App for OrkaGuiApp {
                     |ctx, _class| {
                         // Handle OS close button
                         if ctx.input(|i| i.viewport().close_requested()) {
+                            // If this window owns active streams, stop them
+                            if self.logs_owner == Some(id) {
+                                if let Some(w) = self.detached.iter_mut().find(|w| w.meta.id == id) {
+                                    if let Some(c) = w.state.logs.cancel.take() { c.cancel(); }
+                                    self.logs_owner = None;
+                                }
+                            }
+                            if self.exec_owner == Some(id) {
+                                if let Some(w) = self.detached.iter_mut().find(|w| w.meta.id == id) {
+                                    if let Some(c) = w.state.exec.cancel.take() { c.cancel(); }
+                                    self.exec_owner = None;
+                                }
+                            }
+                            if self.svc_logs_owner == Some(id) {
+                                if let Some(w) = self.detached.iter_mut().find(|w| w.meta.id == id) {
+                                    if let Some(c) = w.state.svc_logs.cancel.take() { c.cancel(); }
+                                    self.svc_logs_owner = None;
+                                }
+                            }
                             cr.borrow_mut().push(id);
                             ctx.send_viewport_cmd(egui::ViewportCommand::Close);
                             return;
                         }
                         egui::CentralPanel::default().show(ctx, |ui| {
-                            // When this window is focused, drive global selection to this UID
-                            let is_focused = ctx.input(|i| i.viewport().focused);
-                            if is_focused.unwrap_or(false) && self.details.selected != Some(uid) {
-                                if let Some(i) = self.results.index.get(&uid).copied() {
-                                    if let Some(row) = self.results.rows.get(i).cloned() {
-                                        self.select_row(row);
+                            // Load per-window state, temporarily swap selection and UI state, then render and save back.
+                            if let Some(idx) = self.detached.iter().position(|w| w.meta.id == id) {
+                                // Snapshot per-window state before mutably using self elsewhere
+                                let (mut win_active_tab, mut win_edit) = {
+                                    let w = &self.detached[idx];
+                                    (w.state.active_tab, w.state.edit_ui.clone())
+                                };
+                                // Focused window controls global selection
+                                let is_focused = ctx.input(|i| i.viewport().focused).unwrap_or(false);
+                                if is_focused && self.details.selected != Some(uid) {
+                                    if let Some(i) = self.results.index.get(&uid).copied() {
+                                        if let Some(row) = self.results.rows.get(i).cloned() {
+                                            self.select_row(row);
+                                        }
                                     }
                                 }
+                                // Snapshot main pane's edit UI subset
+                                let main_edit = model::EditUi {
+                                    buffer: self.edit.buffer.clone(),
+                                    original: self.edit.original.clone(),
+                                    dirty: self.edit.dirty,
+                                    running: self.edit.running,
+                                    status: self.edit.status.clone(),
+                                };
+                                let prev_selected = self.details.selected;
+                                let prev_active_tab = self.details.active_tab;
+                                // Apply window-specific state
+                                self.details.selected = Some(uid);
+                                self.details.active_tab = win_active_tab;
+                                // Swap in window logs/exec/svc_logs state
+                                let mut win_logs = {
+                                    let w = &mut self.detached[idx];
+                                    std::mem::take(&mut w.state.logs)
+                                };
+                                let mut win_exec = {
+                                    let w = &mut self.detached[idx];
+                                    std::mem::take(&mut w.state.exec)
+                                };
+                                let mut win_svc_logs = {
+                                    let w = &mut self.detached[idx];
+                                    std::mem::take(&mut w.state.svc_logs)
+                                };
+                                let main_logs = std::mem::replace(&mut self.logs, win_logs);
+                                let main_exec = std::mem::replace(&mut self.exec, win_exec);
+                                let main_svc_logs = std::mem::replace(&mut self.svc_logs, win_svc_logs);
+                                self.edit.buffer = win_edit.buffer.clone();
+                                self.edit.original = win_edit.original.clone();
+                                self.edit.dirty = win_edit.dirty;
+                                self.edit.running = win_edit.running;
+                                self.edit.status = win_edit.status.clone();
+
+                                // Render full details UI in this window
+                                let prev_render = self.rendering_window_id;
+                                self.rendering_window_id = Some(id);
+                                self.ui_details(ui);
+                                self.rendering_window_id = prev_render;
+
+                                // Save back window state from current UI
+                                win_active_tab = self.details.active_tab;
+                                win_edit = model::EditUi {
+                                    buffer: self.edit.buffer.clone(),
+                                    original: self.edit.original.clone(),
+                                    dirty: self.edit.dirty,
+                                    running: self.edit.running,
+                                    status: self.edit.status.clone(),
+                                };
+                                // Swap back logs/exec/svc_logs to main and store updated window states
+                                let win_logs_new = std::mem::replace(&mut self.logs, main_logs);
+                                let win_exec_new = std::mem::replace(&mut self.exec, main_exec);
+                                let win_svc_logs_new = std::mem::replace(&mut self.svc_logs, main_svc_logs);
+
+                                // Restore main pane selection/tab and edit UI subset
+                                self.details.active_tab = prev_active_tab;
+                                self.details.selected = prev_selected;
+                                self.edit.buffer = main_edit.buffer;
+                                self.edit.original = main_edit.original;
+                                self.edit.dirty = main_edit.dirty;
+                                self.edit.running = main_edit.running;
+                                self.edit.status = main_edit.status;
+
+                                // Write back into detached window state
+                                if let Some(w) = self.detached.get_mut(idx) {
+                                    w.state.active_tab = win_active_tab;
+                                    w.state.edit_ui = win_edit;
+                                    w.state.logs = win_logs_new;
+                                    w.state.exec = win_exec_new;
+                                    w.state.svc_logs = win_svc_logs_new;
+                                }
+                            } else {
+                                // Fallback: if window metadata not found, draw a simple message
+                                ui.label("(window state missing)");
                             }
-                            self.ui_details(ui);
                         });
                     },
                 );

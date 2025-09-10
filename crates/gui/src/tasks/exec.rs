@@ -31,6 +31,8 @@ impl OrkaGuiApp {
         let tx_opt = self.watch.updates_tx.clone();
         self.exec.running = true;
         info!(ns = %ns, pod = %pod, container = ?container, pty, cmd = ?cmd, "exec: start requested");
+        // Route updates to the rendering window (if any)
+        self.exec_owner = self.rendering_window_id;
         let task = tokio::spawn(async move {
             let ops = api_ops(api.as_ref());
             match ops.exec_stream(Some(&ns), &pod, container.as_deref(), &cmd, pty).await {
@@ -192,6 +194,8 @@ impl OrkaGuiApp {
         let ctx_opt = self.current_context.clone();
         let tx_opt = self.watch.updates_tx.clone();
         self.exec.running = true;
+        // Route updates to the rendering window (if any)
+        self.exec_owner = self.rendering_window_id;
         let task = tokio::spawn(async move {
             use std::io::{BufRead, BufReader};
             use std::process::{Command, Stdio};

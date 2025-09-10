@@ -22,6 +22,7 @@ impl OrkaGuiApp {
         }
         if let Some(task) = self.logs.task.take() { task.abort(); }
         self.logs.running = false;
+        // Do not clear owner here; wait for LogEnded to avoid races
     }
 
     pub(crate) fn start_logs_task(&mut self) {
@@ -41,6 +42,8 @@ impl OrkaGuiApp {
         let api = self.api.clone();
         let tx_opt = self.watch.updates_tx.clone();
         self.logs.running = true;
+        // Mark owner for routing updates
+        self.logs_owner = self.rendering_window_id;
         let task = tokio::spawn(async move {
             let opts = LogOptions { follow, tail_lines: tail, since_seconds: since };
             let ops = api_ops(api.as_ref());

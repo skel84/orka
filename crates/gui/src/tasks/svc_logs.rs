@@ -39,6 +39,8 @@ impl OrkaGuiApp {
         let gvk = orka_api::ResourceKind { group: String::new(), version: "v1".into(), kind: "Service".into(), namespaced: true };
         let reference = ResourceRef { cluster: None, gvk, namespace: Some(ns.clone()), name: svc.clone() };
         self.svc_logs.running = true;
+        // Route updates to the rendering window (if any)
+        self.svc_logs_owner = self.rendering_window_id;
         let task = tokio::spawn(async move {
             // Fetch service JSON to get selector
             let selector = match api.get_raw(reference).await {

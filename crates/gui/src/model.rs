@@ -322,11 +322,25 @@ pub struct DetachedDetailsWindowState {
     pub buffer: String,
     pub last_error: Option<String>,
     pub opened_at: Instant,
+    pub active_tab: crate::model::DetailsPaneTab,
+    pub edit_ui: EditUi,
+    pub logs: LogsState,
+    pub exec: ExecState,
+    pub svc_logs: ServiceLogsState,
 }
 
 pub struct DetachedDetailsWindow {
     pub meta: DetachedDetailsWindowMeta,
     pub state: DetachedDetailsWindowState,
+}
+
+#[derive(Default, Clone)]
+pub struct EditUi {
+    pub buffer: String,
+    pub original: String,
+    pub dirty: bool,
+    pub running: bool,
+    pub status: String,
 }
 
 #[derive(Default)]
