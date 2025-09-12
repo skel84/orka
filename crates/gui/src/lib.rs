@@ -979,7 +979,9 @@ impl eframe::App for OrkaGuiApp {
                             if logs.v2 {
                                 let color = ctx.style().visuals.text_color();
                                 let t0 = Instant::now();
-                                let job = crate::logs::parser::parse_line_to_job(&line, color, logs.colorize);
+                            let hl = logs.grep_cache.as_ref().map(|(_, r)| r);
+                            let hl_color = ctx.style().visuals.warn_fg_color;
+                            let job = crate::logs::parser::parse_line_to_job_hl(&line, color, logs.colorize, hl, hl_color);
                                 let ts = crate::logs::parser::parse_timestamp_utc(&line);
                                 let parse_ms = t0.elapsed().as_micros() as f64 / 1000.0;
                                 histogram!("logs_parse_ms", parse_ms);
@@ -999,7 +1001,9 @@ impl eframe::App for OrkaGuiApp {
                             // Append to ring with cap; count drops. Pre-parse to LayoutJob.
                             let color = ctx.style().visuals.text_color();
                             let t0 = Instant::now();
-                            let job = crate::logs::parser::parse_line_to_job(&line, color, self.logs.colorize);
+                            let hl = self.logs.grep_cache.as_ref().map(|(_, r)| r);
+                            let hl_color = ctx.style().visuals.warn_fg_color;
+                            let job = crate::logs::parser::parse_line_to_job_hl(&line, color, self.logs.colorize, hl, hl_color);
                             let ts = crate::logs::parser::parse_timestamp_utc(&line);
                             let parse_ms = t0.elapsed().as_micros() as f64 / 1000.0;
                             histogram!("logs_parse_ms", parse_ms);
@@ -1053,7 +1057,9 @@ impl eframe::App for OrkaGuiApp {
                                 if sl.v2 {
                                     let color = ctx.style().visuals.text_color();
                                     let t0 = Instant::now();
-                                    let job = crate::logs::parser::parse_line_to_job(&line, color, sl.colorize);
+                            let hl = sl.grep_cache.as_ref().map(|(_, r)| r);
+                            let hl_color = ctx.style().visuals.warn_fg_color;
+                            let job = crate::logs::parser::parse_line_to_job_hl(&line, color, sl.colorize, hl, hl_color);
                                     let ts = crate::logs::parser::parse_timestamp_utc(&line);
                                     let parse_ms = t0.elapsed().as_micros() as f64 / 1000.0;
                                     histogram!("svc_logs_parse_ms", parse_ms);
@@ -1068,7 +1074,9 @@ impl eframe::App for OrkaGuiApp {
                             if self.svc_logs.v2 {
                                 let color = ctx.style().visuals.text_color();
                                 let t0 = Instant::now();
-                                let job = crate::logs::parser::parse_line_to_job(&line, color, self.svc_logs.colorize);
+                            let hl = self.svc_logs.grep_cache.as_ref().map(|(_, r)| r);
+                            let hl_color = ctx.style().visuals.warn_fg_color;
+                            let job = crate::logs::parser::parse_line_to_job_hl(&line, color, self.svc_logs.colorize, hl, hl_color);
                                 let ts = crate::logs::parser::parse_timestamp_utc(&line);
                                 let parse_ms = t0.elapsed().as_micros() as f64 / 1000.0;
                                 histogram!("svc_logs_parse_ms", parse_ms);

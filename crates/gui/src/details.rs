@@ -206,40 +206,7 @@ impl OrkaGuiApp {
                 });
                 ui.add_space(4.0);
 
-                // Fallback path when v2 is disabled or wrap is ON (multi-line breaks fixed-height rows)
-                if !self.logs.v2 || self.logs.wrap {
-                    let re_opt = self.logs.grep_cache.as_ref().map(|(_, r)| r);
-                    let mut buf = String::new();
-                    let mut shown = 0usize;
-                    let max_lines: usize = 1000;
-                    if self.logs.v2 {
-                        // Use ring raw lines when v2 is enabled but wrapping is requested
-                        for p in self.logs.ring.iter().rev() {
-                            if let Some(r) = re_opt { if !r.is_match(&p.raw) { continue; } }
-                            buf.push_str(&p.raw);
-                            if !p.raw.ends_with('\n') { buf.push('\n'); }
-                            shown += 1;
-                            if shown >= max_lines { break; }
-                        }
-                    } else {
-                        for line in self.logs.backlog.iter().rev() {
-                            if let Some(r) = re_opt { if !r.is_match(line) { continue; } }
-                            buf.push_str(line);
-                            if !line.ends_with('\n') { buf.push('\n'); }
-                            shown += 1;
-                            if shown >= max_lines { break; }
-                        }
-                    }
-                    let display = if shown == 0 { String::new() } else { buf.lines().rev().collect::<Vec<_>>().join("\n") };
-                    let mut binding = display;
-                    let te = egui::TextEdit::multiline(&mut binding)
-                        .font(egui::TextStyle::Monospace)
-                        .desired_rows(20)
-                        .desired_width(f32::INFINITY)
-                        .interactive(false);
-                    ui.add(te);
-                    return;
-                }
+                // Removed fallback path: always use v2 fixed-row renderer for consistency and highlighting
 
                 // Build visible indices with grep filter and follow/paused logic
                 let mut indices: Vec<usize> = if let Some((_text, re)) = &self.logs.grep_cache {

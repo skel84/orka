@@ -8,14 +8,22 @@ use regex::Regex;
 // Minimal ANSI SGR parsing for 0 (reset), 30–37 and 90–97 (foreground colors)
 // Returns a LayoutJob with segments colored accordingly.
 pub fn parse_line_to_job(line: &str, default_color: egui::Color32, colorize: bool) -> egui::text::LayoutJob {
+    parse_line_to_job_hl(line, default_color, colorize, None, egui::Color32::YELLOW)
+}
+
+pub fn parse_line_to_job_hl(
+    line: &str,
+    default_color: egui::Color32,
+    colorize: bool,
+    highlight_re: Option<&Regex>,
+    highlight_color: egui::Color32,
+) -> egui::text::LayoutJob {
     let mut job = egui::text::LayoutJob::default();
     // Always use monospace for logs
     let mut fmt = egui::TextFormat::default();
     fmt.font_id = egui::FontId::monospace(12.0);
     fmt.color = default_color;
 
-    // If colorize is off, append as a single segment.
-    // ANSI will still be stripped if present (we don't render raw escapes).
     let tailspin_on = colorize;
 
     let bytes = line.as_bytes();
@@ -25,7 +33,6 @@ pub fn parse_line_to_job(line: &str, default_color: egui::Color32, colorize: boo
         if bytes[i] == 0x1b && i + 1 < bytes.len() && bytes[i + 1] == b'[' {
             // Find end of CSI 'm'
             let start = i + 2;
-            // Seek for 'm'
             if let Some(mut end) = bytes[start..].iter().position(|&b| b == b'm') {
                 end += start;
                 // Apply SGR
@@ -34,8 +41,16 @@ pub fn parse_line_to_job(line: &str, default_color: egui::Color32, colorize: boo
                 i = end + 1;
                 continue;
             } else {
-                // Malformed; stop parsing
-                append_tailspin_segment(&mut job, &line[i..], &cur_fmt, tailspin_on, default_color);
+                // Malformed; stop parsing; append rest
+                append_tailspin_segment_with_hl(
+                    &mut job,
+                    &line[i..],
+                    &cur_fmt,
+                    tailspin_on,
+                    default_color,
+                    highlight_re,
+                    highlight_color,
+                );
                 break;
             }
         }
@@ -47,7 +62,15 @@ pub fn parse_line_to_job(line: &str, default_color: egui::Color32, colorize: boo
         }
         let seg = &line[seg_start..i];
         if !seg.is_empty() {
-            append_tailspin_segment(&mut job, seg, &cur_fmt, tailspin_on, default_color);
+            append_tailspin_segment_with_hl(
+                &mut job,
+                seg,
+                &cur_fmt,
+                tailspin_on,
+                default_color,
+                highlight_re,
+                highlight_color,
+            );
         }
     }
     job
@@ -97,9 +120,21 @@ pub fn parse_timestamp_utc(line: &str) -> Option<DateTime<Utc>> {
     None
 }
 
-fn append_tailspin_segment(job: &mut egui::text::LayoutJob, seg: &str, base_fmt: &egui::TextFormat, enable: bool, default_color: egui::Color32) {
+fn append_tailspin_segment_with_hl(
+    job: &mut egui::text::LayoutJob,
+    seg: &str,
+    base_fmt: &egui::TextFormat,
+    enable: bool,
+    default_color: egui::Color32,
+    highlight_re: Option<&Regex>,
+    highlight_color: egui::Color32,
+) {
     if !enable {
-        job.append(seg, 0.0, base_fmt.clone());
+        if let Some(re) = highlight_re {
+            append_with_highlight(job, seg, base_fmt.clone(), re, highlight_color);
+        } else {
+            job.append(seg, 0.0, base_fmt.clone());
+        }
         return;
     }
     static TS_RE: Lazy<Regex> = Lazy::new(|| {
@@ -114,10 +149,12 @@ fn append_tailspin_segment(job: &mut egui::text::LayoutJob, seg: &str, base_fmt:
         ).unwrap()
     });
     let mut idx = 0usize;
+    // Collect tailspin-colored segments first
+    let mut pieces: Vec<(std::borrow::Cow<'_, str>, egui::TextFormat)> = Vec::new();
     while let Some(caps) = TS_RE.captures_at(seg, idx) {
         let m = caps.get(0).unwrap();
         if m.start() > idx {
-            job.append(&seg[idx..m.start()], 0.0, base_fmt.clone());
+            pieces.push((std::borrow::Cow::from(&seg[idx..m.start()]), base_fmt.clone()));
         }
         let mut fmt = base_fmt.clone();
         // Only override color if the base format is the default (avoid fighting ANSI colors)
@@ -145,11 +182,46 @@ fn append_tailspin_segment(job: &mut egui::text::LayoutJob, seg: &str, base_fmt:
                 if can_override { fmt.color = egui::Color32::from_rgb(0x40, 0xC0, 0xC0); }
             }
         }
-        job.append(m.as_str(), 0.0, fmt);
+        pieces.push((std::borrow::Cow::from(m.as_str()), fmt));
         idx = m.end();
         if idx >= seg.len() { break; }
     }
     if idx < seg.len() {
-        job.append(&seg[idx..], 0.0, base_fmt.clone());
+        pieces.push((std::borrow::Cow::from(&seg[idx..]), base_fmt.clone()));
+    }
+    // Apply optional regex highlight across pieces
+    if let Some(re) = highlight_re {
+        for (text, fmt) in pieces.into_iter() {
+            append_with_highlight(job, &text, fmt, re, highlight_color);
+        }
+    } else {
+        for (text, fmt) in pieces.into_iter() {
+            job.append(&text, 0.0, fmt);
+        }
+    }
+}
+
+fn append_with_highlight(
+    job: &mut egui::text::LayoutJob,
+    text: &str,
+    base_fmt: egui::TextFormat,
+    re: &Regex,
+    hl_color: egui::Color32,
+) {
+    let mut last = 0usize;
+    for m in re.find_iter(text) {
+        let start = m.start();
+        let end = m.end();
+        if start == end { continue; } // skip zero-width
+        if start > last {
+            job.append(&text[last..start], 0.0, base_fmt.clone());
+        }
+        let mut fmt = base_fmt.clone();
+        fmt.underline = egui::Stroke { width: 1.5, color: hl_color };
+        job.append(&text[start..end], 0.0, fmt);
+        last = end;
+    }
+    if last < text.len() {
+        job.append(&text[last..], 0.0, base_fmt);
     }
 }
