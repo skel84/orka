@@ -805,12 +805,32 @@ impl eframe::App for OrkaGuiApp {
                                 self.results.display_cache.insert(lo.uid, self.build_display_row(&lo));
                                 self.results.rows[idx] = lo;
                             } else {
-                                let new_idx = self.results.rows.len();
-                                self.results.index.insert(uid, new_idx);
-                                self.results.filter_cache.insert(uid, self.build_filter_haystack(&lo));
-                                self.results.display_cache.insert(uid, self.build_display_row(&lo));
-                                self.results.rows.push(lo);
-                                info!(uid = ?uid, stale_idx = idx, new_idx, len = self.results.rows.len(), "ui: corrected stale index on Applied");
+                                // Try to repair without duplicating: if the object already exists as the last row,
+                                // just update it and fix the index mapping to point to the last position.
+                                let exists_as_last = if !self.results.rows.is_empty() {
+                                    let last_idx = self.results.rows.len() - 1;
+                                    self.results
+                                        .rows
+                                        .get(last_idx)
+                                        .map(|r| r.uid == uid)
+                                        .unwrap_or(false)
+                                } else { false };
+                                if exists_as_last {
+                                    let last_idx = self.results.rows.len() - 1;
+                                    // Update last row in-place and refresh caches
+                                    self.results.rows[last_idx] = lo.clone();
+                                    self.results.index.insert(uid, last_idx);
+                                    self.results.filter_cache.insert(uid, self.build_filter_haystack(&lo));
+                                    self.results.display_cache.insert(uid, self.build_display_row(&lo));
+                                    info!(uid = ?uid, stale_idx = idx, last_idx, len = self.results.rows.len(), "ui: repaired stale index on Applied (updated last)");
+                                } else {
+                                    let new_idx = self.results.rows.len();
+                                    self.results.index.insert(uid, new_idx);
+                                    self.results.filter_cache.insert(uid, self.build_filter_haystack(&lo));
+                                    self.results.display_cache.insert(uid, self.build_display_row(&lo));
+                                    self.results.rows.push(lo);
+                                    info!(uid = ?uid, stale_idx = idx, new_idx, len = self.results.rows.len(), "ui: corrected stale index on Applied (pushed)");
+                                }
                             }
                         } else {
                             let idx = self.results.rows.len();
