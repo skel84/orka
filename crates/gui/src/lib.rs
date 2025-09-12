@@ -26,6 +26,7 @@ mod logs;
 pub use model::{UiUpdate, VirtualMode, SearchExplain, PaletteItem, PaletteState, LayoutState};
 use model::{ResultsState, SearchState, DetailsState, SelectionState, UiDebounce, DiscoveryState, WatchState, LogsState, ServiceLogsState, EditState, OpsState, ToastKind, StatsState, PrefixTheme, ExecState};
 use model::{DetailsPaneTab, DescribeState};
+use model::GraphState;
 use model::{DetachedDetailsWindow, DetachedDetailsWindowMeta, DetachedDetailsWindowState};
 use util::{gvk_label, parse_gvk_key_to_kind};
 use watch::{watch_hub_subscribe, watch_hub_prime};
@@ -52,6 +53,7 @@ pub struct OrkaGuiApp {
     edit: EditState,
     exec: ExecState,
     describe: DescribeState,
+    graph: GraphState,
     // status
     last_error: Option<String>,
     // scratch
@@ -304,6 +306,7 @@ impl OrkaGuiApp {
             watch: WatchState { updates_rx: None, updates_tx: None, task: None, stop: None, loaded_idx: None, loaded_gvk_key: None, loaded_ns: None, prewarm_started: false, select_t0: None, ttfr_logged: false, ns_task: None },
             details: DetailsState { selected: None, buffer: String::new(), task: None, stop: None, selected_at: None, active_tab: DetailsPaneTab::Describe, secret_entries: Vec::new(), secret_revealed: Default::default() },
             describe: DescribeState { running: false, text: String::new(), error: None, uid: None, task: None, stop: None },
+            graph: GraphState { running: false, text: String::new(), error: None, uid: None, task: None, stop: None },
             exec: {
                 let cap = std::env::var("ORKA_EXEC_BACKLOG_CAP").ok().and_then(|s| s.parse().ok()).unwrap_or(4000);
                 ExecState {
@@ -1255,6 +1258,25 @@ impl eframe::App for OrkaGuiApp {
                             self.describe.error = Some(error);
                             self.describe.running = false;
                             self.describe.uid = Some(uid);
+                            processed += 1;
+                            ctx.request_repaint();
+                        }
+                    }
+                    Ok(UiUpdate::GraphReady { uid, text }) => {
+                        if self.details.selected == Some(uid) {
+                            self.graph.text = text;
+                            self.graph.error = None;
+                            self.graph.running = false;
+                            self.graph.uid = Some(uid);
+                            processed += 1;
+                            ctx.request_repaint();
+                        }
+                    }
+                    Ok(UiUpdate::GraphError { uid, error }) => {
+                        if self.details.selected == Some(uid) {
+                            self.graph.error = Some(error);
+                            self.graph.running = false;
+                            self.graph.uid = Some(uid);
                             processed += 1;
                             ctx.request_repaint();
                         }

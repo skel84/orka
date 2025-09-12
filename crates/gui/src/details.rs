@@ -361,7 +361,7 @@ impl OrkaGuiApp {
                 }
             }
         });
-        // Tab bar inside the Details pane (Edit | Logs | Svc Logs | Exec | Describe)
+        // Tab bar inside the Details pane (Edit | Logs | Svc Logs | Exec | Describe | Graph)
         ui.horizontal(|ui| {
             let tab = self.details.active_tab;
             let is_svc = self.selected_is_service();
@@ -370,6 +370,7 @@ impl OrkaGuiApp {
             if is_svc { if ui.selectable_label(matches!(tab, DetailsPaneTab::SvcLogs), "Svc Logs").clicked() { self.details.active_tab = DetailsPaneTab::SvcLogs; } }
             if self.selected_is_pod() { if ui.selectable_label(matches!(tab, DetailsPaneTab::Exec), "Exec").clicked() { self.details.active_tab = DetailsPaneTab::Exec; } }
             if ui.selectable_label(matches!(tab, DetailsPaneTab::Describe), "Describe").clicked() { self.details.active_tab = DetailsPaneTab::Describe; }
+            if ui.selectable_label(matches!(tab, DetailsPaneTab::Graph), "Graph").on_hover_text("List-based relationships").clicked() { self.details.active_tab = DetailsPaneTab::Graph; }
         });
         ui.separator();
         egui::ScrollArea::vertical()
@@ -416,8 +417,34 @@ impl OrkaGuiApp {
                             .interactive(false);
                         ui.add(te);
                     }
+                    DetailsPaneTab::Graph => {
+                        self.ui_graph(ui);
+                    }
                 }
             });
+    }
+
+    fn ui_graph(&mut self, ui: &mut egui::Ui) {
+        // Trigger fetch if first open or selection changed
+        if let Some(sel) = self.details.selected {
+            let need_fetch = match (self.graph.uid, self.details.selected) { (Some(u0), Some(u1)) => u0 != u1, _ => true };
+            if need_fetch && !self.graph.running { self.start_graph_task(sel); }
+        }
+        ui.horizontal(|ui| {
+            if ui.small_button("Refresh").clicked() {
+                if let Some(uid) = self.details.selected { self.start_graph_task(uid); }
+            }
+            if self.graph.running { ui.add(egui::Spinner::new()); }
+            if let Some(err) = &self.graph.error { ui.colored_label(ui.visuals().error_fg_color, err); }
+        });
+        ui.add_space(4.0);
+        let mut text = if self.graph.text.is_empty() { String::from("(no graph yet)") } else { self.graph.text.clone() };
+        let te = egui::TextEdit::multiline(&mut text)
+            .font(egui::TextStyle::Monospace)
+            .desired_rows(24)
+            .desired_width(f32::INFINITY)
+            .interactive(false);
+        ui.add(te);
     }
 
     fn ui_exec(&mut self, ui: &mut egui::Ui) {

@@ -71,6 +71,9 @@ pub enum UiUpdate {
     // Describe output for Details pane
     DescribeReady { uid: Uid, text: String },
     DescribeError { uid: Uid, error: String },
+    // Graph output for Details pane
+    GraphReady { uid: Uid, text: String },
+    GraphError { uid: Uid, error: String },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -165,7 +168,7 @@ pub struct DetailsState {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum DetailsPaneTab { Edit, Logs, SvcLogs, Exec, Describe }
+pub enum DetailsPaneTab { Edit, Logs, SvcLogs, Exec, Describe, Graph }
 
 impl Default for DetailsPaneTab {
     fn default() -> Self { DetailsPaneTab::Describe }
@@ -357,6 +360,16 @@ pub struct EditUi {
 
 #[derive(Default)]
 pub struct DescribeState {
+    pub running: bool,
+    pub text: String,
+    pub error: Option<String>,
+    pub uid: Option<Uid>,
+    pub task: Option<JoinHandle<()>>,
+    pub stop: Option<tokio::sync::oneshot::Sender<()>>,
+}
+
+#[derive(Default)]
+pub struct GraphState {
     pub running: bool,
     pub text: String,
     pub error: Option<String>,
