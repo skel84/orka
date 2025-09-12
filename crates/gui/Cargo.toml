@@ -36,6 +36,7 @@ egui_term = { git = "https://github.com/Harzu/egui_term", branch = "main", optio
 vte = "0.13"
 shell-escape = "0.1"
 rfd = "0.14"
+base64 = "0.22"
 
 [features]
 default = ["dock"]

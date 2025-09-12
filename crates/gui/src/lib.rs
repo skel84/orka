@@ -302,7 +302,7 @@ impl OrkaGuiApp {
                 epoch: None,
             },
             watch: WatchState { updates_rx: None, updates_tx: None, task: None, stop: None, loaded_idx: None, loaded_gvk_key: None, loaded_ns: None, prewarm_started: false, select_t0: None, ttfr_logged: false, ns_task: None },
-            details: DetailsState { selected: None, buffer: String::new(), task: None, stop: None, selected_at: None, active_tab: DetailsPaneTab::Describe },
+            details: DetailsState { selected: None, buffer: String::new(), task: None, stop: None, selected_at: None, active_tab: DetailsPaneTab::Describe, secret_entries: Vec::new(), secret_revealed: Default::default() },
             describe: DescribeState { running: false, text: String::new(), error: None, uid: None, task: None, stop: None },
             exec: {
                 let cap = std::env::var("ORKA_EXEC_BACKLOG_CAP").ok().and_then(|s| s.parse().ok()).unwrap_or(4000);
@@ -874,6 +874,9 @@ impl eframe::App for OrkaGuiApp {
                     Ok(UiUpdate::Detail { uid, text, containers, produced_at }) => {
                         info!(chars = text.len(), "ui: details ready");
                         self.details.buffer = text.clone();
+                        // Clear secret state on fresh details; SecretReady will repopulate if applicable
+                        self.details.secret_entries.clear();
+                        self.details.secret_revealed.clear();
                         if let Some(t0) = self.details.selected_at.take() {
                             let ms = t0.elapsed().as_millis();
                             info!(ttfd_ms = %ms, "metric: time_to_first_details_ms");
@@ -899,6 +902,15 @@ impl eframe::App for OrkaGuiApp {
                         // Force immediate flush/repaint for details
                         saw_batch = true;
                         ctx.request_repaint();
+                    }
+                    Ok(UiUpdate::SecretReady { uid, entries }) => {
+                        // Only apply if this secret matches the current selection (or cache for later?)
+                        if self.details.selected == Some(uid) {
+                            self.details.secret_entries = entries;
+                            // do not auto-reveal any; user must click
+                            ctx.request_repaint();
+                        }
+                        processed += 1;
                     }
                     Ok(UiUpdate::PodContainers(list)) => {
                         info!(count = list.len(), "ui: pod containers ready");

@@ -3813,6 +3813,7 @@ dependencies = [
 name = "orka_gui"
 version = "0.0.0"
 dependencies = [
+ "base64 0.22.1",
  "chrono",
  "eframe",
  "egui 0.32.2",

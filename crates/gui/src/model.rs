@@ -21,6 +21,8 @@ pub enum UiUpdate {
     Event(LiteEvent),
     Error(String),
     Detail { uid: Uid, text: String, containers: Option<Vec<String>>, produced_at: Instant },
+    // For Secret resources: deliver decoded entries (key + data), values redacted in Details YAML
+    SecretReady { uid: Uid, entries: Vec<SecretEntry> },
     DetailError(String),
     Namespaces(Vec<String>),
     Epoch(u64),
@@ -157,6 +159,9 @@ pub struct DetailsState {
     pub stop: Option<tokio::sync::oneshot::Sender<()>>,
     pub selected_at: Option<Instant>,
     pub active_tab: DetailsPaneTab,
+    // Secret-specific UI state
+    pub secret_entries: Vec<SecretEntry>,
+    pub secret_revealed: std::collections::HashSet<String>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -164,6 +169,13 @@ pub enum DetailsPaneTab { Edit, Logs, SvcLogs, Exec, Describe }
 
 impl Default for DetailsPaneTab {
     fn default() -> Self { DetailsPaneTab::Describe }
+}
+
+#[derive(Clone, Debug)]
+pub struct SecretEntry {
+    pub key: String,
+    pub decoded: Option<String>,
+    pub b64: String,
 }
 
 #[derive(Default)]

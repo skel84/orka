@@ -72,8 +72,8 @@ impl WorldBuilder {
     pub fn new() -> Self { Self::with_projector(None) }
 
     pub fn with_projector(projector: Option<std::sync::Arc<dyn Projector + Send + Sync>>) -> Self {
-        let max_labels_per_obj = std::env::var("ORKA_MAX_LABELS_PER_OBJ").ok().and_then(|s| s.parse::<usize>().ok());
-        let max_annos_per_obj = std::env::var("ORKA_MAX_ANNOS_PER_OBJ").ok().and_then(|s| s.parse::<usize>().ok());
+        let max_labels_per_obj = std::env::var("ORKA_MAX_LABELS_PER_OBJ").ok().and_then(|s| s.parse::<usize>().ok()).or(Some(128));
+        let max_annos_per_obj = std::env::var("ORKA_MAX_ANNOS_PER_OBJ").ok().and_then(|s| s.parse::<usize>().ok()).or(Some(64));
         Self { epoch: 0, items: Vec::new(), index: FxHashMap::default(), projector, max_labels_per_obj, max_annos_per_obj }
     }
 

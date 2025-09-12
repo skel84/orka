@@ -4,6 +4,7 @@ use eframe::egui;
 use std::time::Instant;
 use tracing::info;
 use metrics::histogram;
+use base64::Engine as _;
 
 use orka_api::ResourceRef;
 use orka_core::LiteObj;
@@ -37,6 +38,61 @@ impl OrkaGuiApp {
             }
         });
         ui.add_space(4.0);
+        // Secret panel (if current selection is a Secret)
+        let is_secret = self
+            .current_selected_kind()
+            .map(|k| k.group.is_empty() && k.version == "v1" && k.kind == "Secret")
+            .unwrap_or(false);
+        if is_secret {
+            ui.group(|ui| {
+                ui.horizontal(|ui| {
+                    ui.strong("Secret data");
+                    ui.label(egui::RichText::new("(values redacted in YAML)").weak());
+                });
+                ui.add_space(4.0);
+                if self.details.secret_entries.is_empty() {
+                    ui.label(egui::RichText::new("no data keys").weak());
+                } else {
+                    for entry in self.details.secret_entries.clone() {
+                        ui.horizontal(|ui| {
+                            ui.monospace(&entry.key);
+                            ui.separator();
+                            let revealed = self.details.secret_revealed.contains(&entry.key);
+                            if revealed {
+                                if ui.button("Hide").on_hover_text("Hide value").clicked() {
+                                    self.details.secret_revealed.remove(&entry.key);
+                                }
+                            } else {
+                                if ui.button("Reveal").on_hover_text("Reveal value").clicked() {
+                                    self.details.secret_revealed.insert(entry.key.clone());
+                                }
+                            }
+                            if ui.button("Copy").on_hover_text("Copy value to clipboard").clicked() {
+                                let copy_text = match &entry.decoded {
+                                    Some(s) => s.clone(),
+                                    None => entry.b64.clone(),
+                                };
+                                ui.output_mut(|o| o.copied_text = copy_text);
+                            }
+                        });
+                        let revealed = self.details.secret_revealed.contains(&entry.key);
+                        let display = if revealed {
+                            if let Some(s) = &entry.decoded { s.clone() } else { format!("(binary) base64={}", entry.b64) }
+                        } else {
+                            "••••••".to_string()
+                        };
+                        let mut tmp = display;
+                        let widget = egui::TextEdit::singleline(&mut tmp)
+                            .font(egui::TextStyle::Monospace)
+                            .desired_width(400.0)
+                            .interactive(false);
+                        ui.add(widget);
+                        ui.add_space(4.0);
+                    }
+                }
+            });
+            ui.add_space(6.0);
+        }
         // Editor
         // Editor with line numbers and indent guides.
         let lines_count = self.edit.buffer.lines().count().max(1);
@@ -616,6 +672,8 @@ impl OrkaGuiApp {
         self.details.selected = Some(uid);
         self.details.selected_at = Some(Instant::now());
         self.details.buffer.clear();
+        self.details.secret_entries.clear();
+        self.details.secret_revealed.clear();
         #[cfg(feature = "dock")]
         {
             // Open/focus a dedicated tab for this resource when docking is enabled
@@ -668,9 +726,18 @@ impl OrkaGuiApp {
                 tokio::time::sleep(std::time::Duration::from_millis(prefetch_ms)).await;
                 match api.get_raw(reference).await {
                     Ok(bytes) => {
+                        let maxb: usize = std::env::var("ORKA_DETAILS_MAX_BYTES").ok().and_then(|s| s.parse::<usize>().ok()).unwrap_or(1_500_000);
+                        if bytes.len() > maxb {
+                            let msg = format!("object too large to render ({} bytes > {}); adjust ORKA_DETAILS_MAX_BYTES to override", bytes.len(), maxb);
+                            if let Some(tx) = tx_opt.as_ref() {
+                                let _ = tx.send(UiUpdate::Detail { uid, text: msg.clone(), containers: None, produced_at: Instant::now() });
+                            }
+                            info!(size = bytes.len(), "details: skipped oversized object");
+                            return;
+                        }
                         // Parse JSON (if possible) both for YAML rendering and for extracting pod containers
                         let p0 = Instant::now();
-                        let (text, containers): (String, Option<Vec<String>>) = match serde_json::from_slice::<serde_json::Value>(&bytes) {
+                        let (text, containers, secret_entries): (String, Option<Vec<String>>, Option<Vec<crate::model::SecretEntry>>) = match serde_json::from_slice::<serde_json::Value>(&bytes) {
                             Ok(v) => {
                                 let parse_ms = p0.elapsed().as_millis() as f64;
                                 histogram!("details_json_parse_ms", parse_ms);
@@ -694,18 +761,39 @@ impl OrkaGuiApp {
                                 histogram!("details_containers_extract_ms", extract_ms);
                                 let mut uniq = std::collections::BTreeSet::new();
                                 let dedup: Vec<String> = names.into_iter().filter(|n| uniq.insert(n.clone())).collect();
+                                // Redact Secret values and collect entries
+                                let mut redacted = v.clone();
+                                let mut sec_entries: Option<Vec<crate::model::SecretEntry>> = None;
+                                if v.get("kind").and_then(|k| k.as_str()) == Some("Secret") {
+                                    if let Some(map) = v.get("data").and_then(|d| d.as_object()) {
+                                        let mut items: Vec<crate::model::SecretEntry> = Vec::new();
+                                        for (k, val) in map.iter() {
+                                            if let Some(b64) = val.as_str() {
+                                                let bytes = base64::engine::general_purpose::STANDARD.decode(b64.as_bytes()).unwrap_or_default();
+                                                let decoded = String::from_utf8(bytes).ok();
+                                                items.push(crate::model::SecretEntry { key: k.clone(), decoded, b64: b64.to_string() });
+                                            }
+                                        }
+                                        if let Some(rm) = redacted.get_mut("data").and_then(|d| d.as_object_mut()) {
+                                            let keys: Vec<String> = rm.keys().cloned().collect();
+                                            for k in keys { rm.insert(k, serde_json::Value::String("[REDACTED]".into())); }
+                                        }
+                                        sec_entries = Some(items);
+                                    }
+                                }
                                 let y0 = Instant::now();
-                                let y = match serde_yaml::to_string(&v) { Ok(y) => y, Err(_) => String::from_utf8_lossy(&bytes).into_owned() };
+                                let y = match serde_yaml::to_string(&redacted) { Ok(y) => y, Err(_) => String::from_utf8_lossy(&bytes).into_owned() };
                                 let yaml_ms = y0.elapsed().as_millis() as f64;
                                 histogram!("details_yaml_serialize_ms", yaml_ms);
                                 info!(parse_ms, extract_ms, yaml_ms, "details: json→yaml timings");
-                                (y, if dedup.is_empty() { None } else { Some(dedup) })
+                                (y, if dedup.is_empty() { None } else { Some(dedup) }, sec_entries)
                             }
-                            Err(_) => (String::from_utf8_lossy(&bytes).into_owned(), None),
+                            Err(_) => (String::from_utf8_lossy(&bytes).into_owned(), None, None),
                         };
                         info!(size = bytes.len(), took_ms = %t0.elapsed().as_millis(), "details: fetch ok");
                         if let Some(tx) = tx_opt.as_ref() {
                             let _ = tx.send(UiUpdate::Detail { uid, text, containers: containers.clone(), produced_at: Instant::now() });
+                            if let Some(entries) = secret_entries { let _ = tx.send(UiUpdate::SecretReady { uid, entries }); }
                             if let Some(v) = containers { let _ = tx.send(UiUpdate::PodContainers(v)); }
                         }
                     }

@@ -72,6 +72,24 @@ pub fn current_context() -> Result<Option<String>> {
 pub async fn set_context(context: Option<&str>) -> Result<()> {
     use kube::config::KubeConfigOptions;
     if let Some(name) = context {
+        // Validate context name strictly and ensure it exists in kubeconfig
+        let name = name.trim();
+        if name.is_empty() {
+            return Err(anyhow!("invalid context name: empty"));
+        }
+        // Allow a conservative charset to avoid surprising inputs
+        // Alnum, dash, underscore, dot, at, and colon are common in k8s contexts
+        if !name.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '-'|'_'|'.'|'@'|':')) {
+            return Err(anyhow!("invalid context name: unsupported characters"));
+        }
+        if name.len() > 128 {
+            return Err(anyhow!("invalid context name: too long (>128)"));
+        }
+        // Ensure the requested context exists
+        let known = list_contexts()?;
+        if !known.iter().any(|c| c == name) {
+            return Err(anyhow!("unknown context: {}", name));
+        }
         let opts = KubeConfigOptions { context: Some(name.to_string()), ..Default::default() };
         let cfg = kube::Config::from_kubeconfig(&opts).await?;
         let client = Client::try_from(cfg)?;

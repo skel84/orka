@@ -11,6 +11,46 @@ use tracing::warn;
 use orka_persist::Store;
 use uuid::Uuid;
 
+fn max_yaml_bytes() -> usize {
+    std::env::var("ORKA_MAX_YAML_BYTES")
+        .ok()
+        .and_then(|s| s.parse::<usize>().ok())
+        .unwrap_or(1_000_000) // 1 MiB default
+}
+
+fn max_yaml_nodes() -> usize {
+    std::env::var("ORKA_MAX_YAML_NODES")
+        .ok()
+        .and_then(|s| s.parse::<usize>().ok())
+        .unwrap_or(100_000)
+}
+
+fn json_node_budget_exceeded(v: &Json, max: usize) -> bool {
+    // Fast precheck: keep a running counter and bail early when exceeding max
+    fn walk(v: &Json, cur: &mut usize, max: usize) {
+        if *cur >= max { return; }
+        *cur += 1;
+        match v {
+            Json::Object(map) => {
+                for (_k, vv) in map.iter() {
+                    if *cur >= max { break; }
+                    walk(vv, cur, max);
+                }
+            }
+            Json::Array(arr) => {
+                for vv in arr.iter() {
+                    if *cur >= max { break; }
+                    walk(vv, cur, max);
+                }
+            }
+            _ => {}
+        }
+    }
+    let mut count = 0usize;
+    walk(v, &mut count, max);
+    count >= max
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct DiffSummary { pub adds: usize, pub updates: usize, pub removes: usize }
 
@@ -109,14 +149,23 @@ pub async fn edit_from_yaml(
     histogram!("apply_latency_ms", t0.elapsed().as_secs_f64() * 1000.0);
     counter!("apply_ok", 1u64);
 
-    // Persist last-applied YAML snapshot (zstd if enabled)
-    let uid = obj.metadata.uid.as_deref().ok_or_else(|| anyhow!("applied object missing metadata.uid"))?;
-    let uid_bin = parse_uid(uid)?;
-    let rv = new_rv.clone().unwrap_or_default();
-    let la = orka_persist::LastApplied { uid: uid_bin, rv, ts: orka_persist::now_ts(), yaml_zstd: orka_persist::maybe_compress(yaml) };
-    match orka_persist::LogStore::open_default() {
-        Ok(store) => { let _ = store.put_last(la); }
-        Err(e) => warn!(error = %e, "persist open failed; skipping last-applied save"),
+    // Persist last-applied YAML snapshot (zstd if enabled), with safety guards
+    let disable_persist = std::env::var("ORKA_DISABLE_LASTAPPLIED")
+        .ok()
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false);
+    let is_secret = gvk.group.is_empty() && gvk.kind == "Secret";
+    if !disable_persist && !is_secret {
+        let uid = obj.metadata.uid.as_deref().ok_or_else(|| anyhow!("applied object missing metadata.uid"))?;
+        let uid_bin = parse_uid(uid)?;
+        let rv = new_rv.clone().unwrap_or_default();
+        let la = orka_persist::LastApplied { uid: uid_bin, rv, ts: orka_persist::now_ts(), yaml_zstd: orka_persist::maybe_compress(yaml) };
+        match orka_persist::LogStore::open_default() {
+            Ok(store) => { let _ = store.put_last(la); }
+            Err(e) => warn!(error = %e, "persist open failed; skipping last-applied save"),
+        }
+    } else if is_secret {
+        warn!("skipping last-applied persist for Secret kind");
     }
 
     Ok(ApplyResult { dry_run: false, applied: true, new_rv, warnings: vec![], summary })
@@ -166,8 +215,14 @@ pub async fn diff_from_yaml(yaml: &str, ns_override: Option<&str>) -> Result<(Di
 }
 
 fn parse_yaml_for_target(yaml: &str, ns_override: Option<&str>) -> Result<(Json, GroupVersionKind, String, Option<String>)> {
+    if yaml.len() > max_yaml_bytes() {
+        return Err(anyhow!("YAML payload too large (>{} bytes)", max_yaml_bytes()));
+    }
     let val: serde_yaml::Value = serde_yaml::from_str(yaml).context("parsing YAML")?;
     let json = serde_json::to_value(val).context("converting YAML to JSON")?;
+    if json_node_budget_exceeded(&json, max_yaml_nodes()) {
+        return Err(anyhow!("YAML document too complex (>{} nodes)", max_yaml_nodes()));
+    }
     let api_version_s = json.get("apiVersion").and_then(|v| v.as_str()).ok_or_else(|| anyhow!("YAML missing apiVersion"))?.to_string();
     let kind_s = json.get("kind").and_then(|v| v.as_str()).ok_or_else(|| anyhow!("YAML missing kind"))?.to_string();
     let (group, version) = if let Some((g, v)) = api_version_s.split_once('/') { (g.to_string(), v.to_string()) } else { (String::new(), api_version_s) };
