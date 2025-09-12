@@ -40,6 +40,6 @@ kubectl wait --for=condition=Available --timeout=180s deploy/cert-manager-cainje
 kubectl get pods -A
 
 echo "[kind-nightly] recording fixtures is user-defined; run orkactl discover/ls/watch"
-echo "Example: ORKA_METRICS_ADDR=0.0.0.0:9090 ORKA_SHARDS=4 orkactl ls v1/ConfigMap --ns default"
+echo "Example: ORKA_METRICS_ADDR=0.0.0.0:9090 orkactl ls v1/ConfigMap --ns default"
 
 echo "[kind-nightly] done"

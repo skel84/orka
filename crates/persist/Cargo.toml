@@ -8,7 +8,6 @@ anyhow = { workspace = true }
 serde = { workspace = true, features = ["derive"] }
 tracing = { workspace = true }
 metrics = { workspace = true }
-rusqlite = { version = "0.31", features = ["bundled"] }
 time = "0.3"
 
 [features]
@@ -18,4 +17,3 @@ zstd = ["dep:zstd"]
 [dependencies.zstd]
 version = "0.13"
 optional = true
-

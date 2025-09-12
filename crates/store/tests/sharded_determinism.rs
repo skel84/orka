@@ -31,10 +31,8 @@ async fn run_sequence(seq: &[Delta]) -> Vec<(String, String, u8)> {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn deterministic_across_runs_with_shards() {
-    // Force multiple shards
-    let prev = std::env::var_os("ORKA_SHARDS");
-    std::env::set_var("ORKA_SHARDS", "4");
+async fn deterministic_across_runs() {
+    // Sharding removed; determinism must hold
 
     let seq = vec![
         // initial adds across namespaces
@@ -54,6 +52,5 @@ async fn deterministic_across_runs_with_shards() {
     let c2 = run_sequence(&seq).await;
     assert_eq!(c1, c2, "canonical snapshot view must be deterministic across runs");
 
-    // Restore env
-    match prev { Some(v) => std::env::set_var("ORKA_SHARDS", v), None => std::env::remove_var("ORKA_SHARDS") };
+    // No env to restore
 }

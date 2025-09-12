@@ -3,10 +3,9 @@ use std::str::FromStr;
 use anyhow::Result;
 use clap::{ArgAction, Parser, Subcommand, ValueEnum};
 use tracing::{error, info, warn};
-use orka_store::spawn_ingest_with_planner;
+use orka_store::spawn_ingest_with_projector;
 use orka_api::{OrkaApi, InProcApi};
 use std::sync::Arc;
-use orka_core::ModuloNsPlanner;
 use tokio::sync::mpsc;
 use std::collections::HashMap;
 use tokio::signal;
@@ -348,9 +347,7 @@ async fn main() -> Result<()> {
                     Ok(Some(schema)) => Some(std::sync::Arc::new(schema.projector()) as std::sync::Arc<dyn orka_core::Projector + Send + Sync>),
                     _ => None,
                 };
-                let shards = std::env::var("ORKA_SHARDS").ok().and_then(|s| s.parse().ok()).unwrap_or(1);
-                let planner = Arc::new(ModuloNsPlanner::new(shards));
-                let (ingest_tx, backend) = spawn_ingest_with_planner(cap, projector, Some(planner));
+                let (ingest_tx, backend) = spawn_ingest_with_projector(cap, projector);
                 // Start watcher
                 let watcher_handle = tokio::spawn({
                     let gvk = gvk.clone();
@@ -439,9 +436,7 @@ async fn main() -> Result<()> {
                     Ok(Some(schema)) => Some(std::sync::Arc::new(schema.projector()) as std::sync::Arc<dyn orka_core::Projector + Send + Sync>),
                     _ => None,
                 };
-                let shards = std::env::var("ORKA_SHARDS").ok().and_then(|s| s.parse().ok()).unwrap_or(1);
-                let planner = Arc::new(ModuloNsPlanner::new(shards));
-                let (ingest_tx, _backend) = spawn_ingest_with_planner(cap, projector, Some(planner));
+                let (ingest_tx, _backend) = spawn_ingest_with_projector(cap, projector);
                 let (tap_tx, mut tap_rx) = mpsc::channel::<orka_core::Delta>(cap);
                 let watcher_handle = tokio::spawn({
                     let gvk = gvk.clone();
@@ -620,9 +615,7 @@ async fn main() -> Result<()> {
                 Ok(Some(schema)) => Some(std::sync::Arc::new(schema.projector()) as std::sync::Arc<dyn orka_core::Projector + Send + Sync>),
                 _ => None,
             };
-            let shards = std::env::var("ORKA_SHARDS").ok().and_then(|s| s.parse().ok()).unwrap_or(1);
-            let planner = Arc::new(ModuloNsPlanner::new(shards));
-            let (ingest_tx, backend) = spawn_ingest_with_planner(cap, projector, Some(planner));
+            let (ingest_tx, backend) = spawn_ingest_with_projector(cap, projector);
             // Start watcher
             let watcher_handle = tokio::spawn({
                 let gvk = gvk.clone();
@@ -819,7 +812,7 @@ async fn main() -> Result<()> {
                         // Resolve UID by fetching live object
                         let uid_hex = fetch_uid_for(&gvk, &name, ns).await?;
                         let uid = parse_uid(&uid_hex)?;
-                        let store = match orka_persist::SqliteStore::open_default() { Ok(s) => s, Err(e) => { eprintln!("open db error: {}", e); return Ok(()); } };
+                        let store = match orka_persist::LogStore::open_default() { Ok(s) => s, Err(e) => { eprintln!("open store error: {}", e); return Ok(()); } };
                         let rows = store.get_last(uid, Some(limit)).unwrap_or_default();
                         match output.unwrap_or(cli.output) {
                             Output::Human => {
@@ -854,7 +847,8 @@ async fn main() -> Result<()> {
                 let s = api.stats().await?;
                 StatsOut { shards: s.shards, relist_secs: s.relist_secs, watch_backoff_max_secs: s.watch_backoff_max_secs, max_labels_per_obj: s.max_labels_per_obj, max_annos_per_obj: s.max_annos_per_obj, max_postings_per_key: s.max_postings_per_key, max_rss_mb: s.max_rss_mb, max_index_bytes: s.max_index_bytes, metrics_addr: s.metrics_addr }
             } else {
-                let shards = std::env::var("ORKA_SHARDS").ok().and_then(|s| s.parse().ok()).unwrap_or(1);
+                // shards removed; single pipeline
+                let shards = 1usize;
                 let relist_secs = std::env::var("ORKA_RELIST_SECS").ok().and_then(|s| s.parse().ok()).unwrap_or(300);
                 let watch_backoff_max_secs = std::env::var("ORKA_WATCH_BACKOFF_MAX_SECS").ok().and_then(|s| s.parse().ok()).unwrap_or(30);
                 let max_labels_per_obj = std::env::var("ORKA_MAX_LABELS_PER_OBJ").ok().and_then(|s| s.parse().ok());

@@ -38,8 +38,7 @@ async fn scaffold_multigvk_determinism() {
     // This test simulates two independent GVK streams (A and B) and asserts that
     // composing their snapshots is deterministic across runs. Real multi-GVK
     // world composition would happen in a higher-level container.
-    let prev = std::env::var_os("ORKA_SHARDS");
-    std::env::set_var("ORKA_SHARDS", "3");
+    // Sharding removed; single pipeline
 
     // Stream A (e.g., ConfigMaps)
     let a_seq = vec![
@@ -60,6 +59,5 @@ async fn scaffold_multigvk_determinism() {
     let comp2 = compose(a2, b2);
     assert_eq!(comp1, comp2, "composed multi-GVK snapshot must be deterministic across runs");
 
-    match prev { Some(v) => std::env::set_var("ORKA_SHARDS", v), None => std::env::remove_var("ORKA_SHARDS") };
+    // No env to restore
 }
-

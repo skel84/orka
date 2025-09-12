@@ -83,22 +83,6 @@ As noted by The Primagen, dependencies on git repositories are a red flag for bu
 1.  **Commit to the Internal ANSI Terminal:** The custom VTE-based terminal in `crates/gui/src/ui/term.rs` is sufficient for the project's needs. We will remove the optional `egui_term` git dependency and its feature flag entirely. This simplifies the build and removes an external point of failure.
 2.  **Review all `Cargo.toml` files:** Conduct a quick audit of all dependencies. Are they all necessary? Are there lighter-weight alternatives? For example, is a full `regex` dependency needed for simple log grepping, or could a simpler substring search suffice for the 80% case? (For now, `regex` is fine, but this is the mindset to adopt).
 
----
-
-### Phase 3: Validation
-
-**Rationale:**
-We must prove that these simplifications have not negatively impacted performance and have measurably improved maintainability.
-
-#### **Action Area 4: Benchmark and Profile the Simplified Core**
-
-**Technical Steps:**
-
-1.  **Establish Baselines:** Before beginning work, run the existing benchmarks (`crates/search/examples/bench.rs`) and capture key metrics: ingest throughput, p99 search latency, and peak memory usage for a 100k object snapshot.
-2.  **Measure After Simplification:** After removing sharding and replacing SQLite, run the exact same benchmarks.
-3.  **Analyze Results:**
-    *   **Expectation:** Ingest and search latency will be equivalent or slightly *better* due to the removal of sharding overhead. Memory usage may be slightly lower.
-    *   **Primary Win:** The primary benefit is not raw performance but a dramatic reduction in code size, complexity, and dependencies, which will accelerate all future development.
 
 ### Path Forward
 

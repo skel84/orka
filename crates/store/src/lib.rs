@@ -4,14 +4,13 @@
 
 use std::collections::VecDeque;
 
-use orka_core::{Delta, LiteObj, WorldSnapshot, Projector, ShardPlanner, ShardKey};
+use orka_core::{Delta, LiteObj, WorldSnapshot, Projector};
 use rustc_hash::FxHashMap;
 use tokio::sync::{mpsc, watch};
-use tracing::{debug, info, warn};
+use tracing::{debug, info};
 use arc_swap::ArcSwap;
 use std::sync::Arc;
 use metrics::{counter, gauge, histogram};
-use std::time::Instant;
 
 /// Coalescing queue keyed by UID with FIFO order and fixed capacity.
 pub struct Coalescer {
@@ -174,17 +173,154 @@ pub fn spawn_ingest_with_projector(
     cap: usize,
     projector: Option<std::sync::Arc<dyn Projector + Send + Sync>>,
 ) -> (mpsc::Sender<Delta>, BackendHandle) {
-    spawn_ingest_with_planner(cap, projector, None)
+    let (tx, mut rx) = mpsc::channel::<Delta>(cap);
+    let snap = Arc::new(ArcSwap::from_pointee(WorldSnapshot::default()));
+    let (epoch_tx, epoch_rx) = watch::channel(0u64);
+    let (partial_tx, partial_rx) = watch::channel(false);
+    let snap_clone = Arc::clone(&snap);
+    let _inject_tx = tx.clone();
+
+    tokio::spawn(async move {
+        let mut coalescer = Coalescer::with_capacity(cap);
+        let mut builder = WorldBuilder::with_projector(projector.clone());
+        let mut dropped_reported: u64 = 0;
+        let partial: bool = false;
+
+        let mut ticker = tokio::time::interval(std::time::Duration::from_millis(8));
+        let mut arrivals: FxHashMap<orka_core::Uid, std::time::Instant> = FxHashMap::default();
+
+        // no-op: previously used for relist; kept intentionally minimal
+
+        let mut global_epoch: u64 = 0;
+
+        loop {
+            tokio::select! {
+                maybe = rx.recv() => {
+                    match maybe {
+                        Some(d) => {
+                            arrivals.insert(d.uid, std::time::Instant::now());
+                            coalescer.push(d);
+                            gauge!("coalescer_len", coalescer.len() as f64);
+                        }
+                        None => {
+                            debug!("delta channel closed; draining and exiting ingest loop");
+                            let mut any = false;
+                            let batch = coalescer.drain_ready();
+                            if !batch.is_empty() {
+                                let drained = batch.len();
+                                let dropped = coalescer.dropped();
+                                let now = std::time::Instant::now();
+                                for d in batch.iter() {
+                                    if let Some(t0) = arrivals.remove(&d.uid) {
+                                        let ms = now.saturating_duration_since(t0).as_secs_f64() * 1000.0;
+                                        histogram!("ingest_lag_ms", ms);
+                                    }
+                                }
+                                builder.apply(batch);
+                                any = true;
+                                debug!(drained, dropped, "ingest applied batch (final)");
+                                histogram!("ingest_batch_size", drained as f64);
+                            }
+                            gauge!("coalescer_len", coalescer.len() as f64);
+                            if any {
+                                global_epoch = global_epoch.saturating_add(1);
+                                let mut items: Vec<LiteObj> = Vec::new();
+                                builder.extend_live_items(&mut items);
+                                let approx_pre = approx_items_bytes(&items);
+                                let approx_final = if let Some(max_mb) = std::env::var("ORKA_MAX_RSS_MB").ok().and_then(|s| s.parse::<usize>().ok()) {
+                                    let cap = max_mb.saturating_mul(1024*1024);
+                                    if approx_pre > cap { trim_items_for_memory(&mut items, cap) } else { approx_pre }
+                                } else { approx_pre };
+                                let merged = WorldSnapshot { epoch: global_epoch, items };
+                                let t_swap = std::time::Instant::now();
+                                snap_clone.store(Arc::new(merged));
+                                let swap_ms = t_swap.elapsed().as_secs_f64() * 1000.0;
+                                histogram!("snapshot_swap_ms", swap_ms);
+                                let _ = epoch_tx.send(global_epoch);
+                                gauge!("ingest_epoch", global_epoch as f64);
+                                let snap_loaded = snap_clone.load();
+                                gauge!("snapshot_items", snap_loaded.items.len() as f64);
+                                gauge!("docs_total", snap_loaded.items.len() as f64);
+                                gauge!("snapshot_bytes", approx_final as f64);
+                                gauge!("raw_bytes", 0.0);
+                                let mut set = std::collections::HashSet::new();
+                                for o in &snap_loaded.items { for (k, _v) in &o.labels { set.insert(k); } }
+                                gauge!("labels_cardinality", set.len() as f64);
+                                let _ = partial_tx.send(partial);
+                                gauge!("partial_view", if partial { 1.0 } else { 0.0 });
+                            }
+                            break;
+                        }
+                    }
+                }
+                _ = ticker.tick() => {
+                    let mut any = false;
+                    let batch = coalescer.drain_ready();
+                    if !batch.is_empty() {
+                        let drained = batch.len();
+                        let dropped = coalescer.dropped();
+                        let prev = std::mem::replace(&mut dropped_reported, dropped);
+                        if dropped > prev { counter!("coalescer_dropped", (dropped - prev) as u64); }
+                        let now = std::time::Instant::now();
+                        for d in batch.iter() {
+                            if let Some(t0) = arrivals.remove(&d.uid) {
+                                let ms = now.saturating_duration_since(t0).as_secs_f64() * 1000.0;
+                                histogram!("ingest_lag_ms", ms);
+                            }
+                        }
+                        builder.apply(batch);
+                        any = true;
+                        debug!(drained, dropped, "ingest applied batch");
+                        histogram!("ingest_batch_size", drained as f64);
+                    }
+                    gauge!("coalescer_len", coalescer.len() as f64);
+                    if any {
+                        global_epoch = global_epoch.saturating_add(1);
+                        let t_merge = std::time::Instant::now();
+                        let mut items: Vec<LiteObj> = Vec::new();
+                        builder.extend_live_items(&mut items);
+                        let approx_pre = approx_items_bytes(&items);
+                        let approx_final = if let Some(max_mb) = std::env::var("ORKA_MAX_RSS_MB").ok().and_then(|s| s.parse::<usize>().ok()) {
+                            let cap = max_mb.saturating_mul(1024*1024);
+                            if approx_pre > cap { trim_items_for_memory(&mut items, cap) } else { approx_pre }
+                        } else { approx_pre };
+                        let merged = WorldSnapshot { epoch: global_epoch, items };
+                        let t_swap = std::time::Instant::now();
+                        snap_clone.store(Arc::new(merged));
+                        let swap_ms = t_swap.elapsed().as_secs_f64() * 1000.0;
+                        histogram!("snapshot_swap_ms", swap_ms);
+                        let _ = epoch_tx.send(global_epoch);
+                        gauge!("ingest_epoch", global_epoch as f64);
+                        let snap_loaded = snap_clone.load();
+                        gauge!("snapshot_items", snap_loaded.items.len() as f64);
+                        gauge!("docs_total", snap_loaded.items.len() as f64);
+                        gauge!("snapshot_bytes", approx_final as f64);
+                        gauge!("raw_bytes", 0.0);
+                        let mut set = std::collections::HashSet::new();
+                        for o in &snap_loaded.items { for (k, _v) in &o.labels { set.insert(k); } }
+                        gauge!("labels_cardinality", set.len() as f64);
+                        let merge_ms = t_merge.elapsed().as_secs_f64() * 1000.0;
+                        histogram!("snapshot_merge_ms", merge_ms);
+                        let _ = partial_tx.send(partial);
+                        gauge!("partial_view", if partial { 1.0 } else { 0.0 });
+                    }
+                }
+            }
+        }
+        info!("ingest loop stopped");
+    });
+
+    (tx, BackendHandle { snap, epoch_rx, partial_rx })
 }
 
-/// Variant that accepts a shard planner used for partitioning.
+/// Variant that accepted a shard planner (removed).
+#[cfg(any())]
 pub fn spawn_ingest_with_planner(
     cap: usize,
     projector: Option<std::sync::Arc<dyn Projector + Send + Sync>>,
     planner: Option<std::sync::Arc<dyn ShardPlanner + Send + Sync>>,
 ) -> (mpsc::Sender<Delta>, BackendHandle) {
-    // Number of shards for ingest/build; default 1
-    let shards: usize = std::env::var("ORKA_SHARDS").ok().and_then(|s| s.parse().ok()).unwrap_or(1).max(1);
+    let shards: usize = 1;
 
     let (tx, mut rx) = mpsc::channel::<Delta>(cap);
     let snap = Arc::new(ArcSwap::from_pointee(WorldSnapshot::default()));

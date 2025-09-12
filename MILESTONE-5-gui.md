@@ -250,3 +250,6 @@ Notes: Exec UI remains a placeholder; terminal tab to be added later. Drain gati
 - Imperative ops bypass Apply, execute immediately, and stream results.  
 - Show pressure/drops explicitly in bottom bar and Stats page.  
 - Feature flags: `gui`, `ops`, `persist`, `validate`.
+# Note (post-simplification)
+
+UI references to shard counts are now shown as a single pipeline count; the backend no longer shards ingest/search.

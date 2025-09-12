@@ -19,7 +19,7 @@ pub(crate) fn ui_statusbar(app: &mut OrkaGuiApp, ctx: &egui::Context) {
                 ui.colored_label(color, format!("items: {}", items));
                 ui.separator();
                 if ui.button("Stats…").clicked() { app.stats.open = true; app.start_stats_task(); }
-                if let Some(s) = &app.stats.data { ui.label(format!("shards: {}", s.shards)); }
+                if let Some(s) = &app.stats.data { ui.label(format!("pipe: {}", s.shards)); }
                 if let Some(epoch) = app.results.epoch { ui.separator(); ui.label(format!("epoch: {}", epoch)); }
                 // Memory cap banners (static caps)
                 if let Some(s) = &app.stats.data {

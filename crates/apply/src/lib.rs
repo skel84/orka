@@ -114,7 +114,7 @@ pub async fn edit_from_yaml(
     let uid_bin = parse_uid(uid)?;
     let rv = new_rv.clone().unwrap_or_default();
     let la = orka_persist::LastApplied { uid: uid_bin, rv, ts: orka_persist::now_ts(), yaml_zstd: orka_persist::maybe_compress(yaml) };
-    match orka_persist::SqliteStore::open_default() {
+    match orka_persist::LogStore::open_default() {
         Ok(store) => { let _ = store.put_last(la); }
         Err(e) => warn!(error = %e, "persist open failed; skipping last-applied save"),
     }
@@ -147,7 +147,7 @@ pub async fn diff_from_yaml(yaml: &str, ns_override: Option<&str>) -> Result<(Di
 
     // Diff against last-applied if present
     let last_summary = if let Some(uid_str) = live_json.as_ref().and_then(|v| v.get("metadata")).and_then(|m| m.get("uid")).and_then(|s| s.as_str()) {
-        if let Ok(store) = orka_persist::SqliteStore::open_default() {
+        if let Ok(store) = orka_persist::LogStore::open_default() {
             if let Ok(rows) = store.get_last(parse_uid(uid_str)?, Some(1)) {
                 if let Some(top) = rows.get(0) {
                     let prev_yaml = orka_persist::maybe_decompress(&top.yaml_zstd);

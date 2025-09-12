@@ -18,10 +18,7 @@ fn obj(id: u8, name: &str, ns: Option<&str>) -> LiteObj {
 fn snap(items: Vec<LiteObj>) -> WorldSnapshot { WorldSnapshot { epoch: 1, items } }
 
 #[test]
-fn sharded_index_preserves_global_doc_ids_and_ordering() {
-    // Force sharding to 2 buckets to exercise cross-shard search
-    let prev = std::env::var_os("ORKA_SHARDS");
-    std::env::set_var("ORKA_SHARDS", "2");
+fn index_preserves_global_doc_ids_and_ordering() {
 
     let s = snap(vec![
         obj(1, "alpha", Some("default")),
@@ -42,10 +39,4 @@ fn sharded_index_preserves_global_doc_ids_and_ordering() {
     assert_eq!(names_uids.remove(0), ("alpha".to_string(), 2));
     assert_eq!(names_uids.remove(0), ("beta".to_string(), 3));
 
-    // Restore env
-    match prev {
-        Some(v) => std::env::set_var("ORKA_SHARDS", v),
-        None => std::env::remove_var("ORKA_SHARDS"),
-    }
 }
-

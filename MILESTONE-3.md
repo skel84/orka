@@ -196,3 +196,6 @@ Metrics (current):
 - Determinism: sharded replay test added; multi‑GVK replay scaffold in place.
 - Apply preflight freshness guard implemented; opt‑out via env.
 - `orkactl stats` shows runtime knobs and metrics endpoint.
+# Note (post-simplification)
+
+Sharding has been removed in favor of a single, flattened ingest/search pipeline. References to `ORKA_SHARDS` and per‑shard views in this document are historical.

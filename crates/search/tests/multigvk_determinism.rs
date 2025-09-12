@@ -51,9 +51,7 @@ fn canonicalize_hits(world: &WorldSnapshot, hits: &Vec<orka_search::Hit>) -> Vec
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn multigvk_search_topk_deterministic_across_runs() {
-    // Exercise sharding
-    let prev = std::env::var_os("ORKA_SHARDS");
-    std::env::set_var("ORKA_SHARDS", "3");
+    // Sharding removed; determinism must hold regardless
 
     // Stream A (ConfigMaps)
     let a_seq = vec![
@@ -87,7 +85,5 @@ async fn multigvk_search_topk_deterministic_across_runs() {
 
     assert_eq!(canon1, canon2, "top-k multi-GVK search results must be deterministic across runs");
 
-    // Restore env var
-    match prev { Some(v) => std::env::set_var("ORKA_SHARDS", v), None => std::env::remove_var("ORKA_SHARDS") };
+    // No env var to restore
 }
-

@@ -472,7 +472,7 @@ impl OrkaApi for InProcApi {
     async fn stats(&self) -> OrkaResult<Stats> {
         let t0 = Instant::now();
         info!("api: stats start");
-        let shards: usize = std::env::var("ORKA_SHARDS").ok().and_then(|s| s.parse().ok()).unwrap_or(1);
+        let shards: usize = 1; // sharding removed; single pipeline
         let relist_secs: u64 = std::env::var("ORKA_RELIST_SECS").ok().and_then(|s| s.parse().ok()).unwrap_or(300);
         let watch_backoff_max_secs: u64 = std::env::var("ORKA_WATCH_BACKOFF_MAX_SECS").ok().and_then(|s| s.parse().ok()).unwrap_or(30);
         let max_labels_per_obj = std::env::var("ORKA_MAX_LABELS_PER_OBJ").ok().and_then(|s| s.parse().ok());
@@ -610,8 +610,8 @@ impl OrkaApi for InProcApi {
         let uid_str = obj.metadata.uid.ok_or_else(|| OrkaError::Internal("object missing metadata.uid".into()))?;
         let u = uuid::Uuid::parse_str(&uid_str).map_err(|e| OrkaError::Internal(format!("invalid uid: {}", e)))?;
         let uid = *u.as_bytes();
-        // Load from SQLite
-        let store = orka_persist::SqliteStore::open_default().map_err(|e| OrkaError::Internal(e.to_string()))?;
+        // Load from append-only log store (default)
+        let store = orka_persist::LogStore::open_default().map_err(|e| OrkaError::Internal(e.to_string()))?;
         let rows = store.get_last(uid, limit).map_err(|e| OrkaError::Internal(e.to_string()))?;
         info!(rows = rows.len(), took_ms = %t0.elapsed().as_millis(), "api: last_applied ok");
         Ok(rows)

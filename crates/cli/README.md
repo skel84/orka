@@ -73,7 +73,7 @@ Free text is fuzzy-matched over `NAMESPACE/NAME` plus projected fields.
 - `ORKA_QUEUE_CAP`: bounded channel capacity for deltas (default 2048)
 - `ORKA_RELIST_SECS`: periodic relist interval for watchers (default 300)
 - `ORKA_WATCH_BACKOFF_MAX_SECS`: maximum backoff for watch errors (default 30)
-- `ORKA_SHARDS`: number of namespace buckets for ingest/search sharding (default 1)
+- Sharding removed: ingest/search run on a single pipeline
 - `ORKA_METRICS_ADDR`: if set to `host:port`, exposes Prometheus metrics at `/metrics`
 - `ORKA_SEARCH_LIMIT`: default `--limit` for `search` (overridden by CLI)
 - `ORKA_SEARCH_MAX_CANDIDATES`: cap candidate set size after typed filters

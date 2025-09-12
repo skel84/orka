@@ -25,7 +25,7 @@ pub(crate) fn ui_stats_modal(app: &mut OrkaGuiApp, ctx: &egui::Context) {
                     ui.colored_label(ui.visuals().error_fg_color, err);
                 }
                 if let Some(s) = &app.stats.data {
-                    grid_kv(ui, "Shards", &s.shards.to_string());
+                    grid_kv(ui, "Pipelines", &s.shards.to_string());
                     grid_kv(ui, "Relist (secs)", &s.relist_secs.to_string());
                     grid_kv(ui, "Watch backoff max (secs)", &s.watch_backoff_max_secs.to_string());
                     if let Some(v) = s.max_labels_per_obj { grid_kv(ui, "Max labels per object", &v.to_string()); }
