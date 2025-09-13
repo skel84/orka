@@ -1,6 +1,7 @@
 #![forbid(unsafe_code)]
 
 use crate::{OrkaGuiApp, UiUpdate};
+use crate::model::{GraphModel, GraphNode, GraphEdge, GraphNodeRole};
 use orka_core::Uid;
 use tracing::info;
 
@@ -39,16 +40,25 @@ impl OrkaGuiApp {
             let t0 = std::time::Instant::now();
             match api.get_raw(reference).await {
                 Ok(bytes) => {
-                    let text = match serde_json::from_slice::<serde_json::Value>(&bytes) {
+                    match serde_json::from_slice::<serde_json::Value>(&bytes) {
                         Ok(v) => {
-                            match build_graph_text(&api, &v, &gvk, ns_opt.as_deref()).await {
+                            // Build both text and model; send both updates for flexible UI paths
+                            let text = match build_graph_text(&api, &v, &gvk, ns_opt.as_deref()).await {
                                 Ok(s) => s,
                                 Err(e) => format!("graph: error building: {}", e),
-                            }
+                            };
+                            let model = match build_graph_model(&api, &v, &gvk, ns_opt.as_deref()).await {
+                                Ok(m) => m,
+                                Err(_e) => GraphModel::default(),
+                            };
+                            let _ = tx.send(UiUpdate::GraphReady { uid, text });
+                            let _ = tx.send(UiUpdate::GraphModelReady { uid, model });
                         }
-                        Err(_) => String::from_utf8_lossy(&bytes).into_owned(),
-                    };
-                    let _ = tx.send(UiUpdate::GraphReady { uid, text });
+                        Err(_) => {
+                            let text = String::from_utf8_lossy(&bytes).into_owned();
+                            let _ = tx.send(UiUpdate::GraphReady { uid, text });
+                        }
+                    }
                 }
                 Err(e) => {
                     let _ = tx.send(UiUpdate::GraphError { uid, error: e.to_string() });
@@ -169,4 +179,96 @@ async fn count_pods_for_selector(ns: Option<&str>, selector: &str) -> Result<usi
     lp = lp.limit(500);
     let list = api.list(&lp).await.map_err(|e| e.to_string())?;
     Ok(list.items.len())
+}
+
+async fn build_graph_model(
+    api: &std::sync::Arc<dyn orka_api::OrkaApi>,
+    v: &serde_json::Value,
+    gvk: &orka_api::ResourceKind,
+    ns: Option<&str>,
+) -> Result<GraphModel, String> {
+    let mut model = GraphModel::default();
+
+    // Root node
+    let name = v.get("metadata").and_then(|m| m.get("name")).and_then(|x| x.as_str()).unwrap_or("");
+    let ns_str = v.get("metadata").and_then(|m| m.get("namespace")).and_then(|x| x.as_str()).unwrap_or("");
+    let root_label = if gvk.namespaced { format!("{} {}/{}", gvk.kind, ns_str, name) } else { format!("{} {}", gvk.kind, name) };
+    let root_id = format!("root:{}:{}:{}:{}", gvk.group, gvk.version, gvk.kind, name);
+    model.nodes.push(GraphNode { id: root_id.clone(), label: root_label, kind: gvk.kind.clone(), role: GraphNodeRole::Root });
+
+    // Owner chain (walk up preferred controller owner)
+    let mut depth = 0usize;
+    let mut cur_v = v.clone();
+    let mut child_id = root_id.clone();
+    while let Some((group, version, kind, oname)) = owner_from_value(&cur_v) {
+        depth += 1;
+        let owner_id = format!("own:{}/{}/{}:{}", group, version, kind, oname);
+        let owner_label = format!("{}/{} {}", if group.is_empty() { version.clone() } else { format!("{}/{}", group, version) }, kind, oname);
+        model.nodes.push(GraphNode { id: owner_id.clone(), label: owner_label, kind: kind.clone(), role: GraphNodeRole::OwnerChain(depth) });
+        model.edges.push(GraphEdge { from: owner_id.clone(), to: child_id.clone(), label: Some("owner".into()) });
+        if depth >= 5 { break; }
+        // Fetch parent raw to continue walking
+        let parent_ref = ResourceRef {
+            cluster: None,
+            gvk: orka_api::ResourceKind { group: group.clone(), version: version.clone(), kind: kind.clone(), namespaced: true },
+            namespace: ns.map(|s| s.to_string()),
+            name: oname.clone(),
+        };
+        match api.get_raw(parent_ref).await {
+            Ok(bytes) => match serde_json::from_slice::<serde_json::Value>(&bytes) {
+                Ok(pv) => { cur_v = pv; child_id = owner_id; }
+                Err(_) => break,
+            },
+            Err(_) => break,
+        }
+    }
+
+    // Direct relationships
+    match gvk.kind.as_str() {
+        "Pod" => {
+            if let Some(sa) = v.get("spec").and_then(|s| s.get("serviceAccountName")).and_then(|x| x.as_str()) {
+                let id = format!("sa:{}:{}:{}", ns.unwrap_or(""), "v1", sa);
+                model.nodes.push(GraphNode { id: id.clone(), label: format!("ServiceAccount {}", sa), kind: "ServiceAccount".into(), role: GraphNodeRole::Related("ServiceAccount".into()) });
+                model.edges.push(GraphEdge { from: id, to: root_id.clone(), label: Some("uses".into()) });
+            }
+            // ConfigMaps and Secrets from volumes
+            let mut cms: Vec<String> = Vec::new();
+            let mut secs: Vec<String> = Vec::new();
+            if let Some(vols) = v.get("spec").and_then(|s| s.get("volumes")).and_then(|x| x.as_array()) {
+                for vol in vols {
+                    if let Some(cm) = vol.get("configMap").and_then(|m| m.get("name")).and_then(|x| x.as_str()) { cms.push(cm.to_string()); }
+                    if let Some(sec) = vol.get("secret").and_then(|m| m.get("secretName").or_else(|| m.get("name")).and_then(|x| x.as_str())) { secs.push(sec.to_string()); }
+                }
+            }
+            cms.sort(); cms.dedup();
+            secs.sort(); secs.dedup();
+            for cm in cms {
+                let id = format!("cm:{}", cm);
+                model.nodes.push(GraphNode { id: id.clone(), label: format!("ConfigMap {}", cm), kind: "ConfigMap".into(), role: GraphNodeRole::Related("ConfigMap".into()) });
+                model.edges.push(GraphEdge { from: id, to: root_id.clone(), label: Some("mounts".into()) });
+            }
+            for sec in secs {
+                let id = format!("sec:{}", sec);
+                model.nodes.push(GraphNode { id: id.clone(), label: format!("Secret {}", sec), kind: "Secret".into(), role: GraphNodeRole::Related("Secret".into()) });
+                model.edges.push(GraphEdge { from: id, to: root_id.clone(), label: Some("mounts".into()) });
+            }
+        }
+        "Service" => {
+            if let Some(sel) = v.get("spec").and_then(|s| s.get("selector")).and_then(|x| x.as_object()) {
+                let mut items: Vec<String> = Vec::new();
+                for (k, v) in sel.iter() { if let Some(sv) = v.as_str() { items.push(format!("{}={}", k, sv)); } }
+                items.sort();
+                let selector = items.join(",");
+                let ns_for = ns.map(|s| s.to_string());
+                let count = match count_pods_for_selector(ns_for.as_deref(), &selector).await { Ok(n) => n, Err(_) => 0 };
+                let label = if selector.is_empty() { "Pods".to_string() } else { format!("Pods ({})", count) };
+                let id = format!("pods:{}", selector);
+                model.nodes.push(GraphNode { id: id.clone(), label, kind: "Pods".into(), role: GraphNodeRole::Related("Pods".into()) });
+                model.edges.push(GraphEdge { from: root_id.clone(), to: id, label: Some("selects".into()) });
+            }
+        }
+        _ => {}
+    }
+
+    Ok(model)
 }

@@ -14,32 +14,23 @@ pub(crate) fn ui_topbar(app: &mut OrkaGuiApp, ctx: &egui::Context) {
             ui.small_button(if app.layout.show_nav { "Hide Nav" } else { "Show Nav" })
                 .clicked()
                 .then(|| app.layout.show_nav = !app.layout.show_nav);
-            #[cfg(not(feature = "dock"))]
-            {
-                ui.small_button(if app.layout.show_details { "Hide Details" } else { "Show Details" })
-                    .clicked()
-                    .then(|| app.layout.show_details = !app.layout.show_details);
-            }
             ui.small_button(if app.layout.show_log { "Hide Log" } else { "Show Log" })
                 .clicked()
                 .then(|| app.layout.show_log = !app.layout.show_log);
-            #[cfg(feature = "dock")]
-            {
-                ui.separator();
-                if ui.small_button("Close Details Tabs").on_hover_text("Close all Details tabs").clicked() {
-                    app.close_all_details_tabs();
-                }
-                if !app.detached.is_empty() {
-                    let label = format!("Reattach All ({})", app.detached.len());
-                    if ui.small_button(label).on_hover_text("Close detached windows and reopen as tabs").clicked() {
-                        let ids: Vec<(egui::ViewportId, orka_core::Uid)> = app.detached.iter().map(|w| (w.meta.id, w.meta.uid)).collect();
-                        for (id, uid) in &ids {
-                            app.open_details_tab_for(*uid);
-                            ui.ctx().send_viewport_cmd_to(*id, egui::ViewportCommand::Close);
-                        }
-                        app.detached.clear();
-                        app.toast(format!("reattached {}", ids.len()), ToastKind::Info);
+            ui.separator();
+            if ui.small_button("Close Details Tabs").on_hover_text("Close all Details tabs").clicked() {
+                app.close_all_details_tabs();
+            }
+            if !app.detached.is_empty() {
+                let label = format!("Reattach All ({})", app.detached.len());
+                if ui.small_button(label).on_hover_text("Close detached windows and reopen as tabs").clicked() {
+                    let ids: Vec<(egui::ViewportId, orka_core::Uid)> = app.detached.iter().map(|w| (w.meta.id, w.meta.uid)).collect();
+                    for (id, uid) in &ids {
+                        app.open_details_tab_for(*uid);
+                        ui.ctx().send_viewport_cmd_to(*id, egui::ViewportCommand::Close);
                     }
+                    app.detached.clear();
+                    app.toast(format!("reattached {}", ids.len()), ToastKind::Info);
                 }
             }
             ui.separator();

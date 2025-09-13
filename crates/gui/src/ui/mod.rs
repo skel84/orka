@@ -8,3 +8,7 @@ pub mod toasts;
 pub mod stats;
 pub mod shortcuts;
 pub mod term;
+pub mod dock;
+pub mod windows;
+pub mod updates;
+pub mod init;

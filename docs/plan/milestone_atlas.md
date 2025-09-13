@@ -45,10 +45,13 @@ This plan is guided by a set of non-negotiable principles established by the cor
 
 #### **Phase 1: Build the Interactive Atlas**
 
-*   [ ] **Integrate Visual Graphing Library:** Replace the list-based view with an interactive graph rendered using `egui_graphs`. The "Classic Table View" will remain accessible via a prominent toggle.
+*   [x] **Classic/Atlas Toggle (Details > Graph):** Users can switch between the existing list view and the new "Atlas" interactive view in the Details pane.
+*   [x] **Background Graph Model (owner/related):** Build an in-memory graph model for the selected resource (owner chain + direct relationships such as ServiceAccount, ConfigMaps/Secrets, and Pods via Service selectors).
+*   [x] **Minimal Interactive Renderer:** Implement an internal egui-based canvas with pan/zoom, colored nodes, edges, and clickable node feedback.
 *   [ ] **Implement Progressive Disclosure:** The default Atlas view will be a high-level overview (e.g., `Namespaces`). Clicking a node will "unfurl" it to reveal the resources inside, preventing the "hairball problem" on large clusters.
 *   [ ] **Integrate Command Palette:** The Command Palette will become the primary navigation tool for the Atlas. As the user types, matching nodes will be highlighted in real-time. Hitting Enter will pan and zoom the view to focus on the selected resource and its immediate neighbors.
 *   [ ] **Develop the Visual Language:** Design a clear and intuitive visual system of colors, icons, and line styles to represent resource health (e.g., green for `Running`, yellow for `Pending`, red for `Failed`), relationships, and status.
+*   [ ] **Library Evaluation (Optional):** Evaluate `egui_graphs` versus continuing an internal renderer (with a wgpu path) for layout/rendering. Internal path currently used for the baseline.
 
 #### **Phase 2: Progressive Acceleration (The God-Tier Experience)**
 *Goal: Deliver a fluid, 120Hz experience on modern hardware by leveraging GPU acceleration, with a robust CPU fallback.*
@@ -64,6 +67,13 @@ This plan is guided by a set of non-negotiable principles established by the cor
 *   [ ] **Ensure Robust Fallbacks & Testing:**
     *   [ ] The application *must* detect GPU/driver failures at startup and seamlessly fall back to the optimized CPU-only mode. The user should never see a crash, only a notification.
     *   [ ] Establish a CI test matrix that includes both X11 and Wayland on Linux, and targets Apple Silicon to catch platform-specific regressions.
+
+—
+
+Delivered in this milestone so far:
+
+* Atlas baseline (Details > Graph): toggle, background model builder, minimal interactive renderer.
+* Serves as the foundation for progressive disclosure, palette integration, and GPU acceleration work.
 
 ---
 

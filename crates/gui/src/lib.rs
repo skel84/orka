@@ -1,35 +1,36 @@
 #![forbid(unsafe_code)]
 
 use std::collections::{HashMap, VecDeque};
-use std::time::Instant;
 use std::sync::{mpsc, Arc};
+use std::time::Instant;
 
 use eframe::egui;
-#[cfg(feature = "dock")]
 use egui_dock as dock;
-use orka_api::{LiteEvent, OrkaApi, ResourceKind, Selector};
-use orka_core::{LiteObj, Uid};
+use orka_api::{OrkaApi, ResourceKind, Selector};
 use orka_core::columns::{ColumnKind, ColumnSpec};
+use orka_core::{LiteObj, Uid};
 use tracing::info;
-use metrics::{counter, gauge, histogram};
-use tokio::sync::Semaphore;
 
+mod details;
+mod logs;
+mod model;
+mod nav;
+mod results;
+mod tasks;
+mod ui;
 mod util;
 mod watch;
-mod results;
-mod nav;
-mod details;
-mod model;
-mod ui;
-mod tasks;
-mod logs;
-pub use model::{UiUpdate, VirtualMode, SearchExplain, PaletteItem, PaletteState, LayoutState};
-use model::{ResultsState, SearchState, DetailsState, SelectionState, UiDebounce, DiscoveryState, WatchState, LogsState, ServiceLogsState, EditState, OpsState, ToastKind, StatsState, PrefixTheme, ExecState};
-use model::{DetailsPaneTab, DescribeState};
+use model::DetachedDetailsWindow;
 use model::GraphState;
-use model::{DetachedDetailsWindow, DetachedDetailsWindowMeta, DetachedDetailsWindowState};
+use model::{DescribeState, DetailsPaneTab};
+use model::{
+    DetailsState, DiscoveryState, EditState, ExecState, LogsState, OpsState, PrefixTheme,
+    ResultsState, SearchState, SelectionState, ServiceLogsState, StatsState, ToastKind, UiDebounce,
+    WatchState,
+};
+pub use model::{LayoutState, PaletteItem, PaletteState, SearchExplain, UiUpdate, VirtualMode};
 use util::{gvk_label, parse_gvk_key_to_kind};
-use watch::{watch_hub_subscribe, watch_hub_prime};
+use watch::{watch_hub_prime, watch_hub_subscribe};
 
 /// Entry point used by the CLI to launch the GUI.
 pub fn run_native(api: Arc<dyn OrkaApi>) -> eframe::Result<()> {
@@ -59,13 +60,9 @@ pub struct OrkaGuiApp {
     // scratch
     search: SearchState,
     log: String,
-    #[cfg(feature = "dock")]
     dock: Option<dock::DockState<Tab>>,
-    #[cfg(feature = "dock")]
     dock_pending: Vec<Uid>,
-    #[cfg(feature = "dock")]
     details_tab_order: VecDeque<Uid>,
-    #[cfg(feature = "dock")]
     details_tabs_cap: usize,
     // layout visibility
     layout: LayoutState,
@@ -103,155 +100,12 @@ pub struct OrkaGuiApp {
     logs_owner: Option<egui::ViewportId>,
     exec_owner: Option<egui::ViewportId>,
     svc_logs_owner: Option<egui::ViewportId>,
-    #[cfg(feature = "dock")]
     dock_close_pending: Vec<Uid>,
 }
 
 impl OrkaGuiApp {
-    #[cfg(feature = "dock")]
-    fn open_details_tab_for(&mut self, uid: Uid) {
-        // Defer dock mutations to after DockArea render to avoid borrow conflicts
-        self.dock_pending.push(uid);
-    }
+    // open_detached_for moved to ui::windows
 
-    /// Open a detached OS window to show details for the given UID.
-    fn open_detached_for(&mut self, ctx: &egui::Context, uid: Uid) {
-        // If already opened, focus it by re-showing; otherwise create meta/state and start fetch.
-        if self.detached.iter().any(|w| w.meta.uid == uid) {
-            return;
-        }
-        // Resolve row info for title and reference
-        let (ns, name) = if let Some(i) = self.results.index.get(&uid).copied() {
-            if let Some(row) = self.results.rows.get(i) { (row.namespace.clone(), row.name.clone()) } else { (None, String::from("")) }
-        } else { (None, String::from("")) };
-        let gvk = match self.current_selected_kind() { Some(k) => k.clone(), None => return };
-        let title = match &ns { Some(ns) => format!("Details: {}/{}", ns, name), None => format!("Details: {}", name) };
-        let id = egui::ViewportId::from_hash_of(("orka_details", uid));
-        let meta = DetachedDetailsWindowMeta { id, uid, title, gvk: gvk.clone(), namespace: ns.clone(), name: name.clone() };
-        let state = DetachedDetailsWindowState {
-            buffer: String::new(),
-            last_error: None,
-            opened_at: Instant::now(),
-            active_tab: self.details.active_tab,
-            edit_ui: model::EditUi {
-                buffer: self.edit.buffer.clone(),
-                original: self.edit.original.clone(),
-                dirty: self.edit.dirty,
-                running: self.edit.running,
-                status: self.edit.status.clone(),
-            },
-            logs: {
-                let mut l = LogsState::default();
-                l.follow = self.logs.follow;
-                l.grep = String::new();
-                l.backlog = std::collections::VecDeque::with_capacity(self.logs.backlog_cap.min(256));
-                l.backlog_cap = self.logs.backlog_cap;
-                l.dropped = 0;
-                l.recv = 0;
-                l.containers = self.logs.containers.clone();
-                l.container = self.logs.container.clone();
-                l.tail_lines = self.logs.tail_lines;
-                l.since_seconds = self.logs.since_seconds;
-                l.ring = std::collections::VecDeque::with_capacity(self.logs.ring_cap.min(256));
-                l.ring_cap = self.logs.ring_cap;
-                l.wrap = self.logs.wrap;
-                l.colorize = self.logs.colorize;
-                l.visible_follow_limit = self.logs.visible_follow_limit;
-                l.order_by_ts_when_paused = self.logs.order_by_ts_when_paused;
-                l.follow_pad_rows = self.logs.follow_pad_rows;
-                l.prefix_theme = self.logs.prefix_theme;
-                l.grep_cache = None;
-                l.grep_error = None;
-                l.v2 = self.logs.v2;
-                l
-            },
-            exec: {
-                let mut e = ExecState::default();
-                e.pty = self.exec.pty;
-                e.cmd = self.exec.cmd.clone();
-                e.container = self.exec.container.clone();
-                e.backlog = std::collections::VecDeque::with_capacity(self.exec.backlog_cap.min(256));
-                e.backlog_cap = self.exec.backlog_cap;
-                e.dropped = 0;
-                e.recv = 0;
-                e.stdin_buf = String::new();
-                e.last_cols = None;
-                e.last_rows = None;
-                e.term = None;
-                e.focused = false;
-                e.mode_oneshot = self.exec.mode_oneshot;
-                e.external_cmd = self.exec.external_cmd.clone();
-                e
-            },
-            svc_logs: {
-                let mut s = ServiceLogsState::default();
-                s.follow = self.svc_logs.follow;
-                s.grep = String::new();
-                s.grep_cache = None;
-                s.grep_error = None;
-                s.ring = std::collections::VecDeque::with_capacity(self.svc_logs.ring_cap.min(256));
-                s.ring_cap = self.svc_logs.ring_cap;
-                s.recv = 0;
-                s.dropped = 0;
-                s.tail_lines = self.svc_logs.tail_lines;
-                s.since_seconds = self.svc_logs.since_seconds;
-                s.visible_follow_limit = self.svc_logs.visible_follow_limit;
-                s.colorize = self.svc_logs.colorize;
-                s.order_by_ts_when_paused = self.svc_logs.order_by_ts_when_paused;
-                s.follow_pad_rows = self.svc_logs.follow_pad_rows;
-                s.v2 = self.svc_logs.v2;
-                s.prefix_theme = self.svc_logs.prefix_theme;
-                s
-            },
-        };
-        self.detached.push(DetachedDetailsWindow { meta: meta.clone(), state });
-        // Ensure OS knows about the new viewport right away
-        ctx.request_repaint();
-    }
-
-    #[cfg(feature = "dock")]
-    fn ensure_details_tab_in(&mut self, ds: &mut dock::DockState<Tab>, uid: Uid) {
-        let tree = ds.main_surface_mut();
-        // If tab exists for this uid, just focus it
-        if let Some((node, tab_index)) = tree.find_tab_from(|t| matches!(t, Tab::DetailsFor(id) if *id == uid)) {
-            tree.set_focused_node(node);
-            tree.set_active_tab(node, tab_index);
-        } else {
-            // Find an existing details leaf, else split root to create one on the right
-            if let Some((node, _)) = tree.find_tab_from(|t| matches!(t, Tab::DetailsFor(_) | Tab::Details)) {
-                tree.set_focused_node(node);
-                tree.push_to_focused_leaf(Tab::DetailsFor(uid));
-            } else {
-                tree.split_right(dock::NodeIndex::root(), 0.5, vec![Tab::DetailsFor(uid)]);
-            }
-        }
-        // Track order and enforce cap
-        self.note_opened_details_uid(uid, ds);
-    }
-
-    #[cfg(feature = "dock")]
-    fn note_opened_details_uid(&mut self, uid: Uid, ds: &mut dock::DockState<Tab>) {
-        if let Some(pos) = self.details_tab_order.iter().position(|u| *u == uid) {
-            self.details_tab_order.remove(pos);
-        }
-        self.details_tab_order.push_back(uid);
-        while self.details_tab_order.len() > self.details_tabs_cap {
-            if let Some(old) = self.details_tab_order.pop_front() {
-                if let Some((node, tab_index)) = ds.find_main_surface_tab(&Tab::DetailsFor(old)) {
-                    let surface = dock::SurfaceIndex::main();
-                    let _ = ds.remove_tab((surface, node, tab_index));
-                }
-            }
-        }
-    }
-
-    #[cfg(feature = "dock")]
-    pub(crate) fn close_all_details_tabs(&mut self) {
-        if let Some(ds) = self.dock.as_mut() {
-            ds.retain_tabs(|tab| !matches!(tab, Tab::Details | Tab::DetailsFor(_)));
-        }
-        self.details_tab_order.clear();
-    }
     pub(crate) fn selected_is_pod(&self) -> bool {
         match self.current_selected_kind() {
             Some(k) => k.group.is_empty() && k.version == "v1" && k.kind == "Pod",
@@ -280,15 +134,26 @@ impl OrkaGuiApp {
             let t0 = Instant::now();
             let res = api_clone.discover().await.map_err(|e| e.to_string());
             match &res {
-                Ok(v) => info!(took_ms = %t0.elapsed().as_millis(), kinds = v.len(), "discovery completed"),
-                Err(e) => info!(took_ms = %t0.elapsed().as_millis(), error = %e, "discovery failed"),
+                Ok(v) => {
+                    info!(took_ms = %t0.elapsed().as_millis(), kinds = v.len(), "discovery completed")
+                }
+                Err(e) => {
+                    info!(took_ms = %t0.elapsed().as_millis(), error = %e, "discovery failed")
+                }
             }
             let _ = tx.send(res);
         });
         let mut this = Self {
             api,
-            discovery: DiscoveryState { kinds: Vec::new(), rx: Some(rx) },
-            selection: SelectionState { selected_idx: None, selected_kind: None, namespace: String::new() },
+            discovery: DiscoveryState {
+                kinds: Vec::new(),
+                rx: Some(rx),
+            },
+            selection: SelectionState {
+                selected_idx: None,
+                selected_kind: None,
+                namespace: String::new(),
+            },
             results: ResultsState {
                 rows: Vec::new(),
                 index: HashMap::new(),
@@ -297,18 +162,63 @@ impl OrkaGuiApp {
                 sort_asc: true,
                 sort_dirty: false,
                 filter_cache: HashMap::new(),
-                soft_cap: std::env::var("ORKA_RESULTS_SOFT_CAP").ok().and_then(|s| s.parse::<usize>().ok()).unwrap_or(2000),
+                soft_cap: std::env::var("ORKA_RESULTS_SOFT_CAP")
+                    .ok()
+                    .and_then(|s| s.parse::<usize>().ok())
+                    .unwrap_or(2000),
                 display_cache: HashMap::new(),
                 virtual_mode: VirtualMode::Auto,
                 filter: String::new(),
                 epoch: None,
             },
-            watch: WatchState { updates_rx: None, updates_tx: None, task: None, stop: None, loaded_idx: None, loaded_gvk_key: None, loaded_ns: None, prewarm_started: false, select_t0: None, ttfr_logged: false, ns_task: None },
-            details: DetailsState { selected: None, buffer: String::new(), task: None, stop: None, selected_at: None, active_tab: DetailsPaneTab::Describe, secret_entries: Vec::new(), secret_revealed: Default::default() },
-            describe: DescribeState { running: false, text: String::new(), error: None, uid: None, task: None, stop: None },
-            graph: GraphState { running: false, text: String::new(), error: None, uid: None, task: None, stop: None },
+            watch: WatchState {
+                updates_rx: None,
+                updates_tx: None,
+                task: None,
+                stop: None,
+                loaded_idx: None,
+                loaded_gvk_key: None,
+                loaded_ns: None,
+                prewarm_started: false,
+                select_t0: None,
+                ttfr_logged: false,
+                ns_task: None,
+            },
+            details: DetailsState {
+                selected: None,
+                buffer: String::new(),
+                task: None,
+                stop: None,
+                selected_at: None,
+                active_tab: DetailsPaneTab::Describe,
+                secret_entries: Vec::new(),
+                secret_revealed: Default::default(),
+            },
+            describe: DescribeState {
+                running: false,
+                text: String::new(),
+                error: None,
+                uid: None,
+                task: None,
+                stop: None,
+            },
+            graph: GraphState {
+                running: false,
+                text: String::new(),
+                error: None,
+                uid: None,
+                task: None,
+                stop: None,
+                mode: model::GraphViewMode::Classic,
+                model: None,
+                atlas_zoom: 1.0,
+                atlas_pan: egui::vec2(0.0, 0.0),
+            },
             exec: {
-                let cap = std::env::var("ORKA_EXEC_BACKLOG_CAP").ok().and_then(|s| s.parse().ok()).unwrap_or(4000);
+                let cap = std::env::var("ORKA_EXEC_BACKLOG_CAP")
+                    .ok()
+                    .and_then(|s| s.parse().ok())
+                    .unwrap_or(4000);
                 ExecState {
                     running: false,
                     pty: true,
@@ -330,24 +240,63 @@ impl OrkaGuiApp {
                     mode_oneshot: true,
                     external_cmd: {
                         #[cfg(target_os = "macos")]
-                        { "iTerm".to_string() }
+                        {
+                            "iTerm".to_string()
+                        }
                         #[cfg(all(unix, not(target_os = "macos")))]
-                        { "alacritty".to_string() }
+                        {
+                            "alacritty".to_string()
+                        }
                         #[cfg(target_os = "windows")]
-                        { "wt.exe".to_string() }
+                        {
+                            "wt.exe".to_string()
+                        }
                     },
                 }
             },
             logs: {
-                let cap_legacy = std::env::var("ORKA_LOGS_BACKLOG_CAP").ok().and_then(|s| s.parse().ok()).unwrap_or(2000);
-                let ring_cap = std::env::var("ORKA_LOGS_RING_CAP").ok().and_then(|s| s.parse().ok()).unwrap_or(10_000);
-                let vis_limit = std::env::var("ORKA_LOGS_VISIBLE_FOLLOW_LIMIT").ok().and_then(|s| s.parse().ok()).unwrap_or(1000);
-                let colorize = std::env::var("ORKA_LOGS_COLORIZE").ok().and_then(|s| s.parse::<i32>().ok()).unwrap_or(1) != 0;
-                let wrap = std::env::var("ORKA_LOGS_WRAP").ok().and_then(|s| s.parse::<i32>().ok()).unwrap_or(0) != 0;
-                let order_paused = std::env::var("ORKA_LOGS_ORDER_BY_TS_WHEN_PAUSED").ok().and_then(|s| s.parse::<i32>().ok()).unwrap_or(1) != 0;
-                let v2 = std::env::var("ORKA_LOGS_V2").ok().and_then(|s| s.parse::<i32>().ok()).unwrap_or(1) != 0;
-                let pad_rows = std::env::var("ORKA_LOGS_FOLLOW_PAD_ROWS").ok().and_then(|s| s.parse::<usize>().ok()).unwrap_or(1);
-                let prefix_theme = match std::env::var("ORKA_LOGS_PREFIX_THEME").ok().unwrap_or_else(|| "bright".to_string()).to_ascii_lowercase().as_str() {
+                let cap_legacy = std::env::var("ORKA_LOGS_BACKLOG_CAP")
+                    .ok()
+                    .and_then(|s| s.parse().ok())
+                    .unwrap_or(2000);
+                let ring_cap = std::env::var("ORKA_LOGS_RING_CAP")
+                    .ok()
+                    .and_then(|s| s.parse().ok())
+                    .unwrap_or(10_000);
+                let vis_limit = std::env::var("ORKA_LOGS_VISIBLE_FOLLOW_LIMIT")
+                    .ok()
+                    .and_then(|s| s.parse().ok())
+                    .unwrap_or(1000);
+                let colorize = std::env::var("ORKA_LOGS_COLORIZE")
+                    .ok()
+                    .and_then(|s| s.parse::<i32>().ok())
+                    .unwrap_or(1)
+                    != 0;
+                let wrap = std::env::var("ORKA_LOGS_WRAP")
+                    .ok()
+                    .and_then(|s| s.parse::<i32>().ok())
+                    .unwrap_or(0)
+                    != 0;
+                let order_paused = std::env::var("ORKA_LOGS_ORDER_BY_TS_WHEN_PAUSED")
+                    .ok()
+                    .and_then(|s| s.parse::<i32>().ok())
+                    .unwrap_or(1)
+                    != 0;
+                let v2 = std::env::var("ORKA_LOGS_V2")
+                    .ok()
+                    .and_then(|s| s.parse::<i32>().ok())
+                    .unwrap_or(1)
+                    != 0;
+                let pad_rows = std::env::var("ORKA_LOGS_FOLLOW_PAD_ROWS")
+                    .ok()
+                    .and_then(|s| s.parse::<usize>().ok())
+                    .unwrap_or(1);
+                let prefix_theme = match std::env::var("ORKA_LOGS_PREFIX_THEME")
+                    .ok()
+                    .unwrap_or_else(|| "bright".to_string())
+                    .to_ascii_lowercase()
+                    .as_str()
+                {
                     "basic" => PrefixTheme::Basic,
                     "gray" | "grey" => PrefixTheme::Gray,
                     "none" => PrefixTheme::None,
@@ -381,13 +330,39 @@ impl OrkaGuiApp {
                 }
             },
             svc_logs: {
-                let ring_cap = std::env::var("ORKA_LOGS_RING_CAP").ok().and_then(|s| s.parse().ok()).unwrap_or(10_000);
-                let vis_limit = std::env::var("ORKA_LOGS_VISIBLE_FOLLOW_LIMIT").ok().and_then(|s| s.parse().ok()).unwrap_or(1000);
-                let colorize = std::env::var("ORKA_LOGS_COLORIZE").ok().and_then(|s| s.parse::<i32>().ok()).unwrap_or(1) != 0;
-                let order_paused = std::env::var("ORKA_LOGS_ORDER_BY_TS_WHEN_PAUSED").ok().and_then(|s| s.parse::<i32>().ok()).unwrap_or(1) != 0;
-                let v2 = std::env::var("ORKA_LOGS_V2").ok().and_then(|s| s.parse::<i32>().ok()).unwrap_or(1) != 0;
-                let pad_rows = std::env::var("ORKA_LOGS_FOLLOW_PAD_ROWS").ok().and_then(|s| s.parse::<usize>().ok()).unwrap_or(1);
-                let prefix_theme = match std::env::var("ORKA_LOGS_PREFIX_THEME").ok().unwrap_or_else(|| "bright".to_string()).to_ascii_lowercase().as_str() {
+                let ring_cap = std::env::var("ORKA_LOGS_RING_CAP")
+                    .ok()
+                    .and_then(|s| s.parse().ok())
+                    .unwrap_or(10_000);
+                let vis_limit = std::env::var("ORKA_LOGS_VISIBLE_FOLLOW_LIMIT")
+                    .ok()
+                    .and_then(|s| s.parse().ok())
+                    .unwrap_or(1000);
+                let colorize = std::env::var("ORKA_LOGS_COLORIZE")
+                    .ok()
+                    .and_then(|s| s.parse::<i32>().ok())
+                    .unwrap_or(1)
+                    != 0;
+                let order_paused = std::env::var("ORKA_LOGS_ORDER_BY_TS_WHEN_PAUSED")
+                    .ok()
+                    .and_then(|s| s.parse::<i32>().ok())
+                    .unwrap_or(1)
+                    != 0;
+                let v2 = std::env::var("ORKA_LOGS_V2")
+                    .ok()
+                    .and_then(|s| s.parse::<i32>().ok())
+                    .unwrap_or(1)
+                    != 0;
+                let pad_rows = std::env::var("ORKA_LOGS_FOLLOW_PAD_ROWS")
+                    .ok()
+                    .and_then(|s| s.parse::<usize>().ok())
+                    .unwrap_or(1);
+                let prefix_theme = match std::env::var("ORKA_LOGS_PREFIX_THEME")
+                    .ok()
+                    .unwrap_or_else(|| "bright".to_string())
+                    .to_ascii_lowercase()
+                    .as_str()
+                {
                     "basic" => PrefixTheme::Basic,
                     "gray" | "grey" => PrefixTheme::Gray,
                     "none" => PrefixTheme::None,
@@ -415,11 +390,22 @@ impl OrkaGuiApp {
                     prefix_theme,
                 }
             },
-            edit: EditState { buffer: String::new(), original: String::new(), dirty: false, running: false, status: String::new(), task: None, stop: None },
+            edit: EditState {
+                buffer: String::new(),
+                original: String::new(),
+                dirty: false,
+                running: false,
+                status: String::new(),
+                task: None,
+                stop: None,
+            },
             last_error: None,
             search: SearchState {
                 query: String::new(),
-                limit: std::env::var("ORKA_SEARCH_LIMIT").ok().and_then(|s| s.parse::<usize>().ok()).unwrap_or(50),
+                limit: std::env::var("ORKA_SEARCH_LIMIT")
+                    .ok()
+                    .and_then(|s| s.parse::<usize>().ok())
+                    .unwrap_or(50),
                 task: None,
                 stop: None,
                 hits: HashMap::new(),
@@ -433,24 +419,50 @@ impl OrkaGuiApp {
                 need_focus: false,
             },
             log: String::new(),
-            #[cfg(feature = "dock")]
             dock: {
                 // Start with Results only; open Details tabs per resource as needed
                 let t = dock::DockState::new(vec![Tab::Results]);
                 Some(t)
             },
-            #[cfg(feature = "dock")]
             dock_pending: Vec::new(),
-            #[cfg(feature = "dock")]
             details_tab_order: VecDeque::new(),
-            #[cfg(feature = "dock")]
-            details_tabs_cap: std::env::var("ORKA_DETAILS_TABS_CAP").ok().and_then(|s| s.parse::<usize>().ok()).unwrap_or(8),
-            layout: LayoutState { show_nav: true, show_details: true, show_log: true },
+            details_tabs_cap: std::env::var("ORKA_DETAILS_TABS_CAP")
+                .ok()
+                .and_then(|s| s.parse::<usize>().ok())
+                .unwrap_or(8),
+            layout: LayoutState {
+                show_nav: true,
+                show_log: true,
+            },
             namespaces: Vec::new(),
-            contexts: match orka_kubehub::list_contexts() { Ok(v) => v, Err(_) => Vec::new() },
-            current_context: match orka_kubehub::current_context() { Ok(v) => v, Err(_) => None },
-            ui_debounce: UiDebounce { ms: std::env::var("ORKA_UI_DEBOUNCE_MS").ok().and_then(|s| s.parse::<u64>().ok()).unwrap_or(100), pending_count: 0, pending_since: None },
-            palette: PaletteState { open: false, query: String::new(), results: Vec::new(), sel: None, changed_at: None, debounce_ms: 80, need_focus: false, width_hint: 560.0, mode_global: false, prime_task: None },
+            contexts: match orka_kubehub::list_contexts() {
+                Ok(v) => v,
+                Err(_) => Vec::new(),
+            },
+            current_context: match orka_kubehub::current_context() {
+                Ok(v) => v,
+                Err(_) => None,
+            },
+            ui_debounce: UiDebounce {
+                ms: std::env::var("ORKA_UI_DEBOUNCE_MS")
+                    .ok()
+                    .and_then(|s| s.parse::<u64>().ok())
+                    .unwrap_or(100),
+                pending_count: 0,
+                pending_since: None,
+            },
+            palette: PaletteState {
+                open: false,
+                query: String::new(),
+                results: Vec::new(),
+                sel: None,
+                changed_at: None,
+                debounce_ms: 80,
+                need_focus: false,
+                width_hint: 560.0,
+                mode_global: false,
+                prime_task: None,
+            },
             ops: OpsState {
                 caps: None,
                 caps_task: None,
@@ -469,25 +481,64 @@ impl OrkaGuiApp {
             },
             toasts: Vec::new(),
             stats: {
-                let open_ms = std::env::var("ORKA_STATS_REFRESH_OPEN_MS").ok().and_then(|s| s.parse::<u64>().ok()).unwrap_or(5_000);
-                let closed_ms = std::env::var("ORKA_STATS_REFRESH_CLOSED_MS").ok().and_then(|s| s.parse::<u64>().ok()).unwrap_or(30_000);
-                let warn_pct = std::env::var("ORKA_WARN_PCT").ok().and_then(|s| s.parse::<f32>().ok()).unwrap_or(0.80);
-                let err_pct = std::env::var("ORKA_ERR_PCT").ok().and_then(|s| s.parse::<f32>().ok()).unwrap_or(0.95);
-                StatsState { open: false, loading: false, last_error: None, data: None, task: None, last_fetched: None, refresh_open_ms: open_ms, refresh_closed_ms: closed_ms, warn_pct, err_pct, index_bytes: None, index_docs: None }
+                let open_ms = std::env::var("ORKA_STATS_REFRESH_OPEN_MS")
+                    .ok()
+                    .and_then(|s| s.parse::<u64>().ok())
+                    .unwrap_or(5_000);
+                let closed_ms = std::env::var("ORKA_STATS_REFRESH_CLOSED_MS")
+                    .ok()
+                    .and_then(|s| s.parse::<u64>().ok())
+                    .unwrap_or(30_000);
+                let warn_pct = std::env::var("ORKA_WARN_PCT")
+                    .ok()
+                    .and_then(|s| s.parse::<f32>().ok())
+                    .unwrap_or(0.80);
+                let err_pct = std::env::var("ORKA_ERR_PCT")
+                    .ok()
+                    .and_then(|s| s.parse::<f32>().ok())
+                    .unwrap_or(0.95);
+                StatsState {
+                    open: false,
+                    loading: false,
+                    last_error: None,
+                    data: None,
+                    task: None,
+                    last_fetched: None,
+                    refresh_open_ms: open_ms,
+                    refresh_closed_ms: closed_ms,
+                    warn_pct,
+                    err_pct,
+                    index_bytes: None,
+                    index_docs: None,
+                }
             },
             details_cache: HashMap::new(),
-            details_ttl_secs: std::env::var("ORKA_DETAILS_TTL_SECS").ok().and_then(|s| s.parse::<u64>().ok()).unwrap_or(60),
-            details_cache_cap: std::env::var("ORKA_DETAILS_CACHE_CAP").ok().and_then(|s| s.parse::<usize>().ok()).unwrap_or(128),
-            idle_repaint_fast_ms: std::env::var("ORKA_IDLE_FAST_MS").ok().and_then(|s| s.parse::<u64>().ok()).unwrap_or(8),
-            idle_repaint_slow_ms: std::env::var("ORKA_IDLE_SLOW_MS").ok().and_then(|s| s.parse::<u64>().ok()).unwrap_or(120),
-            idle_fast_window_ms: std::env::var("ORKA_IDLE_FAST_WINDOW_MS").ok().and_then(|s| s.parse::<u64>().ok()).unwrap_or(1000),
+            details_ttl_secs: std::env::var("ORKA_DETAILS_TTL_SECS")
+                .ok()
+                .and_then(|s| s.parse::<u64>().ok())
+                .unwrap_or(60),
+            details_cache_cap: std::env::var("ORKA_DETAILS_CACHE_CAP")
+                .ok()
+                .and_then(|s| s.parse::<usize>().ok())
+                .unwrap_or(128),
+            idle_repaint_fast_ms: std::env::var("ORKA_IDLE_FAST_MS")
+                .ok()
+                .and_then(|s| s.parse::<u64>().ok())
+                .unwrap_or(8),
+            idle_repaint_slow_ms: std::env::var("ORKA_IDLE_SLOW_MS")
+                .ok()
+                .and_then(|s| s.parse::<u64>().ok())
+                .unwrap_or(120),
+            idle_fast_window_ms: std::env::var("ORKA_IDLE_FAST_WINDOW_MS")
+                .ok()
+                .and_then(|s| s.parse::<u64>().ok())
+                .unwrap_or(1000),
             last_activity: None,
             detached: Vec::new(),
             rendering_window_id: None,
             logs_owner: None,
             exec_owner: None,
             svc_logs_owner: None,
-            #[cfg(feature = "dock")]
             dock_close_pending: Vec::new(),
         };
         // Start prewarm watchers for curated built-ins immediately (without waiting for discovery)
@@ -495,19 +546,34 @@ impl OrkaGuiApp {
             this.watch.prewarm_started = true;
             let api_pw = this.api.clone();
             let keys = std::env::var("ORKA_PREWARM_KINDS").unwrap_or_else(|_| "v1/Pod,apps/v1/Deployment,v1/Service,v1/Namespace,v1/Node,v1/ConfigMap,v1/Secret".into());
-            for key in keys.split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()) {
+            for key in keys
+                .split(',')
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+            {
                 let api_clone = api_pw.clone();
                 tokio::spawn(async move {
                     let gvk = parse_gvk_key_to_kind(&key);
-                    let sel = Selector { gvk, namespace: None };
+                    let sel = Selector {
+                        gvk,
+                        namespace: None,
+                    };
                     let t0 = Instant::now();
                     match watch_hub_subscribe(api_clone, sel).await {
                         Ok(mut rx) => {
                             info!(gvk = %key, took_ms = %t0.elapsed().as_millis(), "prewarm: stream opened");
-                            let _ = tokio::time::timeout(std::time::Duration::from_millis(800), async { let _ = rx.recv().await; }).await;
+                            let _ = tokio::time::timeout(
+                                std::time::Duration::from_millis(800),
+                                async {
+                                    let _ = rx.recv().await;
+                                },
+                            )
+                            .await;
                             info!(gvk = %key, total_ms = %t0.elapsed().as_millis(), "prewarm: done");
                         }
-                        Err(e) => { info!(gvk = %key, error = %e, "prewarm: failed"); }
+                        Err(e) => {
+                            info!(gvk = %key, error = %e, "prewarm: failed");
+                        }
                     }
                 });
             }
@@ -517,14 +583,20 @@ impl OrkaGuiApp {
 
     pub(crate) fn on_context_selected(&mut self, ctx_name: String) {
         // Only act if it actually changed
-        if self.current_context.as_deref() == Some(ctx_name.as_str()) { return; }
+        if self.current_context.as_deref() == Some(ctx_name.as_str()) {
+            return;
+        }
         self.log = format!("switching context: {}", ctx_name);
         self.current_context = Some(ctx_name.clone());
         // Stop any active watch task
-        if let Some(stop) = self.watch.stop.take() { let _ = stop.send(()); }
+        if let Some(stop) = self.watch.stop.take() {
+            let _ = stop.send(());
+        }
         self.watch.task = None;
         // Stop namespaces watcher if running
-        if let Some(h) = self.watch.ns_task.take() { let _ = h.abort(); }
+        if let Some(h) = self.watch.ns_task.take() {
+            let _ = h.abort();
+        }
         // Reset watch hub and cached results
         crate::watch::watch_hub_reset();
         self.results.rows.clear();
@@ -538,7 +610,9 @@ impl OrkaGuiApp {
         self.selection.namespace.clear();
         // Kick kubehub context switch
         let name = ctx_name.clone();
-        tokio::spawn(async move { let _ = orka_kubehub::set_context(Some(name.as_str())).await; });
+        tokio::spawn(async move {
+            let _ = orka_kubehub::set_context(Some(name.as_str())).await;
+        });
         // Restart discovery
         let (tx, rx) = std::sync::mpsc::channel::<Result<Vec<ResourceKind>, String>>();
         let api_clone = self.api.clone();
@@ -546,8 +620,12 @@ impl OrkaGuiApp {
             let t0 = Instant::now();
             let res = api_clone.discover().await.map_err(|e| e.to_string());
             match &res {
-                Ok(v) => tracing::info!(took_ms = %t0.elapsed().as_millis(), kinds = v.len(), "discovery completed (after ctx switch)"),
-                Err(e) => tracing::info!(took_ms = %t0.elapsed().as_millis(), error = %e, "discovery failed (after ctx switch)"),
+                Ok(v) => {
+                    tracing::info!(took_ms = %t0.elapsed().as_millis(), kinds = v.len(), "discovery completed (after ctx switch)")
+                }
+                Err(e) => {
+                    tracing::info!(took_ms = %t0.elapsed().as_millis(), error = %e, "discovery failed (after ctx switch)")
+                }
             }
             let _ = tx.send(res);
         });
@@ -559,30 +637,67 @@ impl OrkaGuiApp {
         let mut s = String::with_capacity(64);
         s.push_str(&it.name);
         s.push(' ');
-        if let Some(ns) = it.namespace.as_deref() { s.push_str(ns); s.push(' '); }
-        for (_k, v) in &it.projected { s.push_str(v); s.push(' '); }
+        if let Some(ns) = it.namespace.as_deref() {
+            s.push_str(ns);
+            s.push(' ');
+        }
+        for (_k, v) in &it.projected {
+            s.push_str(v);
+            s.push(' ');
+        }
         s.to_lowercase()
     }
 
     fn apply_sort_if_needed(&mut self) {
-        let Some(col_idx) = self.results.sort_col else { return; };
-        if !self.results.sort_dirty || self.results.active_cols.is_empty() || self.results.rows.len() <= 1 {
+        let Some(col_idx) = self.results.sort_col else {
+            return;
+        };
+        if !self.results.sort_dirty
+            || self.results.active_cols.is_empty()
+            || self.results.rows.len() <= 1
+        {
             return;
         }
-        let Some(spec) = self.results.active_cols.get(col_idx).cloned() else { self.results.sort_dirty = false; return; };
+        let Some(spec) = self.results.active_cols.get(col_idx).cloned() else {
+            self.results.sort_dirty = false;
+            return;
+        };
         let asc = self.results.sort_asc;
         match spec.kind {
             ColumnKind::Age => {
-                if asc { self.results.rows.sort_by(|a, b| a.creation_ts.cmp(&b.creation_ts)); }
-                else { self.results.rows.sort_by(|a, b| b.creation_ts.cmp(&a.creation_ts)); }
+                if asc {
+                    self.results
+                        .rows
+                        .sort_by(|a, b| a.creation_ts.cmp(&b.creation_ts));
+                } else {
+                    self.results
+                        .rows
+                        .sort_by(|a, b| b.creation_ts.cmp(&a.creation_ts));
+                }
             }
             ColumnKind::Name => {
-                if asc { self.results.rows.sort_by(|a, b| a.name.cmp(&b.name)); }
-                else { self.results.rows.sort_by(|a, b| b.name.cmp(&a.name)); }
+                if asc {
+                    self.results.rows.sort_by(|a, b| a.name.cmp(&b.name));
+                } else {
+                    self.results.rows.sort_by(|a, b| b.name.cmp(&a.name));
+                }
             }
             ColumnKind::Namespace => {
-                if asc { self.results.rows.sort_by(|a, b| a.namespace.as_deref().unwrap_or("").cmp(b.namespace.as_deref().unwrap_or(""))); }
-                else { self.results.rows.sort_by(|a, b| b.namespace.as_deref().unwrap_or("").cmp(a.namespace.as_deref().unwrap_or(""))); }
+                if asc {
+                    self.results.rows.sort_by(|a, b| {
+                        a.namespace
+                            .as_deref()
+                            .unwrap_or("")
+                            .cmp(b.namespace.as_deref().unwrap_or(""))
+                    });
+                } else {
+                    self.results.rows.sort_by(|a, b| {
+                        b.namespace
+                            .as_deref()
+                            .unwrap_or("")
+                            .cmp(a.namespace.as_deref().unwrap_or(""))
+                    });
+                }
             }
             ColumnKind::Projected(id) => {
                 let key_for = |o: &LiteObj| -> String {
@@ -594,7 +709,9 @@ impl OrkaGuiApp {
                 };
                 // Use sort_by_key to compute keys once per element
                 self.results.rows.sort_by_key(|o| key_for(o));
-                if !asc { self.results.rows.reverse(); }
+                if !asc {
+                    self.results.rows.reverse();
+                }
             }
         }
         // rebuild index map after reordering
@@ -625,7 +742,12 @@ impl OrkaGuiApp {
         out
     }
 
-    pub(crate) fn display_cell_string(&mut self, it: &LiteObj, col_idx: usize, spec: &ColumnSpec) -> String {
+    pub(crate) fn display_cell_string(
+        &mut self,
+        it: &LiteObj,
+        col_idx: usize,
+        spec: &ColumnSpec,
+    ) -> String {
         match spec.kind {
             ColumnKind::Age => crate::util::render_age(it.creation_ts),
             _ => {
@@ -637,7 +759,8 @@ impl OrkaGuiApp {
                     let row = self.build_display_row(it);
                     self.results.display_cache.insert(it.uid, row);
                 }
-                self.results.display_cache
+                self.results
+                    .display_cache
                     .get(&it.uid)
                     .and_then(|v| v.get(col_idx))
                     .cloned()
@@ -645,7 +768,6 @@ impl OrkaGuiApp {
             }
         }
     }
-
 }
 
 impl eframe::App for OrkaGuiApp {
@@ -658,753 +780,25 @@ impl eframe::App for OrkaGuiApp {
                 (false, Some(t)) => t.elapsed().as_millis() as u64 >= self.stats.refresh_closed_ms,
                 (false, None) => true,
             };
-            if due && !self.stats.loading { self.start_stats_task(); }
+            if due && !self.stats.loading {
+                self.start_stats_task();
+            }
         }
         // Poll discovery once per frame; populate kinds when ready
-        if let Some(rx) = &self.discovery.rx {
-            match rx.try_recv() {
-                Ok(Ok(mut v)) => {
-                    info!(kinds = v.len(), "ui: discovery ready");
-                    v.sort_by(|a, b| {
-                        let ga = if a.group.is_empty() {
-                            a.version.clone()
-                        } else {
-                            format!("{}/{}", a.group, a.version)
-                        };
-                        let gb = if b.group.is_empty() {
-                            b.version.clone()
-                        } else {
-                            format!("{}/{}", b.group, b.version)
-                        };
-                        (ga, a.kind.clone()).cmp(&(gb, b.kind.clone()))
-                    });
-                    self.discovery.kinds = v;
-                    self.discovery.rx = None;
-                    // Prewarm watchers for common kinds to reduce first-click latency
-                    if !self.watch.prewarm_started {
-                        self.watch.prewarm_started = true;
-                        let api = self.api.clone();
-                        let keys = std::env::var("ORKA_PREWARM_KINDS").unwrap_or_else(|_| "v1/Pod,apps/v1/Deployment,v1/Service,v1/Namespace,v1/Node,v1/ConfigMap,v1/Secret".into());
-                        for key in keys.split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()) {
-                            let api_clone = api.clone();
-                            tokio::spawn(async move {
-                                let gvk = parse_gvk_key_to_kind(&key);
-                                let sel = Selector { gvk, namespace: None };
-                                let t0 = Instant::now();
-                                match watch_hub_subscribe(api_clone, sel).await {
-                                    Ok(mut rx) => {
-                                        info!(gvk = %key, took_ms = %t0.elapsed().as_millis(), "prewarm: stream opened");
-                                        // Wait for first event or a small timeout, then drop receiver; watcher stays
-                                        let _ = tokio::time::timeout(std::time::Duration::from_millis(800), async { let _ = rx.recv().await; }).await;
-                                        info!(gvk = %key, total_ms = %t0.elapsed().as_millis(), "prewarm: done");
-                                    }
-                                    Err(e) => {
-                                        info!(gvk = %key, error = %e, "prewarm: failed");
-                                    }
-                                }
-                            });
-                        }
-
-                        // Optional: prewarm all built-in kinds by listing first page and priming cache (no watchers)
-                        let prewarm_all = std::env::var("ORKA_PREWARM_ALL_BUILTINS").ok().map(|v| v == "1" || v.eq_ignore_ascii_case("true")).unwrap_or(true);
-                        if prewarm_all {
-                            // Extract built-in kinds from discovery results
-                            let groups_env = std::env::var("ORKA_PREWARM_BUILTIN_GROUPS").unwrap_or_else(|_|
-                                "core,apps,batch,networking.k8s.io,policy,rbac.authorization.k8s.io,autoscaling,coordination.k8s.io,storage.k8s.io,authentication.k8s.io,authorization.k8s.io,admissionregistration.k8s.io,node.k8s.io,certificates.k8s.io,discovery.k8s.io,events.k8s.io,flowcontrol.apiserver.k8s.io,scheduling.k8s.io,apiregistration.k8s.io".into()
-                            );
-                            let allowed: std::collections::HashSet<String> = groups_env.split(',').map(|s| s.trim().to_string()).collect();
-                            let conc: usize = std::env::var("ORKA_PREWARM_CONC").ok().and_then(|s| s.parse().ok()).unwrap_or(4);
-                            let sem = std::sync::Arc::new(Semaphore::new(conc.max(1)));
-                        for k in self.discovery.kinds.iter() {
-                            let group_key = if k.group.is_empty() { "core".to_string() } else { k.group.clone() };
-                            if !allowed.contains(&group_key) { continue; }
-                            let gvk_key = gvk_label(k);
-                                let semc = sem.clone();
-                                tokio::spawn(async move {
-                                    let _permit = semc.acquire().await.ok();
-                                    let t0 = Instant::now();
-                                    match orka_kubehub::list_lite_first_page(&gvk_key, None).await {
-                                        Ok(items) => {
-                                            if !items.is_empty() {
-                                                info!(gvk = %gvk_key, items = items.len(), took_ms = %t0.elapsed().as_millis(), "prewarm_list: first page ok");
-                                                watch_hub_prime(&format!("{}|", gvk_key), items);
-                                            }
-                                        }
-                                        Err(e) => {
-                                            info!(gvk = %gvk_key, error = %e, took_ms = %t0.elapsed().as_millis(), "prewarm_list: failed");
-                                        }
-                                    }
-                                });
-                            }
-                        }
-                    }
-                }
-                Ok(Err(err)) => {
-                    info!(error = %err, "ui: discovery error");
-                    self.log = format!("discover error: {}", err);
-                    self.discovery.rx = None;
-                }
-                Err(mpsc::TryRecvError::Disconnected) => {
-                    self.discovery.rx = None;
-                }
-                Err(mpsc::TryRecvError::Empty) => {}
-            }
-        }
-        // Drain UI updates from background tasks (bounded per frame and time)
-        let mut processed = 0usize;
-        let mut saw_batch = false; // treat snapshot as a batch marker
-        let mut pending_toasts: Vec<(String, ToastKind)> = Vec::new();
-        let mut reattach_requests: Vec<(egui::ViewportId, Uid)> = Vec::new();
-        if let Some(rx) = &self.watch.updates_rx {
-            while processed < 256 {
-                match rx.try_recv() {
-                    Ok(UiUpdate::Snapshot(items)) => {
-                        let count = items.len();
-                        if self.results.rows.is_empty() {
-                            self.results.rows = items;
-                            self.results.index.clear();
-                            for (i, it) in self.results.rows.iter().enumerate() {
-                                self.results.index.insert(it.uid, i);
-                                self.results.filter_cache.insert(it.uid, self.build_filter_haystack(it));
-                                // lazy display cache; can be built on demand
-                            }
-                            info!(items = count, total = self.results.rows.len(), "ui: snapshot applied (initial)");
-                            if !self.watch.ttfr_logged {
-                                if let Some(t0) = self.watch.select_t0.take() {
-                                    let ms = t0.elapsed().as_millis();
-                                    info!(ttfr_ms = %ms, "metric: time_to_first_row_ms");
-                                }
-                                self.watch.ttfr_logged = true;
-                            }
-                        } else {
-                            let pre_total = self.results.rows.len();
-                            // Merge new items we don't yet have; deletions will arrive via watch
-                            for it in items.into_iter() {
-                                if !self.results.index.contains_key(&it.uid) {
-                                    let idx = self.results.rows.len();
-                                    self.results.index.insert(it.uid, idx);
-                                    self.results.filter_cache.insert(it.uid, self.build_filter_haystack(&it));
-                                    // prefill display cache for new rows
-                                    self.results.display_cache.insert(it.uid, self.build_display_row(&it));
-                                    self.results.rows.push(it);
-                                }
-                            }
-                            info!(added = self.results.rows.len() - pre_total, total = self.results.rows.len(), "ui: snapshot merged (incremental)");
-                        }
-                        // Snapshot received -> no longer loading
-                        self.last_error = None;
-                        // Mark sort dirty to refresh order
-                        self.results.sort_dirty = true;
-                        processed += 1;
-                        saw_batch = true;
-                    }
-                    Ok(UiUpdate::Event(LiteEvent::Applied(lo))) => {
-                        let uid = lo.uid;
-                        if let Some(idx) = self.results.index.get(&uid).copied() {
-                            // Guard against stale/out-of-bounds index (can happen if a delete shrunk rows
-                            // between index insert and push in a previous frame).
-                            if idx < self.results.rows.len() {
-                                self.results.filter_cache.insert(lo.uid, self.build_filter_haystack(&lo));
-                                self.results.display_cache.insert(lo.uid, self.build_display_row(&lo));
-                                self.results.rows[idx] = lo;
-                            } else {
-                                // Try to repair without duplicating: if the object already exists as the last row,
-                                // just update it and fix the index mapping to point to the last position.
-                                let exists_as_last = if !self.results.rows.is_empty() {
-                                    let last_idx = self.results.rows.len() - 1;
-                                    self.results
-                                        .rows
-                                        .get(last_idx)
-                                        .map(|r| r.uid == uid)
-                                        .unwrap_or(false)
-                                } else { false };
-                                if exists_as_last {
-                                    let last_idx = self.results.rows.len() - 1;
-                                    // Update last row in-place and refresh caches
-                                    self.results.rows[last_idx] = lo.clone();
-                                    self.results.index.insert(uid, last_idx);
-                                    self.results.filter_cache.insert(uid, self.build_filter_haystack(&lo));
-                                    self.results.display_cache.insert(uid, self.build_display_row(&lo));
-                                    info!(uid = ?uid, stale_idx = idx, last_idx, len = self.results.rows.len(), "ui: repaired stale index on Applied (updated last)");
-                                } else {
-                                    let new_idx = self.results.rows.len();
-                                    self.results.index.insert(uid, new_idx);
-                                    self.results.filter_cache.insert(uid, self.build_filter_haystack(&lo));
-                                    self.results.display_cache.insert(uid, self.build_display_row(&lo));
-                                    self.results.rows.push(lo);
-                                    info!(uid = ?uid, stale_idx = idx, new_idx, len = self.results.rows.len(), "ui: corrected stale index on Applied (pushed)");
-                                }
-                            }
-                        } else {
-                            let idx = self.results.rows.len();
-                            self.results.index.insert(uid, idx);
-                            self.results.filter_cache.insert(uid, self.build_filter_haystack(&lo));
-                            self.results.display_cache.insert(uid, self.build_display_row(&lo));
-                            self.results.rows.push(lo);
-                        }
-                        // Invalidate details cache on object change
-                        let _ = self.details_cache.remove(&uid);
-                        // Don't log every event to avoid spam; tiny heartbeat below
-                        self.results.sort_dirty = true;
-                        processed += 1;
-                    }
-                    Ok(UiUpdate::Event(LiteEvent::Deleted(lo))) => {
-                        if let Some(idx) = self.results.index.remove(&lo.uid) {
-                            let last = self.results.rows.len() - 1;
-                            self.results.rows.swap(idx, last);
-                            let moved = self.results.rows.pop();
-                            if let Some(mv) = moved {
-                                if idx < self.results.rows.len() {
-                                    self.results.index.insert(mv.uid, idx);
-                                }
-                            }
-                            self.results.filter_cache.remove(&lo.uid);
-                            self.results.display_cache.remove(&lo.uid);
-                        }
-                        // Invalidate details cache on delete
-                        let _ = self.details_cache.remove(&lo.uid);
-                        self.results.sort_dirty = true;
-                        processed += 1;
-                    }
-                    Ok(UiUpdate::Error(err)) => {
-                        info!(error = %err, "ui: background error");
-                        if err.starts_with("stats:") { self.stats.loading = false; self.stats.last_error = Some(err.clone()); }
-                        self.last_error = Some(err.clone());
-                        self.log = err;
-                        pending_toasts.push((self.log.clone(), ToastKind::Error));
-                        processed += 1;
-                    }
-                    Ok(UiUpdate::Detail { uid, text, containers, produced_at }) => {
-                        info!(chars = text.len(), "ui: details ready");
-                        self.details.buffer = text.clone();
-                        // Clear secret state on fresh details; SecretReady will repopulate if applicable
-                        self.details.secret_entries.clear();
-                        self.details.secret_revealed.clear();
-                        if let Some(t0) = self.details.selected_at.take() {
-                            let ms = t0.elapsed().as_millis();
-                            info!(ttfd_ms = %ms, "metric: time_to_first_details_ms");
-                        }
-                        let queue_ms = produced_at.elapsed().as_millis();
-                        info!(details_queue_ms = %queue_ms, "ui: details update queue time");
-                        // Cache details (bounded by cap)
-                        if self.details_cache.len() >= self.details_cache_cap { self.details_cache.clear(); }
-                        self.details_cache.insert(uid, (Arc::new(text), containers.clone(), Instant::now()));
-                        // Initialize Edit buffer from details
-                        self.edit.original = self.details.buffer.clone();
-                        self.edit.buffer = self.details.buffer.clone();
-                        self.edit.dirty = false;
-                        self.edit.status.clear();
-                        // Apply containers if present (pod)
-                        if let Some(list) = containers {
-                            self.logs.containers = list.clone();
-                            if let Some(cur) = &self.logs.container {
-                                if !self.logs.containers.iter().any(|c| c == cur) { self.logs.container = self.logs.containers.get(0).cloned(); }
-                            } else { self.logs.container = self.logs.containers.get(0).cloned(); }
-                        }
-                        processed += 1;
-                        // Force immediate flush/repaint for details
-                        saw_batch = true;
-                        ctx.request_repaint();
-                    }
-                    Ok(UiUpdate::SecretReady { uid, entries }) => {
-                        // Only apply if this secret matches the current selection (or cache for later?)
-                        if self.details.selected == Some(uid) {
-                            self.details.secret_entries = entries;
-                            // do not auto-reveal any; user must click
-                            ctx.request_repaint();
-                        }
-                        processed += 1;
-                    }
-                    Ok(UiUpdate::PodContainers(list)) => {
-                        info!(count = list.len(), "ui: pod containers ready");
-                        self.logs.containers = list.clone();
-                        // Default selection heuristic: keep existing if still valid, else first
-                        if let Some(cur) = &self.logs.container {
-                            if !self.logs.containers.iter().any(|c| c == cur) {
-                                self.logs.container = self.logs.containers.get(0).cloned();
-                            }
-                        } else {
-                            self.logs.container = self.logs.containers.get(0).cloned();
-                        }
-                        processed += 1;
-                    }
-                    Ok(UiUpdate::DetailError(err)) => {
-                        info!(error = %err, "ui: details error");
-                        self.details.buffer = format!("error: {}", err);
-                        self.last_error = Some(err);
-                        self.edit.buffer.clear();
-                        self.edit.original.clear();
-                        self.edit.dirty = false;
-                        pending_toasts.push(("details: error".to_string(), ToastKind::Error));
-                        processed += 1;
-                    }
-                    Ok(UiUpdate::Namespaces(list)) => {
-                        info!(namespaces = list.len(), "ui: namespaces updated");
-                        self.namespaces = list;
-                        processed += 1;
-                    }
-                    Ok(UiUpdate::DetachedDetail { id, uid: _uid, text, produced_at: _t0 }) => {
-                        // Update buffer for the matching detached window
-                        if let Some(w) = self.detached.iter_mut().find(|w| w.meta.id == id) {
-                            w.state.buffer = text;
-                            w.state.last_error = None;
-                        }
-                        processed += 1;
-                        // Repaint so detached window updates quickly
-                        ctx.request_repaint();
-                    }
-                    Ok(UiUpdate::DetachedDetailError { id, error }) => {
-                        if let Some(w) = self.detached.iter_mut().find(|w| w.meta.id == id) {
-                            w.state.last_error = Some(error);
-                        }
-                        processed += 1;
-                        ctx.request_repaint();
-                    }
-                    Ok(UiUpdate::ReattachDetached { id, uid }) => {
-                        // Defer reattach actions until after draining rx to avoid borrow conflicts
-                        reattach_requests.push((id, uid));
-                        processed += 1;
-                    }
-                    Ok(UiUpdate::Epoch(e)) => {
-                        self.results.epoch = Some(e);
-                        processed += 1;
-                    }
-                    Ok(UiUpdate::SearchResults { hits, explain, partial }) => {
-                        info!(hits = hits.len(), "ui: search results ready");
-                        self.search.hits.clear();
-                        for (u, s) in hits.into_iter() { self.search.hits.insert(u, s); }
-                        self.search.explain = Some(explain);
-                        self.search.partial = partial;
-                        self.results.sort_dirty = false;
-                        self.log = format!("search: {} hit(s)", self.search.hits.len());
-                        self.search.task = None;
-                        self.search.stop = None;
-                        processed += 1;
-                        ctx.request_repaint();
-                    }
-                    Ok(UiUpdate::SearchError(err)) => {
-                        info!(error = %err, "ui: search error");
-                        self.last_error = Some(err.clone());
-                        self.log = err;
-                        self.search.task = None;
-                        self.search.stop = None;
-                        processed += 1;
-                        ctx.request_repaint();
-                        pending_toasts.push(("search: error".to_string(), ToastKind::Error));
-                    }
-                    Ok(UiUpdate::LogStarted(cancel)) => {
-                        if let Some(owner) = self.logs_owner {
-                            if let Some(w) = self.detached.iter_mut().find(|w| w.meta.id == owner) {
-                                w.state.logs.cancel = Some(cancel);
-                                w.state.logs.running = true;
-                            }
-                        } else {
-                            self.logs.cancel = Some(cancel);
-                            self.logs.running = true;
-                        }
-                        pending_toasts.push(("logs: started".to_string(), ToastKind::Info));
-                        processed += 1;
-                    }
-                    Ok(UiUpdate::LogLine(line)) => {
-                        let target_logs = if let Some(owner) = self.logs_owner { None::<usize>.or_else(|| self.detached.iter().position(|w| w.meta.id == owner)) } else { None };
-                        if let Some(idx) = target_logs {
-                            let logs = &mut self.detached[idx].state.logs;
-                            logs.recv += 1;
-                            counter!("logs_recv_total", 1);
-                            if logs.v2 {
-                                let color = ctx.style().visuals.text_color();
-                                let t0 = Instant::now();
-                            let hl = logs.grep_cache.as_ref().map(|(_, r)| r);
-                            let hl_color = ctx.style().visuals.warn_fg_color;
-                            let job = crate::logs::parser::parse_line_to_job_hl(&line, color, logs.colorize, hl, hl_color);
-                                let ts = crate::logs::parser::parse_timestamp_utc(&line);
-                                let parse_ms = t0.elapsed().as_micros() as f64 / 1000.0;
-                                histogram!("logs_parse_ms", parse_ms);
-                                let parsed = crate::model::ParsedLine { raw: line, job, timestamp: ts };
-                                if logs.ring.len() >= logs.ring_cap { logs.ring.pop_front(); logs.dropped += 1; counter!("logs_dropped_total", 1); }
-                                logs.ring.push_back(parsed);
-                                gauge!("logs_ring_len", logs.ring.len() as f64);
-                            } else {
-                                if logs.backlog.len() >= logs.backlog_cap { logs.backlog.pop_front(); logs.dropped += 1; counter!("logs_dropped_total", 1); }
-                                logs.backlog.push_back(line);
-                                gauge!("logs_ring_len", logs.backlog.len() as f64);
-                            }
-                        } else {
-                            self.logs.recv += 1;
-                        counter!("logs_recv_total", 1);
-                        if self.logs.v2 {
-                            // Append to ring with cap; count drops. Pre-parse to LayoutJob.
-                            let color = ctx.style().visuals.text_color();
-                            let t0 = Instant::now();
-                            let hl = self.logs.grep_cache.as_ref().map(|(_, r)| r);
-                            let hl_color = ctx.style().visuals.warn_fg_color;
-                            let job = crate::logs::parser::parse_line_to_job_hl(&line, color, self.logs.colorize, hl, hl_color);
-                            let ts = crate::logs::parser::parse_timestamp_utc(&line);
-                            let parse_ms = t0.elapsed().as_micros() as f64 / 1000.0;
-                            histogram!("logs_parse_ms", parse_ms);
-                            let parsed = crate::model::ParsedLine { raw: line, job, timestamp: ts };
-                            if self.logs.ring.len() >= self.logs.ring_cap { self.logs.ring.pop_front(); self.logs.dropped += 1; counter!("logs_dropped_total", 1); }
-                            self.logs.ring.push_back(parsed);
-                            gauge!("logs_ring_len", self.logs.ring.len() as f64);
-                        } else {
-                            // Legacy path: simple string backlog
-                            if self.logs.backlog.len() >= self.logs.backlog_cap { self.logs.backlog.pop_front(); self.logs.dropped += 1; counter!("logs_dropped_total", 1); }
-                            self.logs.backlog.push_back(line);
-                            gauge!("logs_ring_len", self.logs.backlog.len() as f64);
-                        }
-                        }
-                        processed += 1;
-                    }
-                    Ok(UiUpdate::LogError(err)) => {
-                        self.last_error = Some(err.clone());
-                        self.log = format!("logs: {}", err);
-                        if let Some(owner) = self.logs_owner {
-                            if let Some(w) = self.detached.iter_mut().find(|w| w.meta.id == owner) {
-                                w.state.logs.running = false;
-                                w.state.logs.task = None;
-                                w.state.logs.cancel = None;
-                            }
-                        } else {
-                            self.logs.running = false;
-                            self.logs.task = None;
-                            self.logs.cancel = None;
-                        }
-                        pending_toasts.push((format!("logs: {}", err), ToastKind::Error));
-                        processed += 1;
-                    }
-                    Ok(UiUpdate::SvcLogStarted) => {
-                        if let Some(owner) = self.svc_logs_owner {
-                            if let Some(w) = self.detached.iter_mut().find(|w| w.meta.id == owner) {
-                                w.state.svc_logs.running = true;
-                            }
-                        } else {
-                            self.svc_logs.running = true;
-                        }
-                        pending_toasts.push(("service logs: started".to_string(), ToastKind::Info));
-                        processed += 1;
-                    }
-                    Ok(UiUpdate::SvcLogLine(line)) => {
-                        counter!("svc_logs_recv_total", 1);
-                        if let Some(owner) = self.svc_logs_owner {
-                            if let Some(w) = self.detached.iter_mut().find(|w| w.meta.id == owner) {
-                                let sl = &mut w.state.svc_logs;
-                                sl.recv += 1;
-                                if sl.v2 {
-                                    let color = ctx.style().visuals.text_color();
-                                    let t0 = Instant::now();
-                            let hl = sl.grep_cache.as_ref().map(|(_, r)| r);
-                            let hl_color = ctx.style().visuals.warn_fg_color;
-                            let job = crate::logs::parser::parse_line_to_job_hl(&line, color, sl.colorize, hl, hl_color);
-                                    let ts = crate::logs::parser::parse_timestamp_utc(&line);
-                                    let parse_ms = t0.elapsed().as_micros() as f64 / 1000.0;
-                                    histogram!("svc_logs_parse_ms", parse_ms);
-                                    let parsed = crate::model::ParsedLine { raw: line, job, timestamp: ts };
-                                    if sl.ring.len() >= sl.ring_cap { sl.ring.pop_front(); sl.dropped += 1; counter!("svc_logs_dropped_total", 1); }
-                                    sl.ring.push_back(parsed);
-                                    gauge!("svc_logs_ring_len", sl.ring.len() as f64);
-                                }
-                            }
-                        } else {
-                            self.svc_logs.recv += 1;
-                            if self.svc_logs.v2 {
-                                let color = ctx.style().visuals.text_color();
-                                let t0 = Instant::now();
-                            let hl = self.svc_logs.grep_cache.as_ref().map(|(_, r)| r);
-                            let hl_color = ctx.style().visuals.warn_fg_color;
-                            let job = crate::logs::parser::parse_line_to_job_hl(&line, color, self.svc_logs.colorize, hl, hl_color);
-                                let ts = crate::logs::parser::parse_timestamp_utc(&line);
-                                let parse_ms = t0.elapsed().as_micros() as f64 / 1000.0;
-                                histogram!("svc_logs_parse_ms", parse_ms);
-                                let parsed = crate::model::ParsedLine { raw: line, job, timestamp: ts };
-                                if self.svc_logs.ring.len() >= self.svc_logs.ring_cap { self.svc_logs.ring.pop_front(); self.svc_logs.dropped += 1; counter!("svc_logs_dropped_total", 1); }
-                                self.svc_logs.ring.push_back(parsed);
-                                gauge!("svc_logs_ring_len", self.svc_logs.ring.len() as f64);
-                            }
-                        }
-                        processed += 1;
-                    }
-                    Ok(UiUpdate::SvcLogError(err)) => {
-                        self.last_error = Some(err.clone());
-                        if let Some(owner) = self.svc_logs_owner {
-                            if let Some(w) = self.detached.iter_mut().find(|w| w.meta.id == owner) {
-                                w.state.svc_logs.running = false;
-                                w.state.svc_logs.task = None;
-                            }
-                        } else {
-                            self.svc_logs.running = false;
-                            self.svc_logs.task = None;
-                        }
-                        pending_toasts.push((format!("service logs: {}", err), ToastKind::Error));
-                        processed += 1;
-                    }
-                    Ok(UiUpdate::SvcLogEnded) => {
-                        if let Some(owner) = self.svc_logs_owner.take() {
-                            if let Some(w) = self.detached.iter_mut().find(|w| w.meta.id == owner) {
-                                w.state.svc_logs.running = false;
-                                w.state.svc_logs.task = None;
-                            }
-                        } else {
-                            self.svc_logs.running = false;
-                            self.svc_logs.task = None;
-                        }
-                        pending_toasts.push(("service logs: ended".to_string(), ToastKind::Info));
-                        processed += 1;
-                    }
-                    Ok(UiUpdate::ExecStarted { cancel, input, resize }) => {
-                        if let Some(owner) = self.exec_owner {
-                            if let Some(w) = self.detached.iter_mut().find(|w| w.meta.id == owner) {
-                                w.state.exec.cancel = Some(cancel);
-                                w.state.exec.input = Some(input);
-                                w.state.exec.resize = resize;
-                                w.state.exec.running = true;
-                            }
-                        } else {
-                            self.exec.cancel = Some(cancel);
-                            self.exec.input = Some(input);
-                            self.exec.resize = resize;
-                            self.exec.running = true;
-                        }
-                        pending_toasts.push(("exec: started".to_string(), ToastKind::Info));
-                        processed += 1;
-                    }
-                    Ok(UiUpdate::ExecData(s)) => {
-                        if let Some(owner) = self.exec_owner {
-                            if let Some(w) = self.detached.iter_mut().find(|w| w.meta.id == owner) {
-                                let exec = &mut w.state.exec;
-                                exec.recv += 1;
-                                if let Some(t) = exec.term.as_mut() { t.feed_bytes(s.as_bytes()); }
-                                if exec.backlog.len() >= exec.backlog_cap { exec.backlog.pop_front(); exec.dropped += 1; }
-                                exec.backlog.push_back(s);
-                            }
-                        } else {
-                            self.exec.recv += 1;
-                            if let Some(t) = self.exec.term.as_mut() { t.feed_bytes(s.as_bytes()); }
-                            if self.exec.backlog.len() >= self.exec.backlog_cap { self.exec.backlog.pop_front(); self.exec.dropped += 1; }
-                            self.exec.backlog.push_back(s);
-                        }
-                        processed += 1;
-                    }
-                    Ok(UiUpdate::ExecError(err)) => {
-                        self.last_error = Some(err.clone());
-                        if let Some(owner) = self.exec_owner {
-                            if let Some(w) = self.detached.iter_mut().find(|w| w.meta.id == owner) {
-                                let exec = &mut w.state.exec;
-                                exec.running = false;
-                                exec.task = None;
-                                exec.cancel = None;
-                                exec.input = None;
-                                exec.resize = None;
-                            }
-                        } else {
-                            self.exec.running = false;
-                            self.exec.task = None;
-                            self.exec.cancel = None;
-                            self.exec.input = None;
-                            self.exec.resize = None;
-                        }
-                        pending_toasts.push((format!("exec: {}", err), ToastKind::Error));
-                        processed += 1;
-                    }
-                    Ok(UiUpdate::ExecEnded) => {
-                        if let Some(owner) = self.exec_owner.take() {
-                            if let Some(w) = self.detached.iter_mut().find(|w| w.meta.id == owner) {
-                                let exec = &mut w.state.exec;
-                                exec.running = false;
-                                exec.task = None;
-                                exec.cancel = None;
-                                exec.input = None;
-                                exec.resize = None;
-                                exec.focused = false;
-                            }
-                        } else {
-                            self.exec.running = false;
-                            self.exec.task = None;
-                            self.exec.cancel = None;
-                            self.exec.input = None;
-                            self.exec.resize = None;
-                            self.exec.focused = false;
-                        }
-                        pending_toasts.push(("exec: ended".to_string(), ToastKind::Info));
-                        processed += 1;
-                    }
-                    Ok(UiUpdate::LogEnded) => {
-                        if let Some(owner) = self.logs_owner.take() {
-                            if let Some(w) = self.detached.iter_mut().find(|w| w.meta.id == owner) {
-                                w.state.logs.running = false;
-                                w.state.logs.task = None;
-                                w.state.logs.cancel = None;
-                            }
-                        } else {
-                            self.logs.running = false;
-                            self.logs.task = None;
-                            self.logs.cancel = None;
-                        }
-                        pending_toasts.push(("logs: ended".to_string(), ToastKind::Info));
-                        processed += 1;
-                    }
-                    Ok(UiUpdate::DescribeReady { uid, text }) => {
-                        // Only update current selection's describe
-                        if self.details.selected == Some(uid) {
-                            self.describe.text = text;
-                            self.describe.error = None;
-                            self.describe.running = false;
-                            self.describe.uid = Some(uid);
-                            processed += 1;
-                            ctx.request_repaint();
-                        }
-                    }
-                    Ok(UiUpdate::DescribeError { uid, error }) => {
-                        if self.details.selected == Some(uid) {
-                            self.describe.error = Some(error);
-                            self.describe.running = false;
-                            self.describe.uid = Some(uid);
-                            processed += 1;
-                            ctx.request_repaint();
-                        }
-                    }
-                    Ok(UiUpdate::GraphReady { uid, text }) => {
-                        if self.details.selected == Some(uid) {
-                            self.graph.text = text;
-                            self.graph.error = None;
-                            self.graph.running = false;
-                            self.graph.uid = Some(uid);
-                            processed += 1;
-                            ctx.request_repaint();
-                        }
-                    }
-                    Ok(UiUpdate::GraphError { uid, error }) => {
-                        if self.details.selected == Some(uid) {
-                            self.graph.error = Some(error);
-                            self.graph.running = false;
-                            self.graph.uid = Some(uid);
-                            processed += 1;
-                            ctx.request_repaint();
-                        }
-                    }
-                    Ok(UiUpdate::EditStatus(s)) => {
-                        self.edit.status = s;
-                        processed += 1;
-                    }
-                    Ok(UiUpdate::EditDryRunDone { summary }) => {
-                        self.edit.running = false;
-                        self.edit.status = format!("dry-run: {}", summary);
-                        pending_toasts.push((format!("dry-run: {}", summary), ToastKind::Info));
-                        processed += 1;
-                    }
-                    Ok(UiUpdate::EditDiffDone { live, last }) => {
-                        self.edit.running = false;
-                        self.edit.status = match last {
-                            Some(s) => format!("diff live: {}  •  vs last-applied: {}", live, s),
-                            None => format!("diff live: {}", live),
-                        };
-                        pending_toasts.push((self.edit.status.clone(), ToastKind::Info));
-                        processed += 1;
-                    }
-                    Ok(UiUpdate::EditApplyDone { message }) => {
-                        self.edit.running = false;
-                        self.edit.status = message;
-                        pending_toasts.push((self.edit.status.clone(), ToastKind::Success));
-                        processed += 1;
-                    }
-                    Ok(UiUpdate::OpsCaps(c)) => {
-                        self.ops.caps = Some(c);
-                        self.ops.caps_task = None;
-                        processed += 1;
-                    }
-                    Ok(UiUpdate::OpsStatus(s)) => {
-                        self.log = s.clone();
-                        pending_toasts.push((s, ToastKind::Success));
-                        processed += 1;
-                    }
-                    Ok(UiUpdate::PfStarted(cancel)) => {
-                        self.ops.pf_cancel = Some(cancel);
-                        self.ops.pf_running = true;
-                        pending_toasts.push(("pf: started".to_string(), ToastKind::Info));
-                        processed += 1;
-                    }
-                    Ok(UiUpdate::PfEvent(ev)) => {
-                        self.log = match ev {
-                            orka_api::PortForwardEvent::Ready(addr) => { pending_toasts.push((format!("pf: ready on {}", addr), ToastKind::Success)); format!("pf: ready on {}", addr) }
-                            orka_api::PortForwardEvent::Connected(peer) => { pending_toasts.push((format!("pf: connected: {}", peer), ToastKind::Info)); format!("pf: connected: {}", peer) }
-                            orka_api::PortForwardEvent::Closed => { pending_toasts.push(("pf: closed".to_string(), ToastKind::Info)); "pf: closed".to_string() }
-                            orka_api::PortForwardEvent::Error(err) => { pending_toasts.push((format!("pf: error: {}", err), ToastKind::Error)); format!("pf: error: {}", err) }
-                        };
-                        processed += 1;
-                    }
-                    Ok(UiUpdate::PfEnded) => {
-                        self.ops.pf_running = false;
-                        self.ops.pf_cancel = None;
-                        pending_toasts.push(("pf: ended".to_string(), ToastKind::Info));
-                        processed += 1;
-                    }
-                    Ok(UiUpdate::StatsReady(s)) => {
-                        self.stats.data = Some(s);
-                        self.stats.loading = false;
-                        self.stats.last_fetched = Some(Instant::now());
-                        processed += 1;
-                    }
-                    Ok(UiUpdate::MetricsReady { index_bytes, index_docs }) => {
-                        self.stats.index_bytes = index_bytes;
-                        self.stats.index_docs = index_docs;
-                        processed += 1;
-                    }
-                    Err(mpsc::TryRecvError::Empty) => break,
-                    Err(mpsc::TryRecvError::Disconnected) => {
-                        self.watch.updates_rx = None;
-                        break;
-                    }
-                }
-            }
-            // Apply any reattach requests now that rx borrow is dropped
-            if !reattach_requests.is_empty() {
-                for (id, uid) in reattach_requests.drain(..) {
-                    #[cfg(feature = "dock")]
-                    {
-                        self.open_details_tab_for(uid);
-                    }
-                    #[cfg(not(feature = "dock"))]
-                    {
-                        self.layout.show_details = true;
-                    }
-                    if let Some(i) = self.results.index.get(&uid).copied() {
-                        if let Some(row) = self.results.rows.get(i).cloned() {
-                            self.select_row(row);
-                        }
-                    } else {
-                        self.toast("reattach: item not in current results", ToastKind::Warn);
-                    }
-                    self.detached.retain(|w| w.meta.id != id);
-                    ctx.request_repaint();
-                }
-            }
-            // Debounce repaint: flush on batch marker, size threshold, or elapsed time
-            if processed > 0 {
-                // Mark activity to keep fast repaint cadence for a short window
-                self.last_activity = Some(Instant::now());
-                self.ui_debounce.pending_count += processed;
-                if self.ui_debounce.pending_since.is_none() { self.ui_debounce.pending_since = Some(Instant::now()); }
-                let elapsed_ms = self.ui_debounce.pending_since.map(|t| t.elapsed().as_millis() as u64).unwrap_or(0);
-                let should_flush = saw_batch || self.ui_debounce.pending_count >= 256 || elapsed_ms >= self.ui_debounce.ms;
-                if should_flush {
-                    let processed_now = self.ui_debounce.pending_count as u64;
-                    info!(processed = processed_now, total = self.results.rows.len(), "ui: flushed updates");
-                    // Metrics: per-flush processed count and debounce window
-                    counter!("ui_updates_processed_per_frame", processed_now);
-                    histogram!("ui_debounce_flush_ms", elapsed_ms as f64);
-                    ctx.request_repaint();
-                    self.ui_debounce.pending_count = 0;
-                    self.ui_debounce.pending_since = None;
-                }
-            }
-        }
-
+        crate::ui::init::process_discovery(self);
+        // Drain UI updates and apply debounce
+        crate::ui::updates::process_updates(self, ctx);
         // Periodic repaint: refresh Age and bound queue latency with adaptive cadence
         if !self.results.rows.is_empty() || self.logs.running {
             let fast = match self.last_activity {
                 Some(t) => (t.elapsed().as_millis() as u64) <= self.idle_fast_window_ms,
                 None => false,
             };
-            let ms = if fast { self.idle_repaint_fast_ms } else { self.idle_repaint_slow_ms };
+            let ms = if fast {
+                self.idle_repaint_fast_ms
+            } else {
+                self.idle_repaint_slow_ms
+            };
             ctx.request_repaint_after(std::time::Duration::from_millis(ms));
         }
 
@@ -1432,86 +826,8 @@ impl eframe::App for OrkaGuiApp {
                 });
         }
 
-        #[cfg(not(feature = "dock"))]
-        if self.layout.show_details {
-            egui::SidePanel::right("details_panel")
-                .resizable(true)
-                .show(ctx, |ui| {
-                    self.ui_details(ui);
-                });
-        }
-
         egui::CentralPanel::default().show(ctx, |ui| {
-            #[cfg(feature = "dock")]
-            {
-                struct Viewer<'a> {
-                    app: &'a mut OrkaGuiApp,
-                }
-                impl dock::TabViewer for Viewer<'_> {
-                    type Tab = Tab;
-                    fn title(&mut self, tab: &mut Self::Tab) -> egui::WidgetText {
-                        match tab {
-                            Tab::Results => "Results".into(),
-                            Tab::Details => "Details".into(),
-                            Tab::DetailsFor(uid) => {
-                                if let Some(i) = self.app.results.index.get(uid).copied() {
-                                    if let Some(row) = self.app.results.rows.get(i) {
-                                        let ns = row.namespace.as_deref().unwrap_or("-");
-                                        format!("Details: {}/{}", ns, row.name).into()
-                                    } else { "Details".into() }
-                                } else { "Details".into() }
-                            }
-                        }
-                    }
-                    fn ui(&mut self, ui: &mut egui::Ui, tab: &mut Self::Tab) {
-                        match tab {
-                            Tab::Results => self.app.ui_results(ui),
-                            Tab::Details => self.app.ui_details(ui),
-                            Tab::DetailsFor(_uid) => {
-                                // Do not force selection per-tab; selection is synced once per frame
-                                // to the currently focused tab after DockArea rendering.
-                                self.app.ui_details(ui);
-                            }
-                        }
-                    }
-                }
-                if let Some(mut ds) = self.dock.take() {
-                    {
-                        let mut viewer = Viewer { app: self };
-                        dock::DockArea::new(&mut ds).show_inside(ui, &mut viewer);
-                    }
-                    // After rendering, apply any queued dock operations (e.g., open/close details tabs)
-                    while let Some(pending) = self.dock_pending.pop() {
-                        self.ensure_details_tab_in(&mut ds, pending);
-                    }
-                    while let Some(close_uid) = self.dock_close_pending.pop() {
-                        if let Some((node, tab_index)) = ds.find_main_surface_tab(&Tab::DetailsFor(close_uid)) {
-                            let surface = dock::SurfaceIndex::main();
-                            let _ = ds.remove_tab((surface, node, tab_index));
-                        }
-                    }
-                    // Sync selection to the currently focused Details tab (if any) to avoid thrash
-                    {
-                        let tree = ds.main_surface_mut();
-                        if let Some((_rect, tab)) = tree.find_active_focused() {
-                            if let Tab::DetailsFor(uid) = *tab {
-                                if self.details.selected != Some(uid) {
-                                    if let Some(i) = self.results.index.get(&uid).copied() {
-                                        if let Some(row) = self.results.rows.get(i).cloned() {
-                                            self.select_row(row);
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    }
-                    self.dock = Some(ds);
-                }
-            }
-            #[cfg(not(feature = "dock"))]
-            {
-                self.ui_results(ui);
-            }
+            crate::ui::dock::show_dock(self, ui);
         });
 
         ui::palette::ui_palette(self, ctx);
@@ -1533,158 +849,13 @@ impl eframe::App for OrkaGuiApp {
         self.ensure_caps_for_selection();
 
         // Render any detached details viewports (OS-managed windows) with full Details UI
-        {
-            // Snapshot metadata to avoid borrow conflicts while drawing with &mut self
-            let windows: Vec<(egui::ViewportId, String, Uid)> = self
-                .detached
-                .iter()
-                .map(|w| (w.meta.id, w.meta.title.clone(), w.meta.uid))
-                .collect();
-            let close_reqs: std::rc::Rc<std::cell::RefCell<Vec<egui::ViewportId>>> = Default::default();
-            for (id, title, uid) in windows.into_iter() {
-                let cr = close_reqs.clone();
-                ctx.show_viewport_immediate(
-                    id,
-                    egui::ViewportBuilder::default()
-                        .with_title(title)
-                        .with_inner_size([980.0, 720.0])
-                        .with_decorations(true),
-                    |ctx, _class| {
-                        // Handle OS close button
-                        if ctx.input(|i| i.viewport().close_requested()) {
-                            // If this window owns active streams, stop them
-                            if self.logs_owner == Some(id) {
-                                if let Some(w) = self.detached.iter_mut().find(|w| w.meta.id == id) {
-                                    if let Some(c) = w.state.logs.cancel.take() { c.cancel(); }
-                                    self.logs_owner = None;
-                                }
-                            }
-                            if self.exec_owner == Some(id) {
-                                if let Some(w) = self.detached.iter_mut().find(|w| w.meta.id == id) {
-                                    if let Some(c) = w.state.exec.cancel.take() { c.cancel(); }
-                                    self.exec_owner = None;
-                                }
-                            }
-                            if self.svc_logs_owner == Some(id) {
-                                if let Some(w) = self.detached.iter_mut().find(|w| w.meta.id == id) {
-                                    if let Some(c) = w.state.svc_logs.cancel.take() { c.cancel(); }
-                                    self.svc_logs_owner = None;
-                                }
-                            }
-                            cr.borrow_mut().push(id);
-                            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
-                            return;
-                        }
-                        egui::CentralPanel::default().show(ctx, |ui| {
-                            // Load per-window state, temporarily swap selection and UI state, then render and save back.
-                            if let Some(idx) = self.detached.iter().position(|w| w.meta.id == id) {
-                                // Snapshot per-window state before mutably using self elsewhere
-                                let (mut win_active_tab, mut win_edit) = {
-                                    let w = &self.detached[idx];
-                                    (w.state.active_tab, w.state.edit_ui.clone())
-                                };
-                                // Focused window controls global selection
-                                let is_focused = ctx.input(|i| i.viewport().focused).unwrap_or(false);
-                                if is_focused && self.details.selected != Some(uid) {
-                                    if let Some(i) = self.results.index.get(&uid).copied() {
-                                        if let Some(row) = self.results.rows.get(i).cloned() {
-                                            self.select_row(row);
-                                        }
-                                    }
-                                }
-                                // Snapshot main pane's edit UI subset
-                                let main_edit = model::EditUi {
-                                    buffer: self.edit.buffer.clone(),
-                                    original: self.edit.original.clone(),
-                                    dirty: self.edit.dirty,
-                                    running: self.edit.running,
-                                    status: self.edit.status.clone(),
-                                };
-                                let prev_selected = self.details.selected;
-                                let prev_active_tab = self.details.active_tab;
-                                // Apply window-specific state
-                                self.details.selected = Some(uid);
-                                self.details.active_tab = win_active_tab;
-                                // Swap in window logs/exec/svc_logs state
-                                let mut win_logs = {
-                                    let w = &mut self.detached[idx];
-                                    std::mem::take(&mut w.state.logs)
-                                };
-                                let mut win_exec = {
-                                    let w = &mut self.detached[idx];
-                                    std::mem::take(&mut w.state.exec)
-                                };
-                                let mut win_svc_logs = {
-                                    let w = &mut self.detached[idx];
-                                    std::mem::take(&mut w.state.svc_logs)
-                                };
-                                let main_logs = std::mem::replace(&mut self.logs, win_logs);
-                                let main_exec = std::mem::replace(&mut self.exec, win_exec);
-                                let main_svc_logs = std::mem::replace(&mut self.svc_logs, win_svc_logs);
-                                self.edit.buffer = win_edit.buffer.clone();
-                                self.edit.original = win_edit.original.clone();
-                                self.edit.dirty = win_edit.dirty;
-                                self.edit.running = win_edit.running;
-                                self.edit.status = win_edit.status.clone();
-
-                                // Render full details UI in this window
-                                let prev_render = self.rendering_window_id;
-                                self.rendering_window_id = Some(id);
-                                self.ui_details(ui);
-                                self.rendering_window_id = prev_render;
-
-                                // Save back window state from current UI
-                                win_active_tab = self.details.active_tab;
-                                win_edit = model::EditUi {
-                                    buffer: self.edit.buffer.clone(),
-                                    original: self.edit.original.clone(),
-                                    dirty: self.edit.dirty,
-                                    running: self.edit.running,
-                                    status: self.edit.status.clone(),
-                                };
-                                // Swap back logs/exec/svc_logs to main and store updated window states
-                                let win_logs_new = std::mem::replace(&mut self.logs, main_logs);
-                                let win_exec_new = std::mem::replace(&mut self.exec, main_exec);
-                                let win_svc_logs_new = std::mem::replace(&mut self.svc_logs, main_svc_logs);
-
-                                // Restore main pane selection/tab and edit UI subset
-                                self.details.active_tab = prev_active_tab;
-                                self.details.selected = prev_selected;
-                                self.edit.buffer = main_edit.buffer;
-                                self.edit.original = main_edit.original;
-                                self.edit.dirty = main_edit.dirty;
-                                self.edit.running = main_edit.running;
-                                self.edit.status = main_edit.status;
-
-                                // Write back into detached window state
-                                if let Some(w) = self.detached.get_mut(idx) {
-                                    w.state.active_tab = win_active_tab;
-                                    w.state.edit_ui = win_edit;
-                                    w.state.logs = win_logs_new;
-                                    w.state.exec = win_exec_new;
-                                    w.state.svc_logs = win_svc_logs_new;
-                                }
-                            } else {
-                                // Fallback: if window metadata not found, draw a simple message
-                                ui.label("(window state missing)");
-                            }
-                        });
-                    },
-                );
-            }
-            // Remove any windows that requested close
-            let to_close = close_reqs.borrow().clone();
-            if !to_close.is_empty() {
-                self.detached.retain(|w| !to_close.iter().any(|id| *id == w.meta.id));
-            }
-        }
+        crate::ui::windows::render_detached(self, ctx);
     }
 }
 
 // render_age in util
-#[cfg(feature = "dock")]
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
-enum Tab {
+pub(crate) enum Tab {
     Results,
     Details,
     DetailsFor(Uid),

@@ -12,6 +12,7 @@ use orka_core::LiteObj;
 use crate::util::gvk_label;
 use super::{OrkaGuiApp, UiUpdate};
 use crate::model::DetailsPaneTab;
+use crate::model::{GraphViewMode, GraphNodeRole};
 
 impl OrkaGuiApp {
     fn ui_edit(&mut self, ui: &mut egui::Ui) {
@@ -333,14 +334,7 @@ impl OrkaGuiApp {
                 let is_detached = self.detached.iter().any(|w| w.meta.id == id);
                 if is_detached {
                     if ui.small_button("Reattach").on_hover_text("Close window and re-open as a tab").clicked() {
-                        #[cfg(feature = "dock")]
-                        {
-                            self.open_details_tab_for(uid);
-                        }
-                        #[cfg(not(feature = "dock"))]
-                        {
-                            self.layout.show_details = true;
-                        }
+                        self.open_details_tab_for(uid);
                         ui.ctx().send_viewport_cmd_to(id, egui::ViewportCommand::Close);
                         self.detached.retain(|w| w.meta.id != id);
                     }
@@ -348,11 +342,8 @@ impl OrkaGuiApp {
                     if ui.small_button("Detach to Window").on_hover_text("Open this Details view in a separate OS window").clicked() {
                         let ctx = ui.ctx();
                         self.open_detached_for(ctx, uid);
-                        #[cfg(feature = "dock")]
-                        {
-                            // Queue closing the corresponding dock tab, if any
-                            self.dock_close_pending.push(uid);
-                        }
+                        // Queue closing the corresponding dock tab, if any
+                        self.dock_close_pending.push(uid);
                     }
                 }
             } else {
@@ -436,15 +427,124 @@ impl OrkaGuiApp {
             }
             if self.graph.running { ui.add(egui::Spinner::new()); }
             if let Some(err) = &self.graph.error { ui.colored_label(ui.visuals().error_fg_color, err); }
+            ui.separator();
+            ui.label("Mode:");
+            ui.selectable_value(&mut self.graph.mode, GraphViewMode::Classic, "Classic");
+            ui.selectable_value(&mut self.graph.mode, GraphViewMode::Atlas, "Atlas");
         });
         ui.add_space(4.0);
-        let mut text = if self.graph.text.is_empty() { String::from("(no graph yet)") } else { self.graph.text.clone() };
-        let te = egui::TextEdit::multiline(&mut text)
-            .font(egui::TextStyle::Monospace)
-            .desired_rows(24)
-            .desired_width(f32::INFINITY)
-            .interactive(false);
-        ui.add(te);
+        match self.graph.mode {
+            GraphViewMode::Classic => {
+                let mut text = if self.graph.text.is_empty() { String::from("(no graph yet)") } else { self.graph.text.clone() };
+                let te = egui::TextEdit::multiline(&mut text)
+                    .font(egui::TextStyle::Monospace)
+                    .desired_rows(24)
+                    .desired_width(f32::INFINITY)
+                    .interactive(false);
+                ui.add(te);
+            }
+            GraphViewMode::Atlas => {
+                self.ui_graph_atlas(ui);
+            }
+        }
+    }
+
+    fn ui_graph_atlas(&mut self, ui: &mut egui::Ui) {
+        // Controls
+        ui.horizontal(|ui| {
+            if ui.small_button("-").on_hover_text("Zoom out").clicked() { self.graph.atlas_zoom = (self.graph.atlas_zoom * 0.9).max(0.25); }
+            if ui.small_button("+").on_hover_text("Zoom in").clicked() { self.graph.atlas_zoom = (self.graph.atlas_zoom * 1.1).min(4.0); }
+            if ui.small_button("Reset").on_hover_text("Reset view").clicked() { self.graph.atlas_zoom = 1.0; self.graph.atlas_pan = egui::vec2(0.0, 0.0); }
+            ui.add(egui::Slider::new(&mut self.graph.atlas_zoom, 0.25..=4.0).text("Zoom"));
+            ui.label("Drag background to pan");
+        });
+        ui.add_space(6.0);
+
+        // Drawing area
+        let desired = egui::vec2(ui.available_width(), ui.available_height().max(260.0));
+        let (rect, response) = ui.allocate_exact_size(desired, egui::Sense::drag());
+        if response.dragged() {
+            let d = response.drag_delta();
+            self.graph.atlas_pan += d;
+        }
+        let painter = ui.painter_at(rect);
+
+        // Background
+        painter.rect_filled(rect, 4.0, ui.visuals().extreme_bg_color);
+
+        let Some(model) = self.graph.model.clone() else {
+            painter.text(rect.center(), egui::Align2::CENTER_CENTER, "(building atlas model…)", egui::TextStyle::Body.resolve(ui.style()), ui.visuals().weak_text_color());
+            return;
+        };
+
+        // Simple layout: root at (0,0), owner chain above, related to the right in a grid
+        use std::collections::HashMap;
+        let mut positions: HashMap<String, egui::Pos2> = HashMap::new();
+        let mut related_ix: usize = 0;
+        for node in &model.nodes {
+            match &node.role {
+                GraphNodeRole::Root => { positions.insert(node.id.clone(), egui::pos2(0.0, 0.0)); }
+                GraphNodeRole::OwnerChain(depth) => {
+                    let d = *depth as f32;
+                    positions.insert(node.id.clone(), egui::pos2(0.0, -d * 120.0));
+                }
+                GraphNodeRole::Related(_typ) => {
+                    let col = (related_ix % 3) as f32;
+                    let row = (related_ix / 3) as f32;
+                    let x = 240.0 + col * 180.0;
+                    let y = -80.0 + row * 120.0;
+                    positions.insert(node.id.clone(), egui::pos2(x, y));
+                    related_ix += 1;
+                }
+            }
+        }
+
+        // Transform logical -> screen
+        let center = rect.center() + self.graph.atlas_pan;
+        let z = self.graph.atlas_zoom;
+        let to_screen = |p: egui::Pos2| egui::pos2(center.x + p.x * z, center.y + p.y * z);
+
+        // Draw edges first
+        for e in &model.edges {
+            if let (Some(a), Some(b)) = (positions.get(&e.from), positions.get(&e.to)) {
+                let pa = to_screen(*a);
+                let pb = to_screen(*b);
+                painter.line_segment([pa, pb], egui::Stroke::new(2.0, ui.visuals().weak_text_color()));
+                if let Some(lbl) = &e.label {
+                    let mid = egui::pos2((pa.x + pb.x) * 0.5, (pa.y + pb.y) * 0.5);
+                    painter.text(mid, egui::Align2::CENTER_CENTER, lbl, egui::TextStyle::Small.resolve(ui.style()), ui.visuals().weak_text_color());
+                }
+            }
+        }
+
+        // Draw nodes
+        for node in &model.nodes {
+            if let Some(lp) = positions.get(&node.id).copied() {
+                let p = to_screen(lp);
+                let radius = 24.0 * z.clamp(0.5, 1.5);
+                let color = match node.kind.as_str() {
+                    "Pod" => egui::Color32::from_rgb(86, 204, 149),
+                    "ServiceAccount" => egui::Color32::from_rgb(86, 156, 214),
+                    "ConfigMap" => egui::Color32::from_rgb(255, 206, 86),
+                    "Secret" => egui::Color32::from_rgb(209, 99, 196),
+                    "Service" => egui::Color32::from_rgb(255, 159, 64),
+                    _ => ui.visuals().hyperlink_color,
+                };
+                painter.circle_filled(p, radius, color.gamma_multiply(0.85));
+                painter.circle_stroke(p, radius, egui::Stroke::new(2.0, ui.visuals().widgets.noninteractive.bg_stroke.color));
+                let id = ui.make_persistent_id((&node.id, "atlas_node"));
+                let hit = egui::Rect::from_center_size(p, egui::vec2(120.0, 36.0));
+                let resp = ui.interact(hit, id, egui::Sense::click());
+                if resp.hovered() {
+                    ui.output_mut(|o| o.cursor_icon = egui::CursorIcon::PointingHand);
+                }
+                if resp.clicked() {
+                    self.toast(format!("atlas: {}", node.label), crate::model::ToastKind::Info);
+                }
+                // Label
+                painter.text(p, egui::Align2::CENTER_CENTER, &node.label, egui::TextStyle::Small.resolve(ui.style()), ui.visuals().strong_text_color());
+            }
+        }
     }
 
     fn ui_exec(&mut self, ui: &mut egui::Ui) {
@@ -701,11 +801,8 @@ impl OrkaGuiApp {
         self.details.buffer.clear();
         self.details.secret_entries.clear();
         self.details.secret_revealed.clear();
-        #[cfg(feature = "dock")]
-        {
-            // Open/focus a dedicated tab for this resource when docking is enabled
-            self.open_details_tab_for(uid);
-        }
+        // Open/focus a dedicated tab for this resource
+        self.open_details_tab_for(uid);
         // Clear pod-specific logs metadata on selection change
         self.logs.containers.clear();
         self.logs.container = None;

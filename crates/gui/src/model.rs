@@ -74,6 +74,8 @@ pub enum UiUpdate {
     // Graph output for Details pane
     GraphReady { uid: Uid, text: String },
     GraphError { uid: Uid, error: String },
+    // Atlas graph model for interactive rendering
+    GraphModelReady { uid: Uid, model: GraphModel },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -118,7 +120,6 @@ pub struct PaletteState {
 #[derive(Default)]
 pub struct LayoutState {
     pub show_nav: bool,
-    pub show_details: bool,
     pub show_log: bool,
 }
 
@@ -376,6 +377,11 @@ pub struct GraphState {
     pub uid: Option<Uid>,
     pub task: Option<JoinHandle<()>>,
     pub stop: Option<tokio::sync::oneshot::Sender<()>>,
+    // Interactive atlas view state
+    pub mode: GraphViewMode,
+    pub model: Option<GraphModel>,
+    pub atlas_zoom: f32,
+    pub atlas_pan: egui::Vec2,
 }
 
 #[derive(Default)]
@@ -428,4 +434,42 @@ pub struct StatsState {
     pub err_pct: f32,
     pub index_bytes: Option<u64>,
     pub index_docs: Option<u64>,
+}
+
+// --------- Atlas/Graph Model ---------
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum GraphViewMode { Classic, Atlas }
+
+impl Default for GraphViewMode { fn default() -> Self { GraphViewMode::Classic } }
+
+#[derive(Clone, Debug, Default)]
+pub struct GraphModel {
+    pub nodes: Vec<GraphNode>,
+    pub edges: Vec<GraphEdge>,
+}
+
+#[derive(Clone, Debug)]
+pub struct GraphNode {
+    pub id: String,
+    pub label: String,
+    // Short type/kind for color/icon mapping
+    pub kind: String,
+    pub role: GraphNodeRole,
+}
+
+#[derive(Clone, Debug)]
+pub enum GraphNodeRole {
+    Root,
+    // Depth 1..=N owner chain (1 is immediate owner)
+    OwnerChain(usize),
+    // Related resource type (e.g., ConfigMap/Secret/ServiceAccount/Pods)
+    Related(String),
+}
+
+#[derive(Clone, Debug)]
+pub struct GraphEdge {
+    pub from: String,
+    pub to: String,
+    pub label: Option<String>,
 }
