@@ -12,6 +12,7 @@ use orka_core::{LiteObj, Uid};
 use tracing::info;
 
 mod details;
+mod atlas;
 mod logs;
 mod model;
 mod nav;
@@ -101,6 +102,8 @@ pub struct OrkaGuiApp {
     exec_owner: Option<egui::ViewportId>,
     svc_logs_owner: Option<egui::ViewportId>,
     dock_close_pending: Vec<Uid>,
+    // Feature switches
+    atlas_enabled: bool,
 }
 
 impl OrkaGuiApp {
@@ -143,6 +146,9 @@ impl OrkaGuiApp {
             }
             let _ = tx.send(res);
         });
+        let atlas_enabled = std::env::var("ORKA_ATLAS")
+            .map(|v| v != "0" && !v.eq_ignore_ascii_case("false"))
+            .unwrap_or(true);
         let mut this = Self {
             api,
             discovery: DiscoveryState {
@@ -213,6 +219,13 @@ impl OrkaGuiApp {
                 model: None,
                 atlas_zoom: 1.0,
                 atlas_pan: egui::vec2(0.0, 0.0),
+                atlas_expanded_ns: Default::default(),
+                atlas_expanded_kinds: Default::default(),
+                atlas_counts: Default::default(),
+                atlas_items: Default::default(),
+                details_expanded_kinds: Default::default(),
+                pending_open: None,
+                details_fit_for: None,
             },
             exec: {
                 let cap = std::env::var("ORKA_EXEC_BACKLOG_CAP")
@@ -540,7 +553,9 @@ impl OrkaGuiApp {
             exec_owner: None,
             svc_logs_owner: None,
             dock_close_pending: Vec::new(),
+            atlas_enabled: true, // set real value below
         };
+        this.atlas_enabled = atlas_enabled;
         // Start prewarm watchers for curated built-ins immediately (without waiting for discovery)
         if !this.watch.prewarm_started {
             this.watch.prewarm_started = true;
@@ -859,6 +874,7 @@ pub(crate) enum Tab {
     Results,
     Details,
     DetailsFor(Uid),
+    Atlas,
 }
 
 impl OrkaGuiApp {}

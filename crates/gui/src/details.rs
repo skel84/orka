@@ -419,18 +419,32 @@ impl OrkaGuiApp {
         // Trigger fetch if first open or selection changed
         if let Some(sel) = self.details.selected {
             let need_fetch = match (self.graph.uid, self.details.selected) { (Some(u0), Some(u1)) => u0 != u1, _ => true };
-            if need_fetch && !self.graph.running { self.start_graph_task(sel); }
+            if need_fetch && !self.graph.running {
+                self.graph.atlas_zoom = 1.0;
+                self.graph.atlas_pan = egui::vec2(0.0, 0.0);
+                self.graph.details_fit_for = None;
+                self.start_graph_task(sel);
+            }
         }
         ui.horizontal(|ui| {
             if ui.small_button("Refresh").clicked() {
-                if let Some(uid) = self.details.selected { self.start_graph_task(uid); }
+                if let Some(uid) = self.details.selected {
+                    self.graph.atlas_zoom = 1.0;
+                    self.graph.atlas_pan = egui::vec2(0.0, 0.0);
+                    self.graph.details_fit_for = None;
+                    self.start_graph_task(uid);
+                }
             }
             if self.graph.running { ui.add(egui::Spinner::new()); }
             if let Some(err) = &self.graph.error { ui.colored_label(ui.visuals().error_fg_color, err); }
             ui.separator();
             ui.label("Mode:");
             ui.selectable_value(&mut self.graph.mode, GraphViewMode::Classic, "Classic");
-            ui.selectable_value(&mut self.graph.mode, GraphViewMode::Atlas, "Atlas");
+            if self.atlas_enabled {
+                ui.selectable_value(&mut self.graph.mode, GraphViewMode::Atlas, "Atlas");
+            } else {
+                self.graph.mode = GraphViewMode::Classic;
+            }
         });
         ui.add_space(4.0);
         match self.graph.mode {
@@ -455,6 +469,7 @@ impl OrkaGuiApp {
             if ui.small_button("-").on_hover_text("Zoom out").clicked() { self.graph.atlas_zoom = (self.graph.atlas_zoom * 0.9).max(0.25); }
             if ui.small_button("+").on_hover_text("Zoom in").clicked() { self.graph.atlas_zoom = (self.graph.atlas_zoom * 1.1).min(4.0); }
             if ui.small_button("Reset").on_hover_text("Reset view").clicked() { self.graph.atlas_zoom = 1.0; self.graph.atlas_pan = egui::vec2(0.0, 0.0); }
+            if ui.small_button("Fit").on_hover_text("Fit to root and neighbors").clicked() { self.graph.details_fit_for = None; }
             ui.add(egui::Slider::new(&mut self.graph.atlas_zoom, 0.25..=4.0).text("Zoom"));
             ui.label("Drag background to pan");
         });
@@ -476,27 +491,44 @@ impl OrkaGuiApp {
             painter.text(rect.center(), egui::Align2::CENTER_CENTER, "(building atlas model…)", egui::TextStyle::Body.resolve(ui.style()), ui.visuals().weak_text_color());
             return;
         };
-
-        // Simple layout: root at (0,0), owner chain above, related to the right in a grid
-        use std::collections::HashMap;
+        // Group related nodes by kind for progressive disclosure
+        use std::collections::{BTreeMap, HashMap};
         let mut positions: HashMap<String, egui::Pos2> = HashMap::new();
-        let mut related_ix: usize = 0;
+        let mut groups: BTreeMap<String, Vec<(String, String)>> = BTreeMap::new(); // kind -> Vec<(id,label)>
+        let mut owner_chain: Vec<(String, usize, String)> = Vec::new(); // (id, depth, label)
+        let mut root_id: Option<(String, String)> = None; // (id,label)
         for node in &model.nodes {
             match &node.role {
-                GraphNodeRole::Root => { positions.insert(node.id.clone(), egui::pos2(0.0, 0.0)); }
-                GraphNodeRole::OwnerChain(depth) => {
-                    let d = *depth as f32;
-                    positions.insert(node.id.clone(), egui::pos2(0.0, -d * 120.0));
-                }
-                GraphNodeRole::Related(_typ) => {
-                    let col = (related_ix % 3) as f32;
-                    let row = (related_ix / 3) as f32;
-                    let x = 240.0 + col * 180.0;
-                    let y = -80.0 + row * 120.0;
-                    positions.insert(node.id.clone(), egui::pos2(x, y));
-                    related_ix += 1;
+                GraphNodeRole::Root => { root_id = Some((node.id.clone(), node.label.clone())); }
+                GraphNodeRole::OwnerChain(depth) => { owner_chain.push((node.id.clone(), *depth, node.label.clone())); }
+                GraphNodeRole::Related(_t) => {
+                    let entry = groups.entry(node.kind.clone()).or_default();
+                    entry.push((node.id.clone(), node.label.clone()));
                 }
             }
+        }
+        owner_chain.sort_by_key(|(_, d, _)| *d);
+
+        if let Some((rid, _)) = &root_id { positions.insert(rid.clone(), egui::pos2(0.0, 0.0)); }
+        for (id, depth, _label) in &owner_chain {
+            let d = *depth as f32; positions.insert(id.clone(), egui::pos2(0.0, -d * 120.0));
+        }
+
+        // Place related group placeholders on a ring around the root.
+        let mut group_pos: BTreeMap<String, egui::Pos2> = BTreeMap::new();
+        let gcount = groups.len().max(1);
+        // Reserve a gap at the top for the owner chain (about 60 degrees)
+        let gap = std::f32::consts::PI / 3.0; // 60°
+        let span = std::f32::consts::TAU - gap;
+        // Start angle to the right of the root
+        let start = gap * 0.5;
+        let step = span / gcount as f32;
+        let radius = 180.0f32; // distance from root
+        for (i, (kind, _items)) in groups.keys().cloned().zip(groups.values()).enumerate() {
+            let a = start + i as f32 * step;
+            let x = radius * a.cos();
+            let y = radius * a.sin();
+            group_pos.insert(kind, egui::pos2(x, y));
         }
 
         // Transform logical -> screen
@@ -504,45 +536,128 @@ impl OrkaGuiApp {
         let z = self.graph.atlas_zoom;
         let to_screen = |p: egui::Pos2| egui::pos2(center.x + p.x * z, center.y + p.y * z);
 
-        // Draw edges first
-        for e in &model.edges {
-            if let (Some(a), Some(b)) = (positions.get(&e.from), positions.get(&e.to)) {
-                let pa = to_screen(*a);
-                let pb = to_screen(*b);
-                painter.line_segment([pa, pb], egui::Stroke::new(2.0, ui.visuals().weak_text_color()));
-                if let Some(lbl) = &e.label {
-                    let mid = egui::pos2((pa.x + pb.x) * 0.5, (pa.y + pb.y) * 0.5);
-                    painter.text(mid, egui::Align2::CENTER_CENTER, lbl, egui::TextStyle::Small.resolve(ui.style()), ui.visuals().weak_text_color());
+        // One-shot auto-fit to keep root + immediate neighbors visible
+        if let Some(uid) = self.graph.uid {
+            if self.graph.details_fit_for != Some(uid) {
+                // compute world bounds across root, owner chain, and group placeholders
+                let mut min_x = 0.0f32; let mut max_x = 0.0f32; let mut min_y = 0.0f32; let mut max_y = 0.0f32;
+                let mut first = true;
+                let mut consider = Vec::new();
+                if let Some((rid, _)) = &root_id { if let Some(p) = positions.get(rid) { consider.push(*p); } }
+                for (_id, _d, _l) in &owner_chain { if let Some(p) = positions.get(_id.as_str()) { consider.push(*p); } }
+                for (_k, pos) in &group_pos { consider.push(*pos); }
+                for p in consider { if first { min_x = p.x; max_x = p.x; min_y = p.y; max_y = p.y; first = false; } else { min_x = min_x.min(p.x); max_x = max_x.max(p.x); min_y = min_y.min(p.y); max_y = max_y.max(p.y); } }
+                if !first {
+                    let pad = 80.0;
+                    let world_w = (max_x - min_x) + pad * 2.0;
+                    let world_h = (max_y - min_y) + pad * 2.0;
+                    let screen_w = rect.width().max(1.0);
+                    let screen_h = rect.height().max(1.0);
+                    let mut zz = (screen_w / world_w).min(screen_h / world_h);
+                    zz = zz.clamp(0.4, 2.0);
+                    let cx = (min_x + max_x) * 0.5;
+                    let cy = (min_y + max_y) * 0.5;
+                    self.graph.atlas_zoom = zz;
+                    self.graph.atlas_pan = egui::vec2(-cx * zz, -cy * zz);
+                    self.graph.details_fit_for = Some(uid);
                 }
             }
         }
 
-        // Draw nodes
-        for node in &model.nodes {
-            if let Some(lp) = positions.get(&node.id).copied() {
+        // Draw root + owner chain nodes and edges between them
+        for (i, (id, _depth, label)) in owner_chain.iter().enumerate() {
+            let a = if i == 0 { &root_id.as_ref().unwrap().0 } else { &owner_chain[i-1].0 };
+            if let (Some(pa), Some(pb)) = (positions.get(a), positions.get(id)) {
+                painter.line_segment([to_screen(*pa), to_screen(*pb)], egui::Stroke::new(2.0, ui.visuals().weak_text_color()));
+            }
+            if let Some(lp) = positions.get(id).copied() {
                 let p = to_screen(lp);
-                let radius = 24.0 * z.clamp(0.5, 1.5);
-                let color = match node.kind.as_str() {
-                    "Pod" => egui::Color32::from_rgb(86, 204, 149),
-                    "ServiceAccount" => egui::Color32::from_rgb(86, 156, 214),
-                    "ConfigMap" => egui::Color32::from_rgb(255, 206, 86),
-                    "Secret" => egui::Color32::from_rgb(209, 99, 196),
-                    "Service" => egui::Color32::from_rgb(255, 159, 64),
-                    _ => ui.visuals().hyperlink_color,
-                };
-                painter.circle_filled(p, radius, color.gamma_multiply(0.85));
-                painter.circle_stroke(p, radius, egui::Stroke::new(2.0, ui.visuals().widgets.noninteractive.bg_stroke.color));
-                let id = ui.make_persistent_id((&node.id, "atlas_node"));
-                let hit = egui::Rect::from_center_size(p, egui::vec2(120.0, 36.0));
-                let resp = ui.interact(hit, id, egui::Sense::click());
-                if resp.hovered() {
-                    ui.output_mut(|o| o.cursor_icon = egui::CursorIcon::PointingHand);
+                painter.circle_filled(p, 20.0 * z.clamp(0.5,1.5), ui.visuals().widgets.inactive.bg_fill);
+                painter.circle_stroke(p, 20.0 * z.clamp(0.5,1.5), egui::Stroke::new(2.0, ui.visuals().widgets.noninteractive.bg_stroke.color));
+                painter.text(p, egui::Align2::CENTER_CENTER, label, egui::TextStyle::Small.resolve(ui.style()), ui.visuals().text_color());
+            }
+        }
+        if let Some((rid, rlabel)) = &root_id {
+            if let Some(lp) = positions.get(rid).copied() {
+                let p = to_screen(lp);
+                painter.circle_filled(p, 22.0 * z.clamp(0.5,1.5), ui.visuals().widgets.inactive.bg_fill);
+                painter.circle_stroke(p, 22.0 * z.clamp(0.5,1.5), egui::Stroke::new(2.0, ui.visuals().widgets.noninteractive.bg_stroke.color));
+                painter.text(p, egui::Align2::CENTER_CENTER, rlabel, egui::TextStyle::Small.resolve(ui.style()), ui.visuals().text_color());
+            }
+        }
+
+        // Draw related groups and link them to the root for visual continuity
+        for (kind, items) in groups {
+            let base = group_pos.get(&kind).copied().unwrap_or(egui::pos2(180.0, 0.0));
+            let p = to_screen(base);
+            if let Some((rid, _)) = &root_id { if let Some(rp) = positions.get(rid) { painter.line_segment([to_screen(*rp), p], egui::Stroke::new(1.5, ui.visuals().weak_text_color())); } }
+            let color = match kind.as_str() {
+                "Pods" => egui::Color32::from_rgb(86, 204, 149),
+                "ServiceAccount" => egui::Color32::from_rgb(86, 156, 214),
+                "ConfigMap" => egui::Color32::from_rgb(255, 206, 86),
+                "Secret" => egui::Color32::from_rgb(209, 99, 196),
+                "Service" => egui::Color32::from_rgb(255, 159, 64),
+                _ => ui.visuals().hyperlink_color,
+            };
+            painter.circle_filled(p, 18.0 * z.clamp(0.5,1.3), color.gamma_multiply(0.9));
+            painter.circle_stroke(p, 18.0 * z.clamp(0.5,1.3), egui::Stroke::new(2.0, ui.visuals().widgets.noninteractive.bg_stroke.color));
+            let text = format!("{} ({})", kind, items.len());
+            painter.text(p + egui::vec2(0.0, 24.0), egui::Align2::CENTER_TOP, text, egui::TextStyle::Small.resolve(ui.style()), ui.visuals().strong_text_color());
+            // toggle expand on click
+            let id = ui.make_persistent_id(("details_kind", &kind));
+            let hit = egui::Rect::from_center_size(p, egui::vec2(140.0, 40.0));
+            let resp = ui.interact(hit, id, egui::Sense::click());
+            if resp.hovered() { ui.output_mut(|o| o.cursor_icon = egui::CursorIcon::PointingHand); }
+            if resp.clicked() {
+                if self.graph.details_expanded_kinds.contains(&kind) { self.graph.details_expanded_kinds.remove(&kind); } else { self.graph.details_expanded_kinds.insert(kind.clone()); }
+            }
+            if self.graph.details_expanded_kinds.contains(&kind) {
+                let mut shown = 0usize;
+                for (j, (id, label)) in items.iter().enumerate().take(8) {
+                    let p2 = to_screen(egui::pos2(base.x, base.y + 36.0 + j as f32 * 20.0));
+                    let rect = egui::Rect::from_center_size(p2, egui::vec2(180.0, 18.0));
+                    let id_w = ui.make_persistent_id(("details_item", &kind, j));
+                    let resp = ui.interact(rect, id_w, egui::Sense::click());
+                    if resp.hovered() { ui.output_mut(|o| o.cursor_icon = egui::CursorIcon::PointingHand); }
+                    painter.rect_filled(rect, 3.0, ui.visuals().extreme_bg_color.gamma_multiply(0.6));
+                    painter.rect_stroke(rect, 3.0, egui::Stroke::new(1.0, ui.visuals().widgets.noninteractive.bg_stroke.color), egui::StrokeKind::Inside);
+                    painter.text(rect.center(), egui::Align2::CENTER_CENTER, label, egui::TextStyle::Small.resolve(ui.style()), ui.visuals().text_color());
+                    if resp.clicked() {
+                        // Determine target (kind, ns, name) from item id formats used in GraphModel
+                        let mut target: Option<(orka_api::ResourceKind, String, String)> = None;
+                        let ns_cur = self
+                            .details
+                            .selected
+                            .and_then(|u| self.results.index.get(&u).copied())
+                            .and_then(|i| self.results.rows.get(i))
+                            .and_then(|r| r.namespace.clone())
+                            .unwrap_or_default();
+                        if let Some(rest) = id.strip_prefix("cm:") {
+                            target = Some((orka_api::ResourceKind { group: String::new(), version: "v1".into(), kind: "ConfigMap".into(), namespaced: true }, ns_cur.clone(), rest.to_string()));
+                        } else if let Some(rest) = id.strip_prefix("sec:") {
+                            target = Some((orka_api::ResourceKind { group: String::new(), version: "v1".into(), kind: "Secret".into(), namespaced: true }, ns_cur.clone(), rest.to_string()));
+                        } else if let Some(rest) = id.strip_prefix("sa:") {
+                            let parts: Vec<&str> = rest.split(':').collect();
+                            if parts.len() == 3 {
+                                let (ns0, ver, name) = (parts[0], parts[1], parts[2]);
+                                target = Some((orka_api::ResourceKind { group: String::new(), version: ver.into(), kind: "ServiceAccount".into(), namespaced: true }, ns0.to_string(), name.to_string()));
+                            }
+                        }
+                        if let Some((rk, ns, name)) = target {
+                            // Switch Kind/NS and request opening the Details once rows load
+                            self.selection.selected_kind = Some(rk.clone());
+                            self.selection.selected_idx = None;
+                            self.selection.namespace = ns.clone();
+                            self.graph.pending_open = Some((rk, ns, name));
+                        }
+                    }
+                    shown += 1;
                 }
-                if resp.clicked() {
-                    self.toast(format!("atlas: {}", node.label), crate::model::ToastKind::Info);
+                if items.len() > shown {
+                    let more = format!("+{} more", items.len() - shown);
+                    let p3 = to_screen(egui::pos2(base.x, base.y + 36.0 + shown as f32 * 20.0));
+                    painter.text(p3, egui::Align2::CENTER_CENTER, more, egui::TextStyle::Small.resolve(ui.style()), ui.visuals().weak_text_color());
                 }
-                // Label
-                painter.text(p, egui::Align2::CENTER_CENTER, &node.label, egui::TextStyle::Small.resolve(ui.style()), ui.visuals().strong_text_color());
             }
         }
     }

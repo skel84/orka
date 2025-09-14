@@ -21,6 +21,11 @@ pub(crate) fn ui_topbar(app: &mut OrkaGuiApp, ctx: &egui::Context) {
             if ui.small_button("Close Details Tabs").on_hover_text("Close all Details tabs").clicked() {
                 app.close_all_details_tabs();
             }
+            if app.atlas_enabled {
+                if ui.small_button("Open Atlas").on_hover_text("Open the global Atlas view").clicked() {
+                    app.open_atlas_tab();
+                }
+            }
             if !app.detached.is_empty() {
                 let label = format!("Reattach All ({})", app.detached.len());
                 if ui.small_button(label).on_hover_text("Close detached windows and reopen as tabs").clicked() {

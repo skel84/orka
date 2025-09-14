@@ -48,10 +48,12 @@ This plan is guided by a set of non-negotiable principles established by the cor
 *   [x] **Classic/Atlas Toggle (Details > Graph):** Users can switch between the existing list view and the new "Atlas" interactive view in the Details pane.
 *   [x] **Background Graph Model (owner/related):** Build an in-memory graph model for the selected resource (owner chain + direct relationships such as ServiceAccount, ConfigMaps/Secrets, and Pods via Service selectors).
 *   [x] **Minimal Interactive Renderer:** Implement an internal egui-based canvas with pan/zoom, colored nodes, edges, and clickable node feedback.
-*   [ ] **Implement Progressive Disclosure:** The default Atlas view will be a high-level overview (e.g., `Namespaces`). Clicking a node will "unfurl" it to reveal the resources inside, preventing the "hairball problem" on large clusters.
+*   [x] **Implement Progressive Disclosure (MVP):**
+    *   Global: Namespaces grid → expand shows 5 kind badges (Pods/Deployments/Services/ConfigMaps/Secrets) with live counts. No per-item lists in MVP to avoid hairball; fast and stable. Kill‑switch via `ORKA_ATLAS=0`.
+    *   Details: Root + owner chain; related grouped by kind with expand‑on‑click and top‑N items. Items (ConfigMap/Secret/ServiceAccount) are clickable and open Details. One‑shot auto‑fit on open; explicit "Fit" button.
 *   [ ] **Integrate Command Palette:** The Command Palette will become the primary navigation tool for the Atlas. As the user types, matching nodes will be highlighted in real-time. Hitting Enter will pan and zoom the view to focus on the selected resource and its immediate neighbors.
 *   [ ] **Develop the Visual Language:** Design a clear and intuitive visual system of colors, icons, and line styles to represent resource health (e.g., green for `Running`, yellow for `Pending`, red for `Failed`), relationships, and status.
-*   [ ] **Library Evaluation (Optional):** Evaluate `egui_graphs` versus continuing an internal renderer (with a wgpu path) for layout/rendering. Internal path currently used for the baseline.
+*   [x] **Library Evaluation (Optional):** Evaluated `egui_graphs` and removed it. We standardised on the internal painter for predictable layout, zero extra deps, and simpler UX. A GPU path remains optional for later.
 
 #### **Phase 2: Progressive Acceleration (The God-Tier Experience)**
 *Goal: Deliver a fluid, 120Hz experience on modern hardware by leveraging GPU acceleration, with a robust CPU fallback.*
@@ -70,10 +72,20 @@ This plan is guided by a set of non-negotiable principles established by the cor
 
 —
 
-Delivered in this milestone so far:
+Delivered in this milestone so far (MVP):
 
-* Atlas baseline (Details > Graph): toggle, background model builder, minimal interactive renderer.
-* Serves as the foundation for progressive disclosure, palette integration, and GPU acceleration work.
+* Atlas baseline (Details > Graph): toggle, background model builder, pan/zoom renderer.
+* Progressive Disclosure:
+  * Global: Namespaces → Kind badges with counts (no item lists). Fast snapshot fallback; resilient to missing watchers.
+  * Details: Grouped related, expand‑on‑click with top‑N items; clickable items open Details; one‑shot auto‑fit + "Fit" control. Ring layout around the root to keep groups near the main chain.
+* Safety/ops: `ORKA_ATLAS` env to disable Atlas completely if needed.
+
+Cut from MVP (post‑MVP targets):
+
+* Palette highlighting and jump-to in Atlas.
+* Services → Pods item expansion in Details; large lists paging.
+* Visual language pass (status colors, edge routing, icons).
+* Optional GPU/compute and physics layout.
 
 ---
 

@@ -16,6 +16,7 @@ pub(crate) fn process_updates(app: &mut OrkaGuiApp, ctx: &egui::Context) {
     let mut processed = 0usize;
     let mut saw_batch = false; // treat snapshot as a batch marker
     let mut reattach_requests: Vec<(egui::ViewportId, Uid)> = Vec::new();
+    let mut pending_select: Option<orka_core::LiteObj> = None;
     let mut pending_toasts: Vec<(String, ToastKind)> = Vec::new();
     if let Some(rx) = &app.watch.updates_rx {
         while processed < 256 {
@@ -54,6 +55,23 @@ pub(crate) fn process_updates(app: &mut OrkaGuiApp, ctx: &egui::Context) {
                     app.results.sort_dirty = true;
                     processed += 1;
                     saw_batch = true;
+                    // If Atlas requested a pending open by (kind, ns, name), try to select it now
+                    if let Some((rk, ns, name)) = app.graph.pending_open.clone() {
+                        if let Some(cur) = app.current_selected_kind().cloned() {
+                            if cur.kind == rk.kind && cur.group == rk.group && cur.version == rk.version {
+                                if let Some(row) = app
+                                    .results
+                                    .rows
+                                    .iter()
+                                    .find(|r| r.name == name && r.namespace.as_deref() == Some(ns.as_str()))
+                                    .cloned()
+                                {
+                                    pending_select = Some(row);
+                                    app.graph.pending_open = None;
+                                }
+                            }
+                        }
+                    }
                 }
                 Ok(UiUpdate::Event(ev)) => {
                     match ev {
@@ -360,6 +378,11 @@ pub(crate) fn process_updates(app: &mut OrkaGuiApp, ctx: &egui::Context) {
                 app.detached.retain(|w| w.meta.id != id);
                 ctx.request_repaint();
             }
+        }
+        // Apply any pending select requested by Atlas click
+        if let Some(row) = pending_select.take() {
+            app.select_row(row);
+            ctx.request_repaint();
         }
         // Debounce repaint: flush on batch marker, size threshold, or elapsed time
         if processed > 0 {

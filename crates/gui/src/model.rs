@@ -382,6 +382,18 @@ pub struct GraphState {
     pub model: Option<GraphModel>,
     pub atlas_zoom: f32,
     pub atlas_pan: egui::Vec2,
+    // Global Atlas progressive disclosure state
+    pub atlas_expanded_ns: std::collections::HashSet<String>,
+    // key = (namespace, kind)
+    pub atlas_expanded_kinds: std::collections::HashSet<(String, String)>,
+    pub atlas_counts: std::collections::HashMap<(String, String), usize>,
+    pub atlas_items: std::collections::HashMap<(String, String), Vec<String>>,
+    // Details Atlas progressive disclosure per kind (simple global set)
+    pub details_expanded_kinds: std::collections::HashSet<String>,
+    // Pending open (kind, namespace, name) requested from Atlas click
+    pub pending_open: Option<(orka_api::ResourceKind, String, String)>,
+    // One-shot autofit marker for Details Atlas (fit completed for this UID)
+    pub details_fit_for: Option<Uid>,
 }
 
 #[derive(Default)]

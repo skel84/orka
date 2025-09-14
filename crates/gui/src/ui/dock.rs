@@ -15,6 +15,7 @@ pub(crate) fn show_dock(app: &mut OrkaGuiApp, ui: &mut egui::Ui) {
             match tab {
                 Tab::Results => "Results".into(),
                 Tab::Details => "Details".into(),
+                Tab::Atlas => "Atlas".into(),
                 Tab::DetailsFor(uid) => {
                     if let Some(i) = self.app.results.index.get(uid).copied() {
                         if let Some(row) = self.app.results.rows.get(i) {
@@ -29,6 +30,7 @@ pub(crate) fn show_dock(app: &mut OrkaGuiApp, ui: &mut egui::Ui) {
             match tab {
                 Tab::Results => self.app.ui_results(ui),
                 Tab::Details => self.app.ui_details(ui),
+                Tab::Atlas => self.app.ui_atlas_global(ui),
                 Tab::DetailsFor(_uid) => {
                     self.app.ui_details(ui);
                 }
