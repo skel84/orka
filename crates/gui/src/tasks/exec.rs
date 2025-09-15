@@ -67,7 +67,7 @@ impl OrkaGuiApp {
         args.push("--".to_string());
         args.extend(cmd.split_whitespace().map(|s| s.to_string()));
         let chosen = self.exec.external_cmd.trim().to_string();
-        let mut launched = false;
+        let mut launched: bool;
         #[cfg(target_os = "macos")]
         {
             use std::path::Path;

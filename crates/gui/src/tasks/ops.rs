@@ -92,6 +92,7 @@ impl OrkaGuiApp {
             let ops = api_ops(api.as_ref());
             match ops.port_forward(Some(&ns), &pod, local, remote).await {
                 Ok(handle) => {
+                    info!(ns = %ns, pod = %pod, local, remote, "ops: pf handle acquired");
                     if let Some(tx) = &tx_opt { let _ = tx.send(UiUpdate::PfStarted(handle.cancel)); }
                     let mut rx = handle.rx;
                     while let Some(ev) = rx.recv().await { if let Some(tx) = &tx_opt { let _ = tx.send(UiUpdate::PfEvent(ev)); } }
@@ -106,6 +107,26 @@ impl OrkaGuiApp {
     pub(crate) fn stop_port_forward(&mut self) {
         if let Some(cancel) = self.ops.pf_cancel.take() { info!("ops: port-forward stop requested"); cancel.cancel(); }
         self.ops.pf_running = false;
+    }
+
+    pub(crate) fn open_pf_in_browser(&mut self) {
+        let Some(addr) = self.ops.pf_ready_addr.clone() else { self.last_error = Some("port-forward: not ready".into()); return; };
+        let port = self.ops.pf_remote;
+        let name = self
+            .ops
+            .pf_candidates
+            .iter()
+            .find(|c| c.port == port)
+            .and_then(|c| c.name.as_deref())
+            .map(|s| s.to_ascii_lowercase());
+        let is_https = matches!(port, 443 | 8443) || name.as_deref().map(|n| n.contains("https")).unwrap_or(false);
+        let scheme = if is_https { "https" } else { "http" };
+        let url = format!("{}://{}", scheme, addr);
+        if let Err(e) = webbrowser::open(&url) {
+            self.last_error = Some(format!("open browser: {}", e));
+        } else {
+            self.log = format!("opened {}", url);
+        }
     }
 
     pub(crate) fn start_delete_pod_task(&mut self) {

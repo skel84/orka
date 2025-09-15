@@ -25,6 +25,7 @@ impl AnsiTerm {
         let cap = (cols as usize) * (rows as usize);
         Self { cols, rows, cur_x: 0, cur_y: 0, grid: vec![Cell::default(); cap], fg: AnsiColor::Default }
     }
+    #[allow(dead_code)]
     fn resize(&mut self, cols: u16, rows: u16) {
         if cols == self.cols && rows == self.rows { return; }
         self.cols = cols; self.rows = rows;
@@ -56,7 +57,7 @@ impl AnsiTerm {
     fn scroll_up(&mut self, n: u16) {
         let n = n.min(self.rows);
         let cols = self.cols as usize;
-        let rows = self.rows as usize;
+        // let rows = self.rows as usize; // unused
         let count = n as usize * cols;
         if count >= self.grid.len() { for c in &mut self.grid { *c = Cell::default(); } return; }
         self.grid.drain(0..count);
@@ -149,10 +150,14 @@ impl UiTerminal {
         // Paint terminal grid as monospace lines using LayoutJob
         let desired = egui::vec2(cols as f32 * char_w, rows as f32 * row_h);
         let (rect, resp) = ui.allocate_exact_size(desired, egui::Sense::click());
-        let mut child = ui.child_ui(rect, *ui.layout(), None);
+        let mut child = ui.new_child(
+            egui::UiBuilder::new()
+                .max_rect(rect)
+                .layout(*ui.layout()),
+        );
         let text_color = ui.visuals().text_color();
         for row in 0..rows {
-            let y = row as f32 * row_h;
+            // let y = row as f32 * row_h; // unused
             // Build a layout job for this row
             let mut job = egui::text::LayoutJob::default();
             job.wrap.max_width = f32::INFINITY;

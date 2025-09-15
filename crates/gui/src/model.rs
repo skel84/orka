@@ -50,6 +50,8 @@ pub enum UiUpdate {
     ExecEnded,
     // Pod-specific metadata
     PodContainers(Vec<String>),
+    // Pod container ports (for PF UI)
+    PodPorts(Vec<PfPort>),
     // Edit tab updates
     EditStatus(String),
     EditDryRunDone { summary: String },
@@ -213,6 +215,7 @@ pub struct EditState {
     pub running: bool,
     pub status: String,
     pub task: Option<JoinHandle<()>>,
+    #[allow(dead_code)]
     pub stop: Option<tokio::sync::oneshot::Sender<()>>,
 }
 
@@ -300,6 +303,12 @@ pub struct OpsState {
     pub pf_cancel: Option<orka_api::CancelHandle>,
     pub pf_info: Option<PfInfo>,
     pub pf_panel_open: bool,
+    // Discovered candidate ports from the selected Pod
+    pub pf_candidates: Vec<PfPort>,
+    // Last bound local address from PF Ready event (e.g., 127.0.0.1:12345)
+    pub pf_ready_addr: Option<String>,
+    // Selected candidate index (into pf_candidates) if using picker
+    pub pf_selected_idx: Option<usize>,
     pub confirm_delete: Option<(String, String)>, // (ns, pod)
     pub confirm_drain: Option<String>,            // node name
     pub scale_prompt_open: bool,
@@ -307,6 +316,14 @@ pub struct OpsState {
 
 #[derive(Clone, Debug)]
 pub struct PfInfo { pub namespace: String, pub pod: String, pub local: u16, pub remote: u16 }
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PfPort {
+    pub container: Option<String>,
+    pub port: u16,
+    pub name: Option<String>,
+    pub protocol: Option<String>,
+}
 
 #[derive(Default)]
 pub struct SelectionState {
@@ -325,6 +342,7 @@ pub struct UiDebounce {
 // --------- Detached Details ---------
 
 #[derive(Clone)]
+#[allow(dead_code)]
 pub struct DetachedDetailsWindowMeta {
     pub id: egui::ViewportId,
     pub uid: Uid,
@@ -334,6 +352,7 @@ pub struct DetachedDetailsWindowMeta {
     pub name: String,
 }
 
+#[allow(dead_code)]
 pub struct DetachedDetailsWindowState {
     pub buffer: String,
     pub last_error: Option<String>,

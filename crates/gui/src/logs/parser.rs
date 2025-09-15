@@ -7,6 +7,7 @@ use regex::Regex;
 
 // Minimal ANSI SGR parsing for 0 (reset), 30–37 and 90–97 (foreground colors)
 // Returns a LayoutJob with segments colored accordingly.
+#[allow(dead_code)]
 pub fn parse_line_to_job(line: &str, default_color: egui::Color32, colorize: bool) -> egui::text::LayoutJob {
     parse_line_to_job_hl(line, default_color, colorize, None, egui::Color32::YELLOW)
 }

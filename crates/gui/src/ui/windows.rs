@@ -73,9 +73,9 @@ pub(crate) fn render_detached(app: &mut OrkaGuiApp, ctx: &egui::Context) {
                         app.details.selected = Some(uid);
                         app.details.active_tab = win_active_tab;
                         // Swap logs/exec/svc_logs state in
-                        let mut win_logs = { let w = &mut app.detached[idx]; std::mem::take(&mut w.state.logs) };
-                        let mut win_exec = { let w = &mut app.detached[idx]; std::mem::take(&mut w.state.exec) };
-                        let mut win_svc_logs = { let w = &mut app.detached[idx]; std::mem::take(&mut w.state.svc_logs) };
+                        let win_logs = { let w = &mut app.detached[idx]; std::mem::take(&mut w.state.logs) };
+                        let win_exec = { let w = &mut app.detached[idx]; std::mem::take(&mut w.state.exec) };
+                        let win_svc_logs = { let w = &mut app.detached[idx]; std::mem::take(&mut w.state.svc_logs) };
                         let main_logs = std::mem::replace(&mut app.logs, win_logs);
                         let main_exec = std::mem::replace(&mut app.exec, win_exec);
                         let main_svc_logs = std::mem::replace(&mut app.svc_logs, win_svc_logs);

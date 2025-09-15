@@ -13,6 +13,14 @@ fn is_pod_selected(app: &OrkaGuiApp) -> bool {
     }
 }
 
+fn is_httpish(port: u16, name: Option<&str>) -> bool {
+    let lname = name.unwrap_or("").to_ascii_lowercase();
+    match port {
+        80 | 8080 | 8000 | 3000 | 443 | 8443 => true,
+        _ => lname.contains("http") || lname.contains("web"),
+    }
+}
+
 pub(crate) fn ui_actions_bar(app: &mut OrkaGuiApp, ui: &mut egui::Ui) {
     let caps = app.ops.caps.clone();
     let has_caps = caps.is_some();
@@ -60,7 +68,32 @@ pub(crate) fn ui_actions_bar(app: &mut OrkaGuiApp, ui: &mut egui::Ui) {
         let mut remote = app.ops.pf_remote;
         ui.add_enabled(pf_ok, egui::DragValue::new(&mut local).range(1..=65535));
         ui.label("→");
-        ui.add_enabled(pf_ok, egui::DragValue::new(&mut remote).range(1..=65535));
+        // Remote port picker: prefer discovered Pod ports, fallback to numeric input
+        if !app.ops.pf_candidates.is_empty() {
+            // Clamp selection and default to first
+            let mut sel = app.ops.pf_selected_idx.unwrap_or(0).min(app.ops.pf_candidates.len().saturating_sub(1));
+            // Always reflect the selected candidate in remote
+            if let Some(p) = app.ops.pf_candidates.get(sel) { remote = p.port; }
+            egui::ComboBox::from_id_salt("pf_remote_combo")
+                .width(160.0)
+                .selected_text({
+                    let p = &app.ops.pf_candidates[sel];
+                    if let Some(name) = &p.name { format!("{} ({})", p.port, name) } else { format!("{}", p.port) }
+                })
+                .show_ui(ui, |ui| {
+                    for (i, p) in app.ops.pf_candidates.iter().enumerate() {
+                        let mut label = p.port.to_string();
+                        if let Some(name) = &p.name { label.push_str(&format!(" ({})", name)); }
+                        ui.selectable_value(&mut sel, i, label);
+                    }
+                });
+            if sel != app.ops.pf_selected_idx.unwrap_or(usize::MAX) {
+                app.ops.pf_selected_idx = Some(sel);
+                if let Some(p) = app.ops.pf_candidates.get(sel) { remote = p.port; if app.ops.pf_local == 0 { local = p.port; } }
+            }
+        } else {
+            ui.add_enabled(pf_ok, egui::DragValue::new(&mut remote).range(1..=65535));
+        }
         if local != app.ops.pf_local { app.ops.pf_local = local; }
         if remote != app.ops.pf_remote { app.ops.pf_remote = remote; }
         if !app.ops.pf_running {
@@ -72,6 +105,22 @@ pub(crate) fn ui_actions_bar(app: &mut OrkaGuiApp, ui: &mut egui::Ui) {
         } else {
             let stop_pf = ui.button("Stop");
             if stop_pf.clicked() { info!("ui: pf stop click"); app.stop_port_forward(); }
+            // When running and Ready was reported, show "Open in Browser" for HTTP(S) ports
+            let show_open = app.ops.pf_ready_addr.is_some() && {
+                let port = app.ops.pf_remote;
+                let name = app
+                    .ops
+                    .pf_candidates
+                    .iter()
+                    .find(|c| c.port == port)
+                    .and_then(|c| c.name.clone());
+                is_httpish(port, name.as_deref())
+            };
+            if show_open {
+                if ui.button("Open in Browser").clicked() {
+                    app.open_pf_in_browser();
+                }
+            }
         }
 
         ui.separator();

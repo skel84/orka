@@ -37,6 +37,7 @@ vte = "0.13"
 shell-escape = "0.1"
 rfd = "0.14"
 base64 = "0.22"
+webbrowser = "0.8"
 
 [features]
 virtual_list = ["dep:egui_virtual_list"]

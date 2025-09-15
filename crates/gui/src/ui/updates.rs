@@ -157,6 +157,24 @@ pub(crate) fn process_updates(app: &mut OrkaGuiApp, ctx: &egui::Context) {
                     }
                     processed += 1;
                 }
+                Ok(UiUpdate::PodPorts(list)) => {
+                    // Update PF candidates; auto-select sensible defaults if unset
+                    app.ops.pf_candidates = list.clone();
+                    // Ensure we have a selection index
+                    if app.ops.pf_selected_idx.is_none() {
+                        if let Some((i, _p)) = app.ops.pf_candidates.iter().enumerate().next() {
+                            app.ops.pf_selected_idx = Some(i);
+                        }
+                    }
+                    // Sync pf_remote to the currently selected candidate
+                    if let Some(sel) = app.ops.pf_selected_idx {
+                        if let Some(p) = app.ops.pf_candidates.get(sel) {
+                            app.ops.pf_remote = p.port;
+                            if app.ops.pf_local == 0 { app.ops.pf_local = p.port; }
+                        }
+                    }
+                    processed += 1;
+                }
                 Ok(UiUpdate::DetachedDetail { id, uid: _uid, text, produced_at: _t0 }) => {
                     if let Some(w) = app.detached.iter_mut().find(|w| w.meta.id == id) {
                         w.state.buffer = text;
@@ -184,57 +202,206 @@ pub(crate) fn process_updates(app: &mut OrkaGuiApp, ctx: &egui::Context) {
                     processed += 1;
                 }
                 Ok(UiUpdate::SearchError(s)) => { app.last_error = Some(s); processed += 1; }
-                Ok(UiUpdate::LogStarted(cancel)) => { app.logs.cancel = Some(cancel); app.logs.running = true; processed += 1; ctx.request_repaint(); }
-                Ok(UiUpdate::LogLine(line)) => {
-                    app.logs.recv += 1;
-                    if app.logs.v2 {
-                        let color = ctx.style().visuals.text_color();
-                        let t0 = std::time::Instant::now();
-                        let hl = app.logs.grep_cache.as_ref().map(|(_, r)| r);
-                        let hl_color = ctx.style().visuals.warn_fg_color;
-                        let job = crate::logs::parser::parse_line_to_job_hl(&line, color, app.logs.colorize, hl, hl_color);
-                        let ts = crate::logs::parser::parse_timestamp_utc(&line);
-                        let _parse_ms = t0.elapsed().as_micros();
-                        let parsed = crate::model::ParsedLine { raw: line, job, timestamp: ts };
-                        if app.logs.ring.len() >= app.logs.ring_cap { app.logs.ring.pop_front(); app.logs.dropped += 1; }
-                        app.logs.ring.push_back(parsed);
+                Ok(UiUpdate::LogStarted(cancel)) => {
+                    if let Some(owner) = app.logs_owner {
+                        if let Some(w) = app.detached.iter_mut().find(|w| w.meta.id == owner) {
+                            w.state.logs.cancel = Some(cancel);
+                            w.state.logs.running = true;
+                        } else {
+                            // Fallback if window disappeared
+                            app.logs.cancel = Some(cancel);
+                            app.logs.running = true;
+                        }
                     } else {
-                        if app.logs.backlog.len() >= app.logs.backlog_cap { app.logs.backlog.pop_front(); app.logs.dropped += 1; }
-                        app.logs.backlog.push_back(line);
+                        app.logs.cancel = Some(cancel);
+                        app.logs.running = true;
+                    }
+                    processed += 1;
+                    ctx.request_repaint();
+                }
+                Ok(UiUpdate::LogLine(line)) => {
+                    // Route to owner window state if logs are owned by a detached window
+                    if let Some(owner) = app.logs_owner {
+                        if let Some(w) = app.detached.iter_mut().find(|w| w.meta.id == owner) {
+                            let st = &mut w.state.logs;
+                            st.recv += 1;
+                            if st.v2 {
+                                let color = ctx.style().visuals.text_color();
+                                let t0 = std::time::Instant::now();
+                                let hl = st.grep_cache.as_ref().map(|(_, r)| r);
+                                let hl_color = ctx.style().visuals.warn_fg_color;
+                                let job = crate::logs::parser::parse_line_to_job_hl(&line, color, st.colorize, hl, hl_color);
+                                let ts = crate::logs::parser::parse_timestamp_utc(&line);
+                                let _parse_ms = t0.elapsed().as_micros();
+                                let parsed = crate::model::ParsedLine { raw: line, job, timestamp: ts };
+                                if st.ring.len() >= st.ring_cap { st.ring.pop_front(); st.dropped += 1; }
+                                st.ring.push_back(parsed);
+                            } else {
+                                if st.backlog.len() >= st.backlog_cap { st.backlog.pop_front(); st.dropped += 1; }
+                                st.backlog.push_back(line);
+                            }
+                        } else {
+                            // Owner disappeared; fallback to main state
+                            app.logs.recv += 1;
+                            if app.logs.v2 {
+                                let color = ctx.style().visuals.text_color();
+                                let t0 = std::time::Instant::now();
+                                let hl = app.logs.grep_cache.as_ref().map(|(_, r)| r);
+                                let hl_color = ctx.style().visuals.warn_fg_color;
+                                let job = crate::logs::parser::parse_line_to_job_hl(&line, color, app.logs.colorize, hl, hl_color);
+                                let ts = crate::logs::parser::parse_timestamp_utc(&line);
+                                let _parse_ms = t0.elapsed().as_micros();
+                                let parsed = crate::model::ParsedLine { raw: line, job, timestamp: ts };
+                                if app.logs.ring.len() >= app.logs.ring_cap { app.logs.ring.pop_front(); app.logs.dropped += 1; }
+                                app.logs.ring.push_back(parsed);
+                            } else {
+                                if app.logs.backlog.len() >= app.logs.backlog_cap { app.logs.backlog.pop_front(); app.logs.dropped += 1; }
+                                app.logs.backlog.push_back(line);
+                            }
+                        }
+                    } else {
+                        // Main pane owns logs
+                        app.logs.recv += 1;
+                        if app.logs.v2 {
+                            let color = ctx.style().visuals.text_color();
+                            let t0 = std::time::Instant::now();
+                            let hl = app.logs.grep_cache.as_ref().map(|(_, r)| r);
+                            let hl_color = ctx.style().visuals.warn_fg_color;
+                            let job = crate::logs::parser::parse_line_to_job_hl(&line, color, app.logs.colorize, hl, hl_color);
+                            let ts = crate::logs::parser::parse_timestamp_utc(&line);
+                            let _parse_ms = t0.elapsed().as_micros();
+                            let parsed = crate::model::ParsedLine { raw: line, job, timestamp: ts };
+                            if app.logs.ring.len() >= app.logs.ring_cap { app.logs.ring.pop_front(); app.logs.dropped += 1; }
+                            app.logs.ring.push_back(parsed);
+                        } else {
+                            if app.logs.backlog.len() >= app.logs.backlog_cap { app.logs.backlog.pop_front(); app.logs.dropped += 1; }
+                            app.logs.backlog.push_back(line);
+                        }
                     }
                     processed += 1;
                     ctx.request_repaint();
                 }
                 Ok(UiUpdate::LogError(s)) => { app.last_error = Some(s); processed += 1; }
-                Ok(UiUpdate::SvcLogStarted) => { app.svc_logs.running = true; processed += 1; ctx.request_repaint(); }
+                Ok(UiUpdate::SvcLogStarted) => {
+                    if let Some(owner) = app.svc_logs_owner {
+                        if let Some(w) = app.detached.iter_mut().find(|w| w.meta.id == owner) {
+                            w.state.svc_logs.running = true;
+                        } else {
+                            app.svc_logs.running = true;
+                        }
+                    } else {
+                        app.svc_logs.running = true;
+                    }
+                    processed += 1;
+                    ctx.request_repaint();
+                }
                 Ok(UiUpdate::SvcLogLine(line)) => {
-                    app.svc_logs.recv += 1;
-                    let color = ctx.style().visuals.text_color();
-                    let t0 = std::time::Instant::now();
-                    let hl = app.svc_logs.grep_cache.as_ref().map(|(_, r)| r);
-                    let hl_color = ctx.style().visuals.warn_fg_color;
-                    let job = crate::logs::parser::parse_line_to_job_hl(&line, color, app.svc_logs.colorize, hl, hl_color);
-                    let ts = crate::logs::parser::parse_timestamp_utc(&line);
-                    let _parse_ms = t0.elapsed().as_micros();
-                    let parsed = crate::model::ParsedLine { raw: line, job, timestamp: ts };
-                    if app.svc_logs.ring.len() >= app.svc_logs.ring_cap { app.svc_logs.ring.pop_front(); app.svc_logs.dropped += 1; }
-                    app.svc_logs.ring.push_back(parsed);
+                    if let Some(owner) = app.svc_logs_owner {
+                        if let Some(w) = app.detached.iter_mut().find(|w| w.meta.id == owner) {
+                            let st = &mut w.state.svc_logs;
+                            st.recv += 1;
+                            let color = ctx.style().visuals.text_color();
+                            let t0 = std::time::Instant::now();
+                            let hl = st.grep_cache.as_ref().map(|(_, r)| r);
+                            let hl_color = ctx.style().visuals.warn_fg_color;
+                            let job = crate::logs::parser::parse_line_to_job_hl(&line, color, st.colorize, hl, hl_color);
+                            let ts = crate::logs::parser::parse_timestamp_utc(&line);
+                            let _parse_ms = t0.elapsed().as_micros();
+                            let parsed = crate::model::ParsedLine { raw: line, job, timestamp: ts };
+                            if st.ring.len() >= st.ring_cap { st.ring.pop_front(); st.dropped += 1; }
+                            st.ring.push_back(parsed);
+                        } else {
+                            // Fallback to main state if owner missing
+                            app.svc_logs.recv += 1;
+                            let color = ctx.style().visuals.text_color();
+                            let t0 = std::time::Instant::now();
+                            let hl = app.svc_logs.grep_cache.as_ref().map(|(_, r)| r);
+                            let hl_color = ctx.style().visuals.warn_fg_color;
+                            let job = crate::logs::parser::parse_line_to_job_hl(&line, color, app.svc_logs.colorize, hl, hl_color);
+                            let ts = crate::logs::parser::parse_timestamp_utc(&line);
+                            let _parse_ms = t0.elapsed().as_micros();
+                            let parsed = crate::model::ParsedLine { raw: line, job, timestamp: ts };
+                            if app.svc_logs.ring.len() >= app.svc_logs.ring_cap { app.svc_logs.ring.pop_front(); app.svc_logs.dropped += 1; }
+                            app.svc_logs.ring.push_back(parsed);
+                        }
+                    } else {
+                        app.svc_logs.recv += 1;
+                        let color = ctx.style().visuals.text_color();
+                        let t0 = std::time::Instant::now();
+                        let hl = app.svc_logs.grep_cache.as_ref().map(|(_, r)| r);
+                        let hl_color = ctx.style().visuals.warn_fg_color;
+                        let job = crate::logs::parser::parse_line_to_job_hl(&line, color, app.svc_logs.colorize, hl, hl_color);
+                        let ts = crate::logs::parser::parse_timestamp_utc(&line);
+                        let _parse_ms = t0.elapsed().as_micros();
+                        let parsed = crate::model::ParsedLine { raw: line, job, timestamp: ts };
+                        if app.svc_logs.ring.len() >= app.svc_logs.ring_cap { app.svc_logs.ring.pop_front(); app.svc_logs.dropped += 1; }
+                        app.svc_logs.ring.push_back(parsed);
+                    }
                     processed += 1;
                     ctx.request_repaint();
                 }
                 Ok(UiUpdate::SvcLogError(s)) => { app.last_error = Some(s); processed += 1; }
                 Ok(UiUpdate::SvcLogEnded) => { app.svc_logs.running = false; processed += 1; }
-                Ok(UiUpdate::ExecStarted { cancel, input, resize }) => { app.exec.cancel = Some(cancel); app.exec.input = Some(input); app.exec.resize = resize; app.exec.running = true; processed += 1; }
-                Ok(UiUpdate::ExecData(s)) => {
-                    if app.exec.mode_oneshot {
-                        app.exec.recv += 1;
-                        if app.exec.backlog.len() >= app.exec.backlog_cap { app.exec.backlog.pop_front(); app.exec.dropped += 1; }
-                        app.exec.backlog.push_back(s);
+                Ok(UiUpdate::ExecStarted { cancel, input, resize }) => {
+                    if let Some(owner) = app.exec_owner {
+                        if let Some(w) = app.detached.iter_mut().find(|w| w.meta.id == owner) {
+                            let exec = &mut w.state.exec;
+                            exec.cancel = Some(cancel);
+                            exec.input = Some(input);
+                            exec.resize = resize;
+                            exec.running = true;
+                        } else {
+                            app.exec.cancel = Some(cancel);
+                            app.exec.input = Some(input);
+                            app.exec.resize = resize;
+                            app.exec.running = true;
+                        }
                     } else {
-                        app.exec.recv += 1;
-                        if let Some(t) = app.exec.term.as_mut() { t.feed_bytes(s.as_bytes()); }
-                        if app.exec.backlog.len() >= app.exec.backlog_cap { app.exec.backlog.pop_front(); app.exec.dropped += 1; }
-                        app.exec.backlog.push_back(s);
+                        app.exec.cancel = Some(cancel);
+                        app.exec.input = Some(input);
+                        app.exec.resize = resize;
+                        app.exec.running = true;
+                    }
+                    processed += 1;
+                }
+                Ok(UiUpdate::ExecData(s)) => {
+                    if let Some(owner) = app.exec_owner {
+                        if let Some(w) = app.detached.iter_mut().find(|w| w.meta.id == owner) {
+                            let exec = &mut w.state.exec;
+                            if exec.mode_oneshot {
+                                exec.recv += 1;
+                                if exec.backlog.len() >= exec.backlog_cap { exec.backlog.pop_front(); exec.dropped += 1; }
+                                exec.backlog.push_back(s);
+                            } else {
+                                exec.recv += 1;
+                                if let Some(t) = exec.term.as_mut() { t.feed_bytes(s.as_bytes()); }
+                                if exec.backlog.len() >= exec.backlog_cap { exec.backlog.pop_front(); exec.dropped += 1; }
+                                exec.backlog.push_back(s);
+                            }
+                        } else {
+                            // Fallback to main state if owner missing
+                            if app.exec.mode_oneshot {
+                                app.exec.recv += 1;
+                                if app.exec.backlog.len() >= app.exec.backlog_cap { app.exec.backlog.pop_front(); app.exec.dropped += 1; }
+                                app.exec.backlog.push_back(s);
+                            } else {
+                                app.exec.recv += 1;
+                                if let Some(t) = app.exec.term.as_mut() { t.feed_bytes(s.as_bytes()); }
+                                if app.exec.backlog.len() >= app.exec.backlog_cap { app.exec.backlog.pop_front(); app.exec.dropped += 1; }
+                                app.exec.backlog.push_back(s);
+                            }
+                        }
+                    } else {
+                        if app.exec.mode_oneshot {
+                            app.exec.recv += 1;
+                            if app.exec.backlog.len() >= app.exec.backlog_cap { app.exec.backlog.pop_front(); app.exec.dropped += 1; }
+                            app.exec.backlog.push_back(s);
+                        } else {
+                            app.exec.recv += 1;
+                            if let Some(t) = app.exec.term.as_mut() { t.feed_bytes(s.as_bytes()); }
+                            if app.exec.backlog.len() >= app.exec.backlog_cap { app.exec.backlog.pop_front(); app.exec.dropped += 1; }
+                            app.exec.backlog.push_back(s);
+                        }
                     }
                     processed += 1;
                 }
@@ -355,17 +522,18 @@ pub(crate) fn process_updates(app: &mut OrkaGuiApp, ctx: &egui::Context) {
                 Ok(UiUpdate::EditApplyDone { message }) => { app.edit.running = false; app.edit.status = message.clone(); pending_toasts.push((message, ToastKind::Success)); processed += 1; }
                 Ok(UiUpdate::OpsCaps(c)) => { app.ops.caps = Some(c); app.ops.caps_task = None; processed += 1; }
                 Ok(UiUpdate::OpsStatus(s)) => { app.log = s.clone(); pending_toasts.push((s, ToastKind::Success)); processed += 1; }
-                Ok(UiUpdate::PfStarted(cancel)) => { app.ops.pf_cancel = Some(cancel); app.ops.pf_running = true; pending_toasts.push(("pf: started".to_string(), ToastKind::Info)); processed += 1; }
+                Ok(UiUpdate::PfStarted(cancel)) => { tracing::info!("ui: pf started"); app.ops.pf_cancel = Some(cancel); app.ops.pf_running = true; pending_toasts.push(("pf: started".to_string(), ToastKind::Info)); processed += 1; }
                 Ok(UiUpdate::PfEvent(ev)) => {
+                    tracing::info!(event = ?ev, "ui: pf event");
                     app.log = match ev {
-                        PortForwardEvent::Ready(addr) => { pending_toasts.push((format!("pf: ready on {}", addr), ToastKind::Success)); format!("pf: ready on {}", addr) }
+                        PortForwardEvent::Ready(addr) => { app.ops.pf_ready_addr = Some(addr.clone()); pending_toasts.push((format!("pf: ready on {}", addr), ToastKind::Success)); format!("pf: ready on {}", addr) }
                         PortForwardEvent::Connected(peer) => { pending_toasts.push((format!("pf: connected: {}", peer), ToastKind::Info)); format!("pf: connected: {}", peer) }
                         PortForwardEvent::Closed => { pending_toasts.push(("pf: closed".to_string(), ToastKind::Info)); "pf: closed".to_string() }
                         PortForwardEvent::Error(err) => { pending_toasts.push((format!("pf: error: {}", err), ToastKind::Error)); format!("pf: error: {}", err) }
                     };
                     processed += 1;
                 }
-                Ok(UiUpdate::PfEnded) => { app.ops.pf_running = false; app.ops.pf_cancel = None; pending_toasts.push(("pf: ended".to_string(), ToastKind::Info)); processed += 1; }
+                Ok(UiUpdate::PfEnded) => { app.ops.pf_running = false; app.ops.pf_cancel = None; app.ops.pf_ready_addr = None; pending_toasts.push(("pf: ended".to_string(), ToastKind::Info)); processed += 1; }
                 Ok(UiUpdate::StatsReady(s)) => { app.stats.data = Some(s); app.stats.loading = false; app.stats.last_fetched = Some(Instant::now()); processed += 1; }
                 Ok(UiUpdate::MetricsReady { index_bytes, index_docs }) => { app.stats.index_bytes = index_bytes; app.stats.index_docs = index_docs; processed += 1; }
                 Err(mpsc::TryRecvError::Empty) => break,

@@ -26,12 +26,12 @@ use model::GraphState;
 use model::{DescribeState, DetailsPaneTab};
 use model::{
     DetailsState, DiscoveryState, EditState, ExecState, LogsState, OpsState, PrefixTheme,
-    ResultsState, SearchState, SelectionState, ServiceLogsState, StatsState, ToastKind, UiDebounce,
+    ResultsState, SearchState, SelectionState, ServiceLogsState, StatsState, UiDebounce,
     WatchState,
 };
 pub use model::{LayoutState, PaletteItem, PaletteState, SearchExplain, UiUpdate, VirtualMode};
 use util::{gvk_label, parse_gvk_key_to_kind};
-use watch::{watch_hub_prime, watch_hub_subscribe};
+use watch::watch_hub_subscribe;
 
 /// Entry point used by the CLI to launch the GUI.
 pub fn run_native(api: Arc<dyn OrkaApi>) -> eframe::Result<()> {
@@ -87,7 +87,7 @@ pub struct OrkaGuiApp {
     // Details cache (YAML + containers), TTL and cap
     details_cache: HashMap<Uid, (Arc<String>, Option<Vec<String>>, Instant)>,
     details_ttl_secs: u64,
-    details_cache_cap: usize,
+    _details_cache_cap: usize,
     // Adaptive idle repaint cadence
     idle_repaint_fast_ms: u64,
     idle_repaint_slow_ms: u64,
@@ -488,6 +488,9 @@ impl OrkaGuiApp {
                 pf_cancel: None,
                 pf_info: None,
                 pf_panel_open: false,
+                pf_candidates: Vec::new(),
+                pf_ready_addr: None,
+                pf_selected_idx: None,
                 confirm_delete: None,
                 confirm_drain: None,
                 scale_prompt_open: false,
@@ -530,7 +533,7 @@ impl OrkaGuiApp {
                 .ok()
                 .and_then(|s| s.parse::<u64>().ok())
                 .unwrap_or(60),
-            details_cache_cap: std::env::var("ORKA_DETAILS_CACHE_CAP")
+            _details_cache_cap: std::env::var("ORKA_DETAILS_CACHE_CAP")
                 .ok()
                 .and_then(|s| s.parse::<usize>().ok())
                 .unwrap_or(128),
@@ -856,7 +859,6 @@ impl eframe::App for OrkaGuiApp {
         // (No-op if this frame didn't process updates.)
         // draw toasts overlay
         ui::toasts::draw_toasts(self, ctx);
-        ui::toasts::draw_toasts(self, ctx);
 
         // Auto start/refresh watch when selection changes
         self.ensure_watch_for_selection();
@@ -870,6 +872,7 @@ impl eframe::App for OrkaGuiApp {
 
 // render_age in util
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
+#[allow(dead_code)]
 pub(crate) enum Tab {
     Results,
     Details,

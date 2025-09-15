@@ -73,7 +73,7 @@ impl OrkaGuiApp {
                                     Some(s) => s.clone(),
                                     None => entry.b64.clone(),
                                 };
-                                ui.output_mut(|o| o.copied_text = copy_text);
+                                ui.ctx().copy_text(copy_text);
                             }
                         });
                         let revealed = self.details.secret_revealed.contains(&entry.key);
@@ -981,17 +981,32 @@ impl OrkaGuiApp {
                         }
                         // Parse JSON (if possible) both for YAML rendering and for extracting pod containers
                         let p0 = Instant::now();
-                        let (text, containers, secret_entries): (String, Option<Vec<String>>, Option<Vec<crate::model::SecretEntry>>) = match serde_json::from_slice::<serde_json::Value>(&bytes) {
+                        let (text, containers, pod_ports, secret_entries): (String, Option<Vec<String>>, Option<Vec<crate::model::PfPort>>, Option<Vec<crate::model::SecretEntry>>) = match serde_json::from_slice::<serde_json::Value>(&bytes) {
                             Ok(v) => {
                                 let parse_ms = p0.elapsed().as_millis() as f64;
                                 histogram!("details_json_parse_ms", parse_ms);
                                 // Extract pod containers if applicable
                                 let e0 = Instant::now();
                                 let mut names: Vec<String> = Vec::new();
+                                let mut ports: Vec<crate::model::PfPort> = Vec::new();
                                 if v.get("kind").and_then(|k| k.as_str()).unwrap_or("") == "Pod" {
                                     if let Some(spec) = v.get("spec") {
                                         if let Some(conts) = spec.get("containers").and_then(|c| c.as_array()) {
-                                            for c in conts { if let Some(n) = c.get("name").and_then(|n| n.as_str()) { names.push(n.to_string()); } }
+                                            for c in conts {
+                                                let cname = c.get("name").and_then(|n| n.as_str()).map(|s| s.to_string());
+                                                if let Some(ref n) = cname { names.push(n.clone()); }
+                                                if let Some(ports_arr) = c.get("ports").and_then(|p| p.as_array()) {
+                                                    for p in ports_arr {
+                                                        let port = p.get("containerPort").and_then(|x| x.as_i64()).unwrap_or(0);
+                                                        if port <= 0 || port > u16::MAX as i64 { continue; }
+                                                        let name = p.get("name").and_then(|x| x.as_str()).map(|s| s.to_string());
+                                                        let proto = p.get("protocol").and_then(|x| x.as_str()).map(|s| s.to_string());
+                                                        // Only TCP (or unspecified) is supported for port-forward
+                                                        if let Some(ref proto_s) = proto { if proto_s.to_ascii_uppercase() != "TCP" { continue; } }
+                                                        ports.push(crate::model::PfPort { container: cname.clone(), port: port as u16, name, protocol: proto });
+                                                    }
+                                                }
+                                            }
                                         }
                                         if let Some(inits) = spec.get("initContainers").and_then(|c| c.as_array()) {
                                             for c in inits { if let Some(n) = c.get("name").and_then(|n| n.as_str()) { names.push(n.to_string()); } }
@@ -1005,6 +1020,13 @@ impl OrkaGuiApp {
                                 histogram!("details_containers_extract_ms", extract_ms);
                                 let mut uniq = std::collections::BTreeSet::new();
                                 let dedup: Vec<String> = names.into_iter().filter(|n| uniq.insert(n.clone())).collect();
+                                // Dedup ports across containers by (port,name,protocol)
+                                let mut seen = std::collections::BTreeSet::new();
+                                let mut ports_dedup: Vec<crate::model::PfPort> = Vec::new();
+                                for pp in ports.into_iter() {
+                                    let key = (pp.port, pp.name.clone().unwrap_or_default(), pp.protocol.clone().unwrap_or_default());
+                                    if seen.insert(key) { ports_dedup.push(pp); }
+                                }
                                 // Redact Secret values and collect entries
                                 let mut redacted = v.clone();
                                 let mut sec_entries: Option<Vec<crate::model::SecretEntry>> = None;
@@ -1030,15 +1052,16 @@ impl OrkaGuiApp {
                                 let yaml_ms = y0.elapsed().as_millis() as f64;
                                 histogram!("details_yaml_serialize_ms", yaml_ms);
                                 info!(parse_ms, extract_ms, yaml_ms, "details: json→yaml timings");
-                                (y, if dedup.is_empty() { None } else { Some(dedup) }, sec_entries)
+                                (y, if dedup.is_empty() { None } else { Some(dedup) }, if ports_dedup.is_empty() { None } else { Some(ports_dedup) }, sec_entries)
                             }
-                            Err(_) => (String::from_utf8_lossy(&bytes).into_owned(), None, None),
+                            Err(_) => (String::from_utf8_lossy(&bytes).into_owned(), None, None, None),
                         };
                         info!(size = bytes.len(), took_ms = %t0.elapsed().as_millis(), "details: fetch ok");
                         if let Some(tx) = tx_opt.as_ref() {
                             let _ = tx.send(UiUpdate::Detail { uid, text, containers: containers.clone(), produced_at: Instant::now() });
                             if let Some(entries) = secret_entries { let _ = tx.send(UiUpdate::SecretReady { uid, entries }); }
                             if let Some(v) = containers { let _ = tx.send(UiUpdate::PodContainers(v)); }
+                            if let Some(pp) = pod_ports { let _ = tx.send(UiUpdate::PodPorts(pp)); }
                         }
                     }
                     Err(e) => {

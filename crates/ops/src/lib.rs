@@ -567,37 +567,65 @@ impl KubeOps {
         use tokio::net::TcpListener;
         let client = orka_kubehub::get_kube_client().await?;
         let api: Api<Pod> = Api::namespaced(client, namespace);
-        let mut pf = api.portforward(pod, &[remote]).await?;
+        info!(ns = %namespace, pod = %pod, local, remote, "pf: internal start");
         let (tx, rx) = mpsc::channel::<ForwardEvent>(16);
         let (cancel_tx, mut cancel_rx) = oneshot::channel::<()>();
         let cancel = CancelHandle { tx: Some(cancel_tx) };
         let bind_addr = std::env::var("ORKA_PF_BIND").unwrap_or_else(|_| "127.0.0.1".to_string());
         let listener = TcpListener::bind((bind_addr.as_str(), local)).await?;
+        info!(bind = %bind_addr, local, "pf: listener bound");
         let actual = listener.local_addr()?;
         let _ = tx.send(ForwardEvent::Ready(actual.to_string())).await;
+        info!(addr = %actual, "pf: ready emitted");
+        let pod_name = pod.to_string();
         tokio::spawn(async move {
             loop {
                 tokio::select! {
-                    _ = &mut cancel_rx => { let _ = tx.send(ForwardEvent::Closed).await; break; }
+                    _ = &mut cancel_rx => { info!("pf: cancel requested"); let _ = tx.send(ForwardEvent::Closed).await; break; }
                     accept_res = listener.accept() => {
                         match accept_res {
                             Ok((mut inbound, peer)) => {
+                                info!(peer = %peer, "pf: inbound accepted");
                                 let _ = tx.send(ForwardEvent::Connected(peer.to_string())).await;
-                                match pf.take_stream(remote) {
-                                    Some(mut stream) => {
-                                        let _ = tokio::io::copy_bidirectional(&mut inbound, &mut stream).await;
-                                        // drop stream and connection; continue accepting
+                                let api_clone = api.clone();
+                                let tx_clone = tx.clone();
+                                let pod_s = pod_name.clone();
+                                tokio::spawn(async move {
+                                    // Create a fresh portforwarder per inbound connection
+                                    match api_clone.portforward(&pod_s, &[remote]).await {
+                                        Ok(mut pf_conn) => {
+                                            info!(remote, "pf: portforward opened");
+                                            match pf_conn.take_stream(remote) {
+                                                Some(mut stream) => {
+                                                    info!(remote, "pf: piping inbound<->remote started");
+                                                    match tokio::io::copy_bidirectional(&mut inbound, &mut stream).await {
+                                                        Ok((a_to_b, b_to_a)) => {
+                                                            info!(remote, bytes_in = a_to_b, bytes_out = b_to_a, "pf: piping inbound<->remote ended");
+                                                        }
+                                                        Err(e) => {
+                                                            warn!(remote, error = %e, "pf: piping error");
+                                                        }
+                                                    }
+                                                }
+                                                None => {
+                                                    warn!(remote, "pf: stream missing from portforwarder");
+                                                    let _ = tx_clone.send(ForwardEvent::Error("pf stream missing".into())).await;
+                                                }
+                                            }
+                                        }
+                                        Err(e) => {
+                                            warn!(error = %e, "pf: open error");
+                                            let _ = tx_clone.send(ForwardEvent::Error(format!("pf open error: {}", e))).await;
+                                        }
                                     }
-                                    None => {
-                                        let _ = tx.send(ForwardEvent::Error("pf stream missing".into())).await;
-                                    }
-                                }
+                                });
                             }
                             Err(e) => { let _ = tx.send(ForwardEvent::Error(format!("accept error: {}", e))).await; break; }
                         }
                     }
                 }
             }
+            info!("pf: listener loop ended");
         });
         Ok(StreamHandle { rx, cancel })
     }
