@@ -1,84 +1,100 @@
 # Orka
 
-Small, fast Kubernetes ops and observability toolkit — a focused CLI with an egui desktop.
+Small, fast Kubernetes ops and observability toolkit. One focused CLI and a desktop app. No daemons, no databases, no drama.
 
-Status: early alpha. It works for me, expect rough edges. API and UX may change.
+Status: early alpha. It works for me; expect rough edges. API and UX may change.
 
-## Why
+## Why Orka
 - Tight feedback loops for day‑to‑day k8s work: list, watch, logs, exec, scale, diff/apply.
-- Simple single‑binary workflow: `orkactl` for both CLI and GUI.
-- Opinionated but small: zero ceremony, no daemon, no database.
+- Single binary workflow: `orkactl` (CLI) and `orka` (GUI) share the same core.
+- Opinionated and small: predictable behavior, minimal latency, zero ceremony.
+
+## Install
+- Prereqs: Rust stable, a configured `kubectl` context. GUI needs a working GPU/driver (eframe/wgpu) on Linux/macOS/Windows.
+- From source:
+  - CLI: `cargo run -p orkactl -- --help`
+  - GUI: `cargo run -p orka-app --bin orka`
+
+See `docs/installation.md` for details and platform notes.
 
 ## Quickstart
 
-Prereqs:
-- Rust stable (latest), `kubectl` context configured.
-- Linux/macOS/Windows supported for the GUI (wgpu via eframe); a working GPU/driver is recommended.
-
-Build and try:
+CLI basics:
 
 ```bash
-# CLI discovery and listing
+# Discover served kinds
 cargo run -p orkactl -- discover
+
+# List Pods in a namespace
 cargo run -p orkactl -- --ns default ls v1/Pod
 
-# Watch changes
+# Watch adds/deletes (lite stream)
 cargo run -p orkactl -- --ns default watch v1/ConfigMap
 
-# Logs/exec/port-forward (ops)
-cargo run -p orkactl -- --ns default ops logs my-pod --tail 20 --grep error
-cargo run -p orkactl -- --ns default ops exec my-pod -- sh -c 'echo hello'
+# Logs / exec / port-forward
+cargo run -p orkactl -- --ns default ops logs my-pod --tail 100 --grep error
+cargo run -p orkactl -- --ns default ops exec my-pod -- sh -lc 'echo hello'
 cargo run -p orkactl -- --ns default ops pf my-pod 18080:8080
 
-# Apply/diff from YAML
+# Edit YAML (dry-run or apply with SSA)
 cargo run -p orkactl -- edit -f examples/configmap.yaml --dry-run
-cargo run -p orkactl -- diff -f examples/configmap.yaml
+cargo run -p orkactl -- edit -f examples/configmap.yaml --apply
 
-# GUI (default experience)
+# Minimal diffs vs live and last-applied
+cargo run -p orkactl -- diff -f examples/configmap.yaml
+```
+
+GUI (default experience):
+
+```bash
 cargo run -p orka-app --bin orka
 ```
 
 Prometheus metrics: `ORKA_METRICS_ADDR=127.0.0.1:9090 cargo run -p orkactl -- ls v1/Pod`
 
-Kind smoke test (optional, spins up a local cluster):
-
-```bash
-./scripts/kind-ops-smoke.sh   # requires kind + kubectl
-```
+Optional: spin up a local Kind cluster for smoke testing: `./scripts/kind-ops-smoke.sh`
 
 ## Features
-- Discover served kinds (incl. CRDs) and scope.
-- Consistent per‑GVK snapshot in RAM with lite objects for fast lists/search.
+- Discovery: served kinds (incl. CRDs) and scope.
+- Snapshots: consistent per‑GVK in RAM, shaped Lite objects for fast lists/search.
 - CLI: list, watch, search, diff/apply (SSA), last‑applied history, ops (logs/exec/pf/scale/rr/cordon/drain/delete).
-- GUI: responsive egui app with sorting, filtering, details, logs, and ops panels.
-- In‑process façade `orka_api` for frontends today; fits a future RPC transport.
+- GUI: responsive egui app with sorting/filtering, details (YAML/Describe), logs, exec, port‑forward, and a graph/atlas view.
+- API façade: `orka_api` is the stable surface used by CLI and GUI; ready for a future RPC transport.
 
-## Environment
-Common knobs (see source for all `ORKA_*`):
-- `ORKA_LOG=info|debug`: logging level (CLI and GUI).
-- `ORKA_USE_API=0|1`: prefer API façade path (default 1).
-- `ORKA_RELIST_SECS` / `ORKA_WATCH_BACKOFF_MAX_SECS`: watcher timings.
-- `ORKA_RESULTS_SOFT_CAP`: GUI results soft row cap.
-- `ORKA_LOGS_*`: GUI log view tuning (ring cap, colorize, wrap, etc.).
-- `ORKA_METRICS_ADDR=host:port`: expose Prometheus metrics endpoint.
+## Configuration
+Most knobs are environment variables. A few useful ones:
+- `ORKA_LOG=info|debug` — logging level (CLI and GUI)
+- `ORKA_USE_API=0|1` — prefer API façade (default 1)
+- `ORKA_METRICS_ADDR=host:port` — expose a Prometheus endpoint
+- `ORKA_RELIST_SECS`, `ORKA_WATCH_BACKOFF_MAX_SECS` — watcher timings
+- `ORKA_RESULTS_SOFT_CAP` — GUI results soft row cap
+- `ORKA_LOGS_*` — GUI logs controls (ring cap, colorize, wrap, etc.)
 
-Tip: `rg -n "ORKA_" -S` in the repo to discover all switches.
+Full list: `docs/config.md`.
+
+## Architecture
+- `crates/core` — core types (Lite objects, deltas, built‑in columns/projectors)
+- `crates/kubehub` — discovery, fast list/watch, kube client/context handling
+- `crates/store` — ingest loop, coalescer, world snapshots
+- `crates/search` — lightweight in‑RAM index and query
+- `crates/apply` — diff/dry‑run/SSA apply; last‑applied persistence
+- `crates/ops` — imperative ops: logs, exec, port‑forward, scale, rollout, node ops
+- `crates/schema` — CRD schema, printer columns, simple projectors (+optional validation)
+- `crates/api` — public façade trait and in‑process implementation
+- `crates/gui` + `crates/app` — egui desktop app
+- `crates/cli` — `orkactl` for scripting and debugging
+
+See `docs/overview.md` and `docs/architecture.md` for a deeper dive.
 
 ## Development
-- Toolchain: stable. Keep `cargo fmt` clean and `clippy -D warnings` green.
-- Run tests: `cargo test --workspace`.
-- CI runs formatting, clippy, tests; a separate workflow runs a Kind smoke.
-
-CLI debugging tool: `orkactl`
-- Use `orkactl` as a lightweight CLI to introspect internals (lists, watch, search, diff/apply, ops).
-- Example: `cargo run -p orkactl -- --ns default ls v1/Pod`
-
-Architecture notes live under `docs/` (start with `docs/orka_api.md`).
+- Toolchain: Rust stable. Keep `cargo fmt` clean and `clippy -D warnings` green.
+- Tests: `cargo test --workspace`.
+- Metrics: set `ORKA_METRICS_ADDR` and scrape with Prometheus.
 
 ## Roadmap
-- M0–M2: CLI/GUI in‑process (current).
-- M3: polish, UX, docs, stability.
-- M4: optional RPC transport implementing the same façade.
+- M0–M2: In‑process CLI/GUI, core ops, fast list/watch/search (current)
+- M3: polish, UX, docs, stability
+- M4: optional RPC transport exposing the same façade
 
 ## License
 Dual‑licensed under Apache 2.0 or MIT. You can choose either license.
