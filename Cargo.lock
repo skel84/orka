@@ -3670,7 +3670,7 @@ dependencies = [
 
 [[package]]
 name = "orka-app"
-version = "0.0.0"
+version = "0.0.1"
 dependencies = [
  "orka_api",
  "orka_gui",

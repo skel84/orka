@@ -72,6 +72,13 @@ Most knobs are environment variables. A few useful ones:
 
 Full list: `docs/config.md`.
 
+## macOS Notes
+- GUI PATH and exec auth: apps launched from Finder inherit a minimal PATH. If your kubeconfig uses an exec auth plugin (aws/gcloud/az/kubelogin), Orka may show: `internal: auth error: unable to run auth exec: No such file or directory`.
+  - Quick fix: set an absolute path in kubeconfig `users[].user.exec.command` (e.g., `/opt/homebrew/bin/aws`).
+  - Or export Homebrew in the GUI PATH for this login: `launchctl setenv PATH "/opt/homebrew/bin:/opt/homebrew/sbin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"`.
+  - To persist across logins, add a LaunchAgent that runs `launchctl setenv PATH ...` at login.
+- App icon in Dock: if Finder shows your icon but the Dock shows a default icon, ensure the `.icns` is bundled under the app crate and referenced correctly (`crates/app/assets/macos/orka.icns` in `[package.metadata.bundle].icon`). Rebuild the app, then refresh caches (`killall Dock`) or bump the app version and rebuild. Launch the `.app` bundle (not the CLI binary).
+
 ## Architecture
 - `crates/core` — core types (Lite objects, deltas, built‑in columns/projectors)
 - `crates/kubehub` — discovery, fast list/watch, kube client/context handling
