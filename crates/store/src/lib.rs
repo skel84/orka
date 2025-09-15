@@ -26,6 +26,7 @@ impl Coalescer {
     }
 
     pub fn len(&self) -> usize { self.map.len() }
+    pub fn is_empty(&self) -> bool { self.map.is_empty() }
     pub fn dropped(&self) -> u64 { self.dropped }
 
     pub fn push(&mut self, d: Delta) {
@@ -137,8 +138,8 @@ impl WorldBuilder {
     /// Extend provided vector with clones of live items.
     pub fn extend_live_items(&self, out: &mut Vec<LiteObj>) {
         out.reserve(self.index.len());
-        for slot in self.items.iter() {
-            if let Some(obj) = slot { out.push(obj.clone()); }
+        for obj in self.items.iter().flatten() {
+            out.push(obj.clone());
         }
     }
 
@@ -147,6 +148,10 @@ impl WorldBuilder {
         self.extend_live_items(&mut compact);
         std::sync::Arc::new(WorldSnapshot { epoch: self.epoch, items: compact })
     }
+}
+
+impl Default for WorldBuilder {
+    fn default() -> Self { Self::new() }
 }
 
 /// Handle for readers to access the current snapshot and subscribe to swaps.
@@ -590,7 +595,7 @@ fn approx_snapshot_bytes(snap: &WorldSnapshot) -> usize {
     approx_items_bytes(&snap.items)
 }
 
-fn approx_items_bytes(items: &Vec<LiteObj>) -> usize {
+fn approx_items_bytes(items: &[LiteObj]) -> usize {
     let mut total: usize = std::mem::size_of::<WorldSnapshot>();
     for o in items.iter() {
         total += std::mem::size_of::<LiteObj>();
@@ -603,7 +608,7 @@ fn approx_items_bytes(items: &Vec<LiteObj>) -> usize {
     total
 }
 
-fn trim_items_for_memory(items: &mut Vec<LiteObj>, cap_bytes: usize) -> usize {
+fn trim_items_for_memory(items: &mut [LiteObj], cap_bytes: usize) -> usize {
     // Stage 1: drop annotations
     let mut approx = approx_items_bytes(items);
     if approx > cap_bytes {

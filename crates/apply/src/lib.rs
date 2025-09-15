@@ -198,7 +198,7 @@ pub async fn diff_from_yaml(yaml: &str, ns_override: Option<&str>) -> Result<(Di
     let last_summary = if let Some(uid_str) = live_json.as_ref().and_then(|v| v.get("metadata")).and_then(|m| m.get("uid")).and_then(|s| s.as_str()) {
         if let Ok(store) = orka_persist::LogStore::open_default() {
             if let Ok(rows) = store.get_last(parse_uid(uid_str)?, Some(1)) {
-                if let Some(top) = rows.get(0) {
+                if let Some(top) = rows.first() {
                     let prev_yaml = orka_persist::maybe_decompress(&top.yaml_zstd);
                     if let Ok(prev_val_yaml) = serde_yaml::from_str::<serde_yaml::Value>(&prev_yaml) {
                         let prev_json = serde_json::to_value(prev_val_yaml).unwrap_or(Json::Null);

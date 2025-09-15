@@ -89,6 +89,10 @@ impl KubeOps {
     pub fn new() -> Self { Self }
 }
 
+impl Default for KubeOps {
+    fn default() -> Self { Self::new() }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct OpsCaps {
     pub namespace: Option<String>,
@@ -186,10 +190,7 @@ impl OrkaOps for KubeOps {
             None => return Err(anyhow!("namespace is required for pod logs")),
         };
 
-        let mut lp = LogParams::default();
-        lp.follow = opts.follow;
-        lp.tail_lines = opts.tail_lines.map(|v| v as i64);
-        lp.since_seconds = opts.since_seconds.map(|v| v as i64);
+        let mut lp = LogParams { follow: opts.follow, tail_lines: opts.tail_lines, since_seconds: opts.since_seconds, ..Default::default() };
         if let Some(c) = container { lp.container = Some(c.to_string()); }
 
         let cap = std::env::var("ORKA_OPS_QUEUE_CAP").ok().and_then(|s| s.parse().ok()).unwrap_or(1024);
@@ -243,7 +244,7 @@ impl OrkaOps for KubeOps {
             // Initial size and SIGWINCH updates
             if let Some(mut tx) = attached.terminal_size() {
                 let (w, h) = crossterm::terminal::size().unwrap_or((80, 24));
-                let _ = tx.send(TerminalSize { height: h as u16, width: w as u16 }).await;
+                let _ = tx.send(TerminalSize { height: h, width: w }).await;
                 #[cfg(unix)]
                 {
                     use tokio::signal::unix::{signal, SignalKind};
@@ -251,7 +252,7 @@ impl OrkaOps for KubeOps {
                     resize_task = Some(tokio::spawn(async move {
                         while sig.recv().await.is_some() {
                             if let Ok((w, h)) = crossterm::terminal::size() {
-                                let _ = tx.send(TerminalSize { height: h as u16, width: w as u16 }).await;
+                                let _ = tx.send(TerminalSize { height: h, width: w }).await;
                             }
                         }
                     }));
@@ -278,7 +279,10 @@ impl OrkaOps for KubeOps {
                 }
             });
             stdin_task = Some(tokio::spawn(async move {
-                while let Some(chunk) = rx.recv().await { if chunk.is_empty() { break; } if writer.write_all(&chunk).await.is_err() { break; } }
+                while let Some(chunk) = rx.recv().await {
+                    if chunk.is_empty() { break; }
+                    if writer.write_all(&chunk).await.is_err() { break; }
+                }
             }));
         }
 

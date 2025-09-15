@@ -3669,6 +3669,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "orka-app"
+version = "0.0.0"
+dependencies = [
+ "orka_api",
+ "orka_gui",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
 name = "orka-apply"
 version = "0.1.0"
 dependencies = [
@@ -3880,7 +3891,6 @@ dependencies = [
  "orka-search",
  "orka-store",
  "orka_api",
- "orka_gui",
  "orka_ops",
  "regex",
  "serde",

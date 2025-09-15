@@ -914,6 +914,11 @@ impl OrkaGuiApp {
         self.details.selected = Some(uid);
         self.details.selected_at = Some(Instant::now());
         self.details.buffer.clear();
+        // Reset Edit state for new selection; it will be initialized on next Detail update
+        self.edit.buffer.clear();
+        self.edit.original.clear();
+        self.edit.dirty = false;
+        self.edit.status.clear();
         self.details.secret_entries.clear();
         self.details.secret_revealed.clear();
         // Open/focus a dedicated tab for this resource

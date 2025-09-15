@@ -1,3 +1,4 @@
+#![allow(dead_code, unused_imports, unused_variables, unused_mut)]
 use orka_core::{LiteObj, WorldSnapshot, Uid};
 use orka_search::{Index, SearchOpts};
 use std::time::{Duration, Instant};
@@ -89,4 +90,3 @@ fn main() {
     run("typed+fuzzy", &typed_fuzzy);
     run("field", &field_queries);
 }
-

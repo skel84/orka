@@ -246,6 +246,10 @@ impl InProcApi {
     }
 }
 
+impl Default for InProcApi {
+    fn default() -> Self { Self::new() }
+}
+
 static TRAFFIC_DETAILS_BYTES: AtomicU64 = AtomicU64::new(0);
 
 #[async_trait::async_trait]
@@ -307,7 +311,7 @@ impl OrkaApi for InProcApi {
         let is_builtin = selector.gvk.group.is_empty();
         let offline_only = schema_offline_only();
         let skip_builtins = schema_builtin_skip();
-        let should_try_schema = !defer_schema && !offline_only && !(is_builtin && skip_builtins);
+        let should_try_schema = !(defer_schema || offline_only || (is_builtin && skip_builtins));
         let (mut projector, explain_available) = if should_try_schema {
             match orka_schema::fetch_crd_schema(&gvk_key).await {
                 Ok(Some(schema)) => (Some(Arc::new(schema.projector()) as Arc<dyn orka_core::Projector + Send + Sync>), true),
@@ -382,7 +386,7 @@ impl OrkaApi for InProcApi {
         let offline_only = schema_offline_only();
         let skip_builtins = schema_builtin_skip();
         let is_builtin = group.is_empty();
-        let pairs: Option<Vec<(String, u32)>> = if !offline_only && !(is_builtin && skip_builtins) {
+        let pairs: Option<Vec<(String, u32)>> = if !(offline_only || (is_builtin && skip_builtins)) {
             match orka_schema::fetch_crd_schema(&gvk_key).await {
                 Ok(Some(schema)) => Some(schema.projected_paths.iter().map(|p| (p.json_path.clone(), p.id)).collect()),
                 _ => None,
@@ -589,7 +593,7 @@ impl OrkaApi for InProcApi {
         let t0 = Instant::now();
         info!(gvk = %gvk_key, name = %name, ns = %namespace.unwrap_or("-"), limit = ?limit, "api: last_applied start");
         // Resolve UID via live object fetch
-        let client = get_kube_client().await.map_err(|e| e)?;
+        let client = get_kube_client().await?;
         // Parse GVK key -> GroupVersionKind
         let parts: Vec<&str> = gvk_key.split('/').collect();
         let gvk = match parts.as_slice() {

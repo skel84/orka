@@ -126,7 +126,13 @@ pub(crate) fn process_updates(app: &mut OrkaGuiApp, ctx: &egui::Context) {
                 Ok(UiUpdate::Error(err)) => { app.last_error = Some(err); processed += 1; }
                 Ok(UiUpdate::Detail { uid, text, containers, produced_at: _ }) => {
                     if app.details.selected == Some(uid) {
-                        app.details.buffer = text;
+                        // Populate Details pane
+                        app.details.buffer = text.clone();
+                        // Initialize Edit pane with live YAML when not dirty
+                        if !app.edit.dirty {
+                            app.edit.original = text.clone();
+                            app.edit.buffer = text.clone();
+                        }
                         if let Some(v) = containers { app.logs.containers = v; }
                         if app.rendering_window_id.is_none() { ctx.request_repaint(); }
                         processed += 1;

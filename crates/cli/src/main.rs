@@ -110,8 +110,9 @@ enum Commands {
     },
     /// Show runtime configuration and metrics endpoint
     Stats {},
-    /// Launch the Orka GUI (eframe/egui)
-    Gui {},
+    // Deprecated/unknown subcommands handler
+    #[command(external_subcommand)]
+    External(Vec<String>),
     /// Imperative operations against Kubernetes resources
     Ops {
         #[command(subcommand)]
@@ -265,10 +266,17 @@ async fn main() -> Result<()> {
     let api = if use_api { Some(InProcApi::new()) } else { None };
 
     match cli.command {
-        Commands::Gui {} => {
-            let api = Arc::new(InProcApi::new());
-            // Run native GUI on the main thread (required on macOS).
-            if let Err(e) = orka_gui::run_native(api) { eprintln!("GUI error: {}", e); }
+        Commands::External(args) => {
+            // Deprecation shim: `orkactl gui` moved to the standalone `orka` binary
+            if let Some(cmd) = args.first() {
+                if cmd == "gui" {
+                    eprintln!("orkactl: 'gui' subcommand has moved. Use the 'orka' app binary.\n  - Run: cargo run -p orka-app --bin orka\n  - Or install and run: orka");
+                    return Ok(());
+                }
+            }
+            // Unknown subcommand
+            eprintln!("orkactl: unknown command: {}", args.join(" "));
+            std::process::exit(2);
         }
         Commands::Discover { prefer_crd } => {
             info!(prefer_crd, "discover invoked");
@@ -884,7 +892,7 @@ async fn main() -> Result<()> {
                     let opts = LogOptions { follow, tail_lines, since_seconds };
                     let re = match grep { Some(pat) => match Regex::new(&pat) { Ok(r) => Some(r), Err(e) => { eprintln!("invalid regex: {}", e); return Ok(()); } }, None => None };
                     if container.len() <= 1 {
-                        let single = container.get(0).map(|s| s.as_str());
+                        let single = container.first().map(|s| s.as_str());
                         match ops.logs(ns, &pod, single, opts).await {
                             Ok(mut handle) => {
                                 loop {
@@ -906,7 +914,9 @@ async fn main() -> Result<()> {
                                 }
                             }
                             Err(e) => {
-                                if let Some(ae) = e.downcast_ref::<kube::Error>() { if let kube::Error::Api(api_err) = ae { if api_err.code == 403 { eprintln!("forbidden: missing get on pods/log in ns"); } else { eprintln!("logs error: {}", e); } } else { eprintln!("logs error: {}", e); } } else { eprintln!("logs error: {}", e); }
+                                if let Some(kube::Error::Api(api_err)) = e.downcast_ref::<kube::Error>() {
+                                    if api_err.code == 403 { eprintln!("forbidden: missing get on pods/log in ns"); } else { eprintln!("logs error: {}", e); }
+                                } else { eprintln!("logs error: {}", e); }
                             }
                         }
                     } else {
@@ -917,7 +927,8 @@ async fn main() -> Result<()> {
                         let (tx, mut rx) = mpsc::channel::<(String, String)>(1024);
                         let mut handles = Vec::new();
                         let ns_owned = cli.namespace.clone();
-                        for c in container.iter().cloned() {
+                        for c in container.iter() {
+                            let c = c.clone();
                             let pod = pod.clone();
                             let opts = LogOptions { follow, tail_lines, since_seconds };
                             let ops: Arc<dyn OrkaOps> = if let Some(api) = &api { api.ops() } else { Arc::new(KubeOps::new()) };
@@ -960,7 +971,9 @@ async fn main() -> Result<()> {
                     if ns.is_none() { eprintln!("--ns is required for exec"); return Ok(()); }
                     let ops: Arc<dyn OrkaOps> = if let Some(api) = &api { api.ops() } else { Arc::new(KubeOps::new()) };
                     if let Err(e) = ops.exec(ns, &pod, container.as_deref(), &cmd, tty).await {
-                        if let Some(ae) = e.downcast_ref::<kube::Error>() { if let kube::Error::Api(api_err) = ae { if api_err.code == 403 { eprintln!("forbidden: missing create on pods/exec in ns"); } else { eprintln!("exec error: {}", e); } } else { eprintln!("exec error: {}", e); } } else { eprintln!("exec error: {}", e); }
+                        if let Some(kube::Error::Api(api_err)) = e.downcast_ref::<kube::Error>() {
+                            if api_err.code == 403 { eprintln!("forbidden: missing create on pods/exec in ns"); } else { eprintln!("exec error: {}", e); }
+                        } else { eprintln!("exec error: {}", e); }
                     }
                 }
                 OpsCmd::Pf { pod, mapping } => {
@@ -987,7 +1000,9 @@ async fn main() -> Result<()> {
                             }
                         }
                         Err(e) => {
-                            if let Some(ae) = e.downcast_ref::<kube::Error>() { if let kube::Error::Api(api_err) = ae { if api_err.code == 403 { eprintln!("forbidden: missing create on pods/portforward in ns"); } else { eprintln!("pf error: {}", e); } } else { eprintln!("pf error: {}", e); } } else { eprintln!("pf error: {}", e); }
+                            if let Some(kube::Error::Api(api_err)) = e.downcast_ref::<kube::Error>() {
+                                if api_err.code == 403 { eprintln!("forbidden: missing create on pods/portforward in ns"); } else { eprintln!("pf error: {}", e); }
+                            } else { eprintln!("pf error: {}", e); }
                         }
                     }
                 }
@@ -1004,7 +1019,9 @@ async fn main() -> Result<()> {
                             }
                         },
                         Err(e) => {
-                            if let Some(ae) = e.downcast_ref::<kube::Error>() { if let kube::Error::Api(api_err) = ae { if api_err.code == 403 { eprintln!("forbidden: missing patch on {}/scale or {} in ns", gvk, gvk); } else { eprintln!("scale error: {}", e); } } else { eprintln!("scale error: {}", e); } } else { eprintln!("scale error: {}", e); }
+                            if let Some(kube::Error::Api(api_err)) = e.downcast_ref::<kube::Error>() {
+                                if api_err.code == 403 { eprintln!("forbidden: missing patch on {}/scale or {} in ns", gvk, gvk); } else { eprintln!("scale error: {}", e); }
+                            } else { eprintln!("scale error: {}", e); }
                         }
                     }
                 }
@@ -1021,7 +1038,9 @@ async fn main() -> Result<()> {
                             }
                         },
                         Err(e) => {
-                            if let Some(ae) = e.downcast_ref::<kube::Error>() { if let kube::Error::Api(api_err) = ae { if api_err.code == 403 { eprintln!("forbidden: missing patch on {} in ns", gvk); } else { eprintln!("rollout-restart error: {}", e); } } else { eprintln!("rollout-restart error: {}", e); } } else { eprintln!("rollout-restart error: {}", e); }
+                            if let Some(kube::Error::Api(api_err)) = e.downcast_ref::<kube::Error>() {
+                                if api_err.code == 403 { eprintln!("forbidden: missing patch on {} in ns", gvk); } else { eprintln!("rollout-restart error: {}", e); }
+                            } else { eprintln!("rollout-restart error: {}", e); }
                         }
                     }
                 }
@@ -1038,7 +1057,9 @@ async fn main() -> Result<()> {
                             }
                         },
                         Err(e) => {
-                            if let Some(ae) = e.downcast_ref::<kube::Error>() { if let kube::Error::Api(api_err) = ae { if api_err.code == 403 { eprintln!("forbidden: missing delete on pods in ns"); } else { eprintln!("delete error: {}", e); } } else { eprintln!("delete error: {}", e); } } else { eprintln!("delete error: {}", e); }
+                            if let Some(kube::Error::Api(api_err)) = e.downcast_ref::<kube::Error>() {
+                                if api_err.code == 403 { eprintln!("forbidden: missing delete on pods in ns"); } else { eprintln!("delete error: {}", e); }
+                            } else { eprintln!("delete error: {}", e); }
                         }
                     }
                 }
@@ -1054,7 +1075,9 @@ async fn main() -> Result<()> {
                             }
                         },
                         Err(e) => {
-                            if let Some(ae) = e.downcast_ref::<kube::Error>() { if let kube::Error::Api(api_err) = ae { if api_err.code == 403 { eprintln!("forbidden: missing patch on nodes"); } else { eprintln!("cordon error: {}", e); } } else { eprintln!("cordon error: {}", e); } } else { eprintln!("cordon error: {}", e); }
+                            if let Some(kube::Error::Api(api_err)) = e.downcast_ref::<kube::Error>() {
+                                if api_err.code == 403 { eprintln!("forbidden: missing patch on nodes"); } else { eprintln!("cordon error: {}", e); }
+                            } else { eprintln!("cordon error: {}", e); }
                         }
                     }
                 }
@@ -1070,7 +1093,9 @@ async fn main() -> Result<()> {
                             }
                         },
                         Err(e) => {
-                            if let Some(ae) = e.downcast_ref::<kube::Error>() { if let kube::Error::Api(api_err) = ae { if api_err.code == 403 { eprintln!("forbidden: missing create on pods/eviction and/or delete on pods across namespaces"); } else { eprintln!("drain error: {}", e); } } else { eprintln!("drain error: {}", e); } } else { eprintln!("drain error: {}", e); }
+                            if let Some(kube::Error::Api(api_err)) = e.downcast_ref::<kube::Error>() {
+                                if api_err.code == 403 { eprintln!("forbidden: missing create on pods/eviction and/or delete on pods across namespaces"); } else { eprintln!("drain error: {}", e); }
+                            } else { eprintln!("drain error: {}", e); }
                         }
                     }
                 }

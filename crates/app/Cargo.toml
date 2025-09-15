@@ -1,0 +1,17 @@
+[package]
+name = "orka-app"
+version = "0.0.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+description = "Orka desktop app (eframe/egui)"
+
+[[bin]]
+name = "orka"
+path = "src/main.rs"
+
+[dependencies]
+orka_gui = { path = "../gui" }
+orka_api = { path = "../api" }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+tokio = { workspace = true }

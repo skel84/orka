@@ -48,7 +48,7 @@ pub async fn get_kube_client() -> Result<Client> {
                 .map_err(|e| anyhow!(e.to_string()))
         })
         .await
-        .map(|c| c.clone())
+        .cloned()
 }
 
 /// List kubeconfig contexts available to the current process.
@@ -893,7 +893,7 @@ fn load_discovery_cache() -> Result<Option<Vec<DiskEntry>>> {
     Ok(Some(dc.entries))
 }
 
-fn save_discovery_cache(entries: &Vec<DiskEntry>) -> Result<()> {
+fn save_discovery_cache(entries: &[DiskEntry]) -> Result<()> {
     let dir = cache_dir();
     fs::create_dir_all(&dir).ok();
     let mut tmp = dir.clone();
@@ -905,7 +905,7 @@ fn save_discovery_cache(entries: &Vec<DiskEntry>) -> Result<()> {
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
             .as_secs(),
-        entries: entries.clone(),
+        entries: entries.to_owned(),
     };
     let bytes = serde_json::to_vec_pretty(&dc).context("serialize discovery cache")?;
     fs::write(&tmp, &bytes).context("write tmp discovery cache")?;

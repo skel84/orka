@@ -65,7 +65,7 @@ impl Index {
     pub fn build_from_snapshot(snap: &WorldSnapshot) -> Self {
         Self::build_from_snapshot_with_meta(snap, None, None, None)
     }
-    fn intersect_sorted(a: &Vec<usize>, b: &Vec<usize>) -> Vec<usize> {
+    fn intersect_sorted(a: &[usize], b: &[usize]) -> Vec<usize> {
         let mut i = 0usize;
         let mut j = 0usize;
         let mut out = Vec::new();
@@ -465,7 +465,7 @@ fn approx_index_bytes_flat(flat: &FlatIndex) -> usize {
     b
 }
 
-fn enforce_index_cap_flat(flat: &mut FlatIndex, cap: usize, approx_before: usize, g_names: &Vec<String>) -> (usize, Vec<PressureEvent>) {
+fn enforce_index_cap_flat(flat: &mut FlatIndex, cap: usize, approx_before: usize, g_names: &[String]) -> (usize, Vec<PressureEvent>) {
     let mut approx = approx_before;
     let mut events: Vec<PressureEvent> = Vec::new();
 
@@ -530,7 +530,7 @@ fn prune_key_postings_flat(flat: &mut FlatIndex) -> (usize, usize) {
     (bytes, keys)
 }
 
-fn shrink_texts_to_name_flat(flat: &mut FlatIndex, g_names: &Vec<String>) -> usize {
+fn shrink_texts_to_name_flat(flat: &mut FlatIndex, g_names: &[String]) -> usize {
     let mut trimmed = 0usize;
     for i in 0..flat.texts.len() {
         let old = std::mem::take(&mut flat.texts[i]);

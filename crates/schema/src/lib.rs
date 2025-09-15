@@ -84,7 +84,6 @@ fn normalize_json_path(jp: &str) -> Option<String> {
 /// Try to fetch CRD schema for the provided `gvk_key` (e.g. "group/v1/Kind" or "v1/Kind").
 /// Returns Ok(None) for built-in kinds without a CRD.
 pub async fn fetch_crd_schema(gvk_key: &str) -> Result<Option<CrdSchema>> {
-    use kube::Client;
     use k8s_openapi::apiextensions_apiserver::pkg::apis::apiextensions::v1 as apiextv1;
     use kube::{Api, api::ListParams};
 
@@ -178,7 +177,7 @@ pub async fn fetch_crd_schema(gvk_key: &str) -> Result<Option<CrdSchema>> {
         }
 
         let candidates = schema_opt
-            .and_then(|s| derive_projected_from_openapi(s))
+            .and_then(derive_projected_from_openapi)
             .unwrap_or_else(|| vec![
                 "spec.name".to_string(),
                 "spec.namespace".to_string(),
@@ -274,7 +273,6 @@ pub mod validate {
     }
 
     async fn fetch_openapi_schema(gvk_key: &str) -> Result<Option<serde_json::Value>> {
-        use kube::Client;
         use k8s_openapi::apiextensions_apiserver::pkg::apis::apiextensions::v1 as apiextv1;
         use kube::{Api, api::ListParams};
 
@@ -355,41 +353,6 @@ pub mod validate {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn normalize_json_path_accepts_simple_paths() {
-        assert_eq!(normalize_json_path(".spec.foo"), Some("spec.foo".to_string()));
-        assert_eq!(normalize_json_path("spec.dnsNames[0]"), Some("spec.dnsNames[0]".to_string()));
-        assert_eq!(normalize_json_path("").is_none(), true);
-        assert_eq!(normalize_json_path("spec.*").is_none(), true);
-        assert_eq!(normalize_json_path("spec.foo[0][1]").is_some(), false);
-    }
-
-    #[test]
-    fn projector_extracts_scalars() {
-        let json = serde_json::json!({
-            "spec": {
-                "dnsNames": ["a.example.com", "b.example.com"],
-                "replicas": 3,
-                "paused": false
-            }
-        });
-        let specs = vec![
-            PathSpec { id: 1, json_path: "spec.dnsNames[0]".to_string() },
-            PathSpec { id: 2, json_path: "spec.replicas".to_string() },
-            PathSpec { id: 3, json_path: "spec.paused".to_string() },
-        ];
-        let pj = SchemaProjector::new(specs);
-        let out = pj.project(&json);
-        assert!(out.contains(&(1, "a.example.com".to_string())));
-        assert!(out.contains(&(2, "3".to_string())));
-        assert!(out.contains(&(3, "false".to_string())));
-    }
-}
-
 fn derive_projected_from_openapi(schema: &serde_json::Value) -> Option<Vec<String>> {
     use serde_json::Value;
     let mut out: Vec<String> = Vec::new();
@@ -432,4 +395,39 @@ fn derive_projected_from_openapi(schema: &serde_json::Value) -> Option<Vec<Strin
     walk_object(spec_props, "spec", 0, &mut out);
 
     if out.is_empty() { None } else { Some(out) }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn normalize_json_path_accepts_simple_paths() {
+        assert_eq!(normalize_json_path(".spec.foo"), Some("spec.foo".to_string()));
+        assert_eq!(normalize_json_path("spec.dnsNames[0]"), Some("spec.dnsNames[0]".to_string()));
+        assert!(normalize_json_path("").is_none());
+        assert!(normalize_json_path("spec.*").is_none());
+        assert!(normalize_json_path("spec.foo[0][1]").is_none());
+    }
+
+    #[test]
+    fn projector_extracts_scalars() {
+        let json = serde_json::json!({
+            "spec": {
+                "dnsNames": ["a.example.com", "b.example.com"],
+                "replicas": 3,
+                "paused": false
+            }
+        });
+        let specs = vec![
+            PathSpec { id: 1, json_path: "spec.dnsNames[0]".to_string() },
+            PathSpec { id: 2, json_path: "spec.replicas".to_string() },
+            PathSpec { id: 3, json_path: "spec.paused".to_string() },
+        ];
+        let pj = SchemaProjector::new(specs);
+        let out = pj.project(&json);
+        assert!(out.contains(&(1, "a.example.com".to_string())));
+        assert!(out.contains(&(2, "3".to_string())));
+        assert!(out.contains(&(3, "false".to_string())));
+    }
 }

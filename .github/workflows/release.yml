@@ -1,0 +1,84 @@
+name: release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+jobs:
+  create-release:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          name: Orka ${{ github.ref_name }}
+          tag_name: ${{ github.ref_name }}
+          draft: false
+          prerelease: false
+
+  build-and-upload:
+    name: build+upload (${{ matrix.os }})
+    needs: create-release
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+          - os: macos-latest
+          - os: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Build orka (release)
+        run: cargo build -p orka-app --release
+
+      - name: Package (linux/mac)
+        if: matrix.os != 'windows-latest'
+        run: |
+          TAG=${{ github.ref_name }}
+          OUT="orka-${TAG}-${{ matrix.os }}.tar.gz"
+          mkdir -p package
+          cp target/release/orka package/
+          cp LICENSE-* README.md package/ || true
+          tar -czf "$OUT" -C package .
+          if command -v shasum >/dev/null 2>&1; then shasum -a 256 "$OUT" > "$OUT.sha256"; else sha256sum "$OUT" > "$OUT.sha256"; fi
+
+      - name: Package (windows)
+        if: matrix.os == 'windows-latest'
+        shell: powershell
+        run: |
+          $Tag = "${{ github.ref_name }}"
+          $Out = "orka-$Tag-windows-latest.zip"
+          New-Item -ItemType Directory -Force -Path package | Out-Null
+          Copy-Item target\release\orka.exe package\
+          Copy-Item LICENSE-* , README.md -ErrorAction SilentlyContinue -Destination package\
+          Compress-Archive -Path package\* -DestinationPath $Out
+          $hash = (Get-FileHash $Out -Algorithm SHA256).Hash.ToLower()
+          "$hash  $Out" | Out-File "$Out.sha256" -Encoding ascii
+
+      - name: Upload release assets (linux/mac)
+        if: matrix.os != 'windows-latest'
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.ref_name }}
+          files: |
+            orka-${{ github.ref_name }}-${{ matrix.os }}.tar.gz
+            orka-${{ github.ref_name }}-${{ matrix.os }}.tar.gz.sha256
+          append_body: true
+
+      - name: Upload release assets (windows)
+        if: matrix.os == 'windows-latest'
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.ref_name }}
+          files: |
+            orka-${{ github.ref_name }}-windows-latest.zip
+            orka-${{ github.ref_name }}-windows-latest.zip.sha256
+          append_body: true
+

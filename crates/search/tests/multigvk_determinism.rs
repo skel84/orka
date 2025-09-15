@@ -42,7 +42,7 @@ async fn run_stream(seq: &[Delta]) -> WorldSnapshot {
     (*backend.current()).clone()
 }
 
-fn canonicalize_hits(world: &WorldSnapshot, hits: &Vec<orka_search::Hit>) -> Vec<(String, String, [u8;16])> {
+fn canonicalize_hits(world: &WorldSnapshot, hits: &[orka_search::Hit]) -> Vec<(String, String, [u8;16])> {
     hits.iter().map(|h| {
         let o = &world.items[h.doc as usize];
         (o.namespace.clone().unwrap_or_default(), o.name.clone(), o.uid)
@@ -69,7 +69,7 @@ async fn multigvk_search_topk_deterministic_across_runs() {
     // First run
     let a1 = run_stream(&a_seq).await;
     let b1 = run_stream(&b_seq).await;
-    let mut world1 = WorldSnapshot { epoch: 1, items: { let mut v = a1.items.clone(); v.extend(b1.items.clone()); v } };
+    let world1 = WorldSnapshot { epoch: 1, items: { let mut v = a1.items.clone(); v.extend(b1.items.clone()); v } };
     // Build index over combined world and query
     let idx1 = Index::build_from_snapshot(&world1);
     let (hits1, _dbg1) = idx1.search_with_debug("ns:ns1", 10);
@@ -78,7 +78,7 @@ async fn multigvk_search_topk_deterministic_across_runs() {
     // Second run
     let a2 = run_stream(&a_seq).await;
     let b2 = run_stream(&b_seq).await;
-    let mut world2 = WorldSnapshot { epoch: 1, items: { let mut v = a2.items.clone(); v.extend(b2.items.clone()); v } };
+    let world2 = WorldSnapshot { epoch: 1, items: { let mut v = a2.items.clone(); v.extend(b2.items.clone()); v } };
     let idx2 = Index::build_from_snapshot(&world2);
     let (hits2, _dbg2) = idx2.search_with_debug("ns:ns1", 10);
     let canon2 = canonicalize_hits(&world2, &hits2);

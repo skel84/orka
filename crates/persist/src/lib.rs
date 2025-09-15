@@ -38,7 +38,7 @@ impl LogStore {
 
     pub fn open(path: &str) -> Result<Self> {
         let started = std::time::Instant::now();
-        let f = std::fs::OpenOptions::new().read(true).write(true).create(true).append(true).open(path)
+        let f = std::fs::OpenOptions::new().read(true).create(true).append(true).open(path)
             .with_context(|| format!("opening log store at {}", path))?;
         let mut idx: std::collections::HashMap<[u8;16], Vec<u64>> = std::collections::HashMap::new();
         // Walk the file to build in-memory offsets per uid

@@ -21,6 +21,25 @@ pub(crate) fn process_discovery(app: &mut OrkaGuiApp) {
                 });
                 app.discovery.kinds = v;
                 app.discovery.rx = None;
+                // Select Pods by default on first load (no prior selection)
+                if app.selection.selected_kind.is_none() && app.selection.selected_idx.is_none() {
+                    // Prefer core/v1 Pod if available
+                    let mut candidate: Option<usize> = None;
+                    for (idx, k) in app.discovery.kinds.iter().enumerate() {
+                        if k.kind == "Pod" && k.group.is_empty() {
+                            if k.version == "v1" { candidate = Some(idx); break; }
+                            candidate = Some(idx);
+                        }
+                    }
+                    if let Some(idx) = candidate {
+                        if let Some(k) = app.discovery.kinds.get(idx).cloned() {
+                            app.selection.selected_kind = Some(k);
+                            app.selection.selected_idx = Some(idx);
+                            // Kick off initial watch for Pods
+                            app.ensure_watch_for_selection();
+                        }
+                    }
+                }
                 // Prewarm watchers for common kinds to reduce first-click latency
                 if !app.watch.prewarm_started {
                     app.watch.prewarm_started = true;
@@ -84,4 +103,3 @@ pub(crate) fn process_discovery(app: &mut OrkaGuiApp) {
         }
     }
 }
-

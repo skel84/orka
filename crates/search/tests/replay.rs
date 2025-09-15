@@ -31,7 +31,7 @@ fn replay_deltas_produce_stable_index_and_ordering() {
         Delta { uid: u3, kind: DeltaKind::Applied, raw: obj_raw("gamma", "default", &[]) },
     ]);
     // rename beta -> alpha (tests tie-break by uid when names equal)
-    let mut o2 = obj_raw("alpha", "default", &[("app","api")]);
+    let o2 = obj_raw("alpha", "default", &[("app","api")]);
     wb.apply(vec![Delta { uid: u2, kind: DeltaKind::Applied, raw: o2 }]);
     // delete gamma
     wb.apply(vec![Delta { uid: u3, kind: DeltaKind::Deleted, raw: serde_json::json!({}) }]);
@@ -54,4 +54,3 @@ fn replay_deltas_produce_stable_index_and_ordering() {
     let d = hits_label[0].doc as usize;
     assert_eq!(snap.items[d].uid[0], 1);
 }
-

@@ -1,0 +1,48 @@
+name: ci
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  rust:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Format
+        run: cargo fmt --all -- --check
+      - name: Clippy (core crates)
+        run: cargo clippy --workspace --exclude orka_gui -- -D warnings
+      - name: Test
+        run: cargo test --workspace --no-fail-fast
+
+  build-orka:
+    name: build-orka (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            ext: ""
+          - os: macos-latest
+            ext: ""
+          - os: windows-latest
+            ext: ".exe"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Build orka app (release)
+        run: cargo build -p orka-app --release
+      - name: Upload orka binary
+        uses: actions/upload-artifact@v4
+        with:
+          name: orka-${{ matrix.os }}
+          path: target/release/orka${{ matrix.ext }}
+          if-no-files-found: error
+          retention-days: 7
