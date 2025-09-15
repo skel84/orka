@@ -1,48 +1,79 @@
-name: ci
+name: CI
 
 on:
   push:
-    branches: [ main ]
+    branches: [ main, master ]
   pull_request:
-  workflow_dispatch:
+    branches: [ main, master ]
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
 
 jobs:
-  rust:
+  check:
+    name: Lint & Format (ubuntu)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
-      - name: Format
-        run: cargo fmt --all -- --check
-      - name: Clippy (core crates)
-        run: cargo clippy --workspace --exclude orka_gui -- -D warnings
-      - name: Test
-        run: cargo test --workspace --no-fail-fast
+      - name: cargo fmt
+        run: cargo fmt --all --check
+      - name: cargo clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
 
-  build-orka:
-    name: build-orka (${{ matrix.os }})
+  test:
+    name: Tests (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
       matrix:
-        include:
-          - os: ubuntu-latest
-            ext: ""
-          - os: macos-latest
-            ext: ""
-          - os: windows-latest
-            ext: ".exe"
+        os: [ubuntu-latest, macos-latest, windows-latest]
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-      - name: Build orka app (release)
-        run: cargo build -p orka-app --release
-      - name: Upload orka binary
+      - name: cargo test
+        run: cargo test --workspace --all-targets
+
+  build-cli:
+    name: Build CLI (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    needs: [check, test]
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Build orkactl (release)
+        run: cargo build -p orkactl --release
+      - name: Package artifact
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ "${{ runner.os }}" == "Windows" ]]; then
+            out=orkactl-windows-${{ runner.arch }}.zip
+            7z a "$out" target/release/orkactl.exe > /dev/null
+          elif [[ "${{ runner.os }}" == "macOS" ]]; then
+            out=orkactl-macos-${{ runner.arch }}.tar.gz
+            tar czf "$out" -C target/release orkactl
+          else
+            out=orkactl-linux-${{ runner.arch }}.tar.gz
+            tar czf "$out" -C target/release orkactl
+          fi
+          echo "out=$out" >> $GITHUB_OUTPUT
+        id: pkg
+      - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: orka-${{ matrix.os }}
-          path: target/release/orka${{ matrix.ext }}
-          if-no-files-found: error
-          retention-days: 7
+          name: ${{ steps.pkg.outputs.out }}
+          path: ${{ steps.pkg.outputs.out }}
