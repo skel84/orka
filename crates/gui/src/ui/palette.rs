@@ -11,6 +11,7 @@ use crate::{OrkaGuiApp, UiUpdate};
 
 #[derive(Clone, Copy)]
 pub(crate) enum PaletteOpenTarget {
+    Dock,
     Floating,
     Detached,
 }
@@ -93,9 +94,13 @@ pub(crate) fn ui_palette(app: &mut OrkaGuiApp, ctx: &egui::Context) {
                     app.palette.sel = Some(if cur == 0 { len - 1 } else { cur - 1 });
                 }
             }
-            let (enter, shift_enter) = ui.input(|i| {
+            let (enter, shift_enter, overlay_enter) = ui.input(|i| {
                 let pressed = i.key_pressed(egui::Key::Enter);
-                (pressed, pressed && i.modifiers.shift)
+                (
+                    pressed,
+                    pressed && i.modifiers.shift,
+                    pressed && (i.modifiers.alt || i.modifiers.ctrl || i.modifiers.command),
+                )
             });
             let esc = ui.input(|i| i.key_pressed(egui::Key::Escape));
             if esc {
@@ -103,7 +108,7 @@ pub(crate) fn ui_palette(app: &mut OrkaGuiApp, ctx: &egui::Context) {
             }
             let scroll_to_selected = app.palette.sel != prev_sel;
             let mut chosen: Option<PaletteItem> = None;
-            let mut target = PaletteOpenTarget::Floating;
+            let mut target = PaletteOpenTarget::Dock;
             // Results list
             let font = egui::FontId::monospace(13.0);
             egui::ScrollArea::vertical()
@@ -180,8 +185,10 @@ pub(crate) fn ui_palette(app: &mut OrkaGuiApp, ctx: &egui::Context) {
                 {
                     target = if shift_enter {
                         PaletteOpenTarget::Detached
-                    } else {
+                    } else if overlay_enter {
                         PaletteOpenTarget::Floating
+                    } else {
+                        PaletteOpenTarget::Dock
                     };
                     chosen = Some(sel);
                 }
@@ -340,13 +347,20 @@ impl OrkaGuiApp {
         self.selection.namespace = obj.namespace.clone().unwrap_or_default();
         // Drive selection state so the detached window renders the right resource
         self.select_row(obj);
-        // Skip opening/focusing a dock tab; close any existing one for this UID
-        self.dock_pending.retain(|pending| *pending != uid);
-        self.dock_close_pending.push(uid);
-        // Spawn or focus a window for the selection
         match target {
-            PaletteOpenTarget::Floating => self.open_floating_for(ctx, uid),
-            PaletteOpenTarget::Detached => self.open_detached_for(ctx, uid),
+            PaletteOpenTarget::Dock => {
+                // Selection already focuses the standard details tab.
+            }
+            PaletteOpenTarget::Floating => {
+                self.dock_pending.retain(|pending| *pending != uid);
+                self.dock_close_pending.push(uid);
+                self.open_floating_for(ctx, uid);
+            }
+            PaletteOpenTarget::Detached => {
+                self.dock_pending.retain(|pending| *pending != uid);
+                self.dock_close_pending.push(uid);
+                self.open_detached_for(ctx, uid);
+            }
         }
     }
 
