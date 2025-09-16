@@ -2,10 +2,10 @@
 
 use eframe::egui;
 
+use crate::model::{DetachedDetailsWindow, DetachedDetailsWindowMeta, DetachedDetailsWindowState};
+use crate::model::{EditUi, ExecState, LogsState, ServiceLogsState};
 use crate::OrkaGuiApp;
 use orka_core::Uid;
-use crate::model::{EditUi, LogsState, ExecState, ServiceLogsState};
-use crate::model::{DetachedDetailsWindow, DetachedDetailsWindowMeta, DetachedDetailsWindowState};
 use std::time::Instant;
 
 pub(crate) fn render_detached(app: &mut OrkaGuiApp, ctx: &egui::Context) {
@@ -27,19 +27,25 @@ pub(crate) fn render_detached(app: &mut OrkaGuiApp, ctx: &egui::Context) {
                 if ctx.input(|i| i.viewport().close_requested()) {
                     if app.logs_owner == Some(id) {
                         if let Some(w) = app.detached.iter_mut().find(|w| w.meta.id == id) {
-                            if let Some(c) = w.state.logs.cancel.take() { c.cancel(); }
+                            if let Some(c) = w.state.logs.cancel.take() {
+                                c.cancel();
+                            }
                             app.logs_owner = None;
                         }
                     }
                     if app.exec_owner == Some(id) {
                         if let Some(w) = app.detached.iter_mut().find(|w| w.meta.id == id) {
-                            if let Some(c) = w.state.exec.cancel.take() { c.cancel(); }
+                            if let Some(c) = w.state.exec.cancel.take() {
+                                c.cancel();
+                            }
                             app.exec_owner = None;
                         }
                     }
                     if app.svc_logs_owner == Some(id) {
                         if let Some(w) = app.detached.iter_mut().find(|w| w.meta.id == id) {
-                            if let Some(c) = w.state.svc_logs.cancel.take() { c.cancel(); }
+                            if let Some(c) = w.state.svc_logs.cancel.take() {
+                                c.cancel();
+                            }
                             app.svc_logs_owner = None;
                         }
                     }
@@ -73,9 +79,18 @@ pub(crate) fn render_detached(app: &mut OrkaGuiApp, ctx: &egui::Context) {
                         app.details.selected = Some(uid);
                         app.details.active_tab = win_active_tab;
                         // Swap logs/exec/svc_logs state in
-                        let win_logs = { let w = &mut app.detached[idx]; std::mem::take(&mut w.state.logs) };
-                        let win_exec = { let w = &mut app.detached[idx]; std::mem::take(&mut w.state.exec) };
-                        let win_svc_logs = { let w = &mut app.detached[idx]; std::mem::take(&mut w.state.svc_logs) };
+                        let win_logs = {
+                            let w = &mut app.detached[idx];
+                            std::mem::take(&mut w.state.logs)
+                        };
+                        let win_exec = {
+                            let w = &mut app.detached[idx];
+                            std::mem::take(&mut w.state.exec)
+                        };
+                        let win_svc_logs = {
+                            let w = &mut app.detached[idx];
+                            std::mem::take(&mut w.state.svc_logs)
+                        };
                         let main_logs = std::mem::replace(&mut app.logs, win_logs);
                         let main_exec = std::mem::replace(&mut app.exec, win_exec);
                         let main_svc_logs = std::mem::replace(&mut app.svc_logs, win_svc_logs);
@@ -122,21 +137,43 @@ pub(crate) fn render_detached(app: &mut OrkaGuiApp, ctx: &egui::Context) {
     }
     let to_close = close_reqs.borrow().clone();
     if !to_close.is_empty() {
-        app.detached.retain(|w| !to_close.iter().any(|id| *id == w.meta.id));
+        app.detached
+            .retain(|w| !to_close.iter().any(|id| *id == w.meta.id));
     }
 }
 
 impl OrkaGuiApp {
     /// Open a detached OS window to show details for the given UID.
     pub(crate) fn open_detached_for(&mut self, ctx: &egui::Context, uid: orka_core::Uid) {
-        if self.detached.iter().any(|w| w.meta.uid == uid) { return; }
+        if self.detached.iter().any(|w| w.meta.uid == uid) {
+            return;
+        }
         let (ns, name) = if let Some(i) = self.results.index.get(&uid).copied() {
-            if let Some(row) = self.results.rows.get(i) { (row.namespace.clone(), row.name.clone()) } else { (None, String::from("")) }
-        } else { (None, String::from("")) };
-        let gvk = match self.current_selected_kind() { Some(k) => k.clone(), None => return };
-        let title = match &ns { Some(ns) => format!("Details: {}/{}", ns, name), None => format!("Details: {}", name) };
+            if let Some(row) = self.results.rows.get(i) {
+                (row.namespace.clone(), row.name.clone())
+            } else {
+                (None, String::from(""))
+            }
+        } else {
+            (None, String::from(""))
+        };
+        let gvk = match self.current_selected_kind() {
+            Some(k) => k.clone(),
+            None => return,
+        };
+        let title = match &ns {
+            Some(ns) => format!("Details: {}/{}", ns, name),
+            None => format!("Details: {}", name),
+        };
         let id = egui::ViewportId::from_hash_of(("orka_details", uid));
-        let meta = DetachedDetailsWindowMeta { id, uid, title, gvk: gvk.clone(), namespace: ns.clone(), name: name.clone() };
+        let meta = DetachedDetailsWindowMeta {
+            id,
+            uid,
+            title,
+            gvk: gvk.clone(),
+            namespace: ns.clone(),
+            name: name.clone(),
+        };
         let state = DetachedDetailsWindowState {
             buffer: String::new(),
             last_error: None,
@@ -153,7 +190,8 @@ impl OrkaGuiApp {
                 let mut l = LogsState::default();
                 l.follow = self.logs.follow;
                 l.grep = String::new();
-                l.backlog = std::collections::VecDeque::with_capacity(self.logs.backlog_cap.min(256));
+                l.backlog =
+                    std::collections::VecDeque::with_capacity(self.logs.backlog_cap.min(256));
                 l.backlog_cap = self.logs.backlog_cap;
                 l.dropped = 0;
                 l.recv = 0;
@@ -179,7 +217,8 @@ impl OrkaGuiApp {
                 e.pty = self.exec.pty;
                 e.cmd = self.exec.cmd.clone();
                 e.container = self.exec.container.clone();
-                e.backlog = std::collections::VecDeque::with_capacity(self.exec.backlog_cap.min(256));
+                e.backlog =
+                    std::collections::VecDeque::with_capacity(self.exec.backlog_cap.min(256));
                 e.backlog_cap = self.exec.backlog_cap;
                 e.dropped = 0;
                 e.recv = 0;
@@ -213,7 +252,10 @@ impl OrkaGuiApp {
                 s
             },
         };
-        self.detached.push(DetachedDetailsWindow { meta: meta.clone(), state });
+        self.detached.push(DetachedDetailsWindow {
+            meta: meta.clone(),
+            state,
+        });
         ctx.request_repaint();
     }
 }

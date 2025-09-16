@@ -5,15 +5,34 @@ use orka_api::ResourceKind;
 pub mod highlight;
 
 pub(crate) fn gvk_label(k: &ResourceKind) -> String {
-    if k.group.is_empty() { format!("{}/{}", k.version, k.kind) } else { format!("{}/{}/{}", k.group, k.version, k.kind) }
+    if k.group.is_empty() {
+        format!("{}/{}", k.version, k.kind)
+    } else {
+        format!("{}/{}/{}", k.group, k.version, k.kind)
+    }
 }
 
 pub(crate) fn parse_gvk_key_to_kind(key: &str) -> ResourceKind {
     let parts: Vec<&str> = key.split('/').collect();
     match parts.as_slice() {
-        [version, kind] => ResourceKind { group: String::new(), version: (*version).to_string(), kind: (*kind).to_string(), namespaced: true },
-        [group, version, kind] => ResourceKind { group: (*group).to_string(), version: (*version).to_string(), kind: (*kind).to_string(), namespaced: true },
-        _ => ResourceKind { group: String::new(), version: String::new(), kind: key.to_string(), namespaced: true },
+        [version, kind] => ResourceKind {
+            group: String::new(),
+            version: (*version).to_string(),
+            kind: (*kind).to_string(),
+            namespaced: true,
+        },
+        [group, version, kind] => ResourceKind {
+            group: (*group).to_string(),
+            version: (*version).to_string(),
+            kind: (*kind).to_string(),
+            namespaced: true,
+        },
+        _ => ResourceKind {
+            group: String::new(),
+            version: String::new(),
+            kind: key.to_string(),
+            namespaced: true,
+        },
     }
 }
 

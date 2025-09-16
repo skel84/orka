@@ -4,9 +4,9 @@
 #![forbid(unsafe_code)]
 
 use anyhow::{Context, Result};
-use std::io::Seek;
 use metrics::{counter, histogram};
 use serde::{Deserialize, Serialize};
+use std::io::Seek;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LastApplied {
@@ -21,12 +21,11 @@ pub trait Store {
     fn get_last(&self, uid: [u8; 16], limit: Option<usize>) -> Result<Vec<LastApplied>>;
 }
 
-
 /// Append-only log store (pure Rust). Format per record:
 /// [ts_i64][uid[16]][rv_len_u32][yaml_len_u32][rv_bytes][yaml_bytes]
 pub struct LogStore {
     file: std::sync::Mutex<std::fs::File>,
-    index: std::sync::Mutex<std::collections::HashMap<[u8;16], Vec<u64>>>,
+    index: std::sync::Mutex<std::collections::HashMap<[u8; 16], Vec<u64>>>,
     path: String,
 }
 
@@ -38,9 +37,14 @@ impl LogStore {
 
     pub fn open(path: &str) -> Result<Self> {
         let started = std::time::Instant::now();
-        let f = std::fs::OpenOptions::new().read(true).create(true).append(true).open(path)
+        let f = std::fs::OpenOptions::new()
+            .read(true)
+            .create(true)
+            .append(true)
+            .open(path)
             .with_context(|| format!("opening log store at {}", path))?;
-        let mut idx: std::collections::HashMap<[u8;16], Vec<u64>> = std::collections::HashMap::new();
+        let mut idx: std::collections::HashMap<[u8; 16], Vec<u64>> =
+            std::collections::HashMap::new();
         // Walk the file to build in-memory offsets per uid
         let mut rf = std::fs::File::open(path)?;
         let mut off: u64 = 0;
@@ -51,7 +55,11 @@ impl LogStore {
             match std::io::Read::read_exact(&mut rf, &mut buf8) {
                 Ok(()) => {}
                 Err(e) => {
-                    if e.kind() == std::io::ErrorKind::UnexpectedEof { break; } else { return Err(e.into()); }
+                    if e.kind() == std::io::ErrorKind::UnexpectedEof {
+                        break;
+                    } else {
+                        return Err(e.into());
+                    }
                 }
             }
             let ts_le = i64::from_le_bytes(buf8);
@@ -79,7 +87,11 @@ impl LogStore {
             off += skip;
         }
         histogram!("persist_open_ms", started.elapsed().as_secs_f64() * 1000.0);
-        Ok(Self { file: std::sync::Mutex::new(f), index: std::sync::Mutex::new(idx), path: path.to_string() })
+        Ok(Self {
+            file: std::sync::Mutex::new(f),
+            index: std::sync::Mutex::new(idx),
+            path: path.to_string(),
+        })
     }
 }
 
@@ -88,7 +100,8 @@ impl Store for LogStore {
         let started = std::time::Instant::now();
         let mut f = self.file.lock().unwrap();
         // Prepare buffers
-        let mut rec: Vec<u8> = Vec::with_capacity(8 + 16 + 4 + 4 + la.rv.len() + la.yaml_zstd.len());
+        let mut rec: Vec<u8> =
+            Vec::with_capacity(8 + 16 + 4 + 4 + la.rv.len() + la.yaml_zstd.len());
         rec.extend_from_slice(&la.ts.to_le_bytes());
         rec.extend_from_slice(&la.uid);
         rec.extend_from_slice(&(la.rv.len() as u32).to_le_bytes());
@@ -103,7 +116,12 @@ impl Store for LogStore {
         let mut idx = self.index.lock().unwrap();
         idx.entry(la.uid).or_default().push(off);
         // Optional prune vector size to last few offsets (index only)
-        if let Some(v) = idx.get_mut(&la.uid) { if v.len() > 64 { let keep = v.split_off(v.len() - 64); *v = keep; } }
+        if let Some(v) = idx.get_mut(&la.uid) {
+            if v.len() > 64 {
+                let keep = v.split_off(v.len() - 64);
+                *v = keep;
+            }
+        }
         histogram!("persist_put_ms", started.elapsed().as_secs_f64() * 1000.0);
         counter!("persist_put_total", 1u64);
         Ok(())
@@ -138,13 +156,17 @@ impl Store for LogStore {
             // yaml
             let mut yaml_bytes = vec![0u8; yaml_len];
             std::io::Read::read_exact(&mut rf, &mut yaml_bytes)?;
-            out.push(LastApplied { uid, rv: String::from_utf8_lossy(&rv_bytes).to_string(), ts, yaml_zstd: yaml_bytes });
+            out.push(LastApplied {
+                uid,
+                rv: String::from_utf8_lossy(&rv_bytes).to_string(),
+                ts,
+                yaml_zstd: yaml_bytes,
+            });
         }
         histogram!("persist_get_ms", started.elapsed().as_secs_f64() * 1000.0);
         Ok(out)
     }
 }
-
 
 fn default_log_path() -> String {
     if let Some(home) = std::env::var_os("HOME") {
@@ -159,15 +181,21 @@ fn default_log_path() -> String {
 
 pub fn now_ts() -> i64 {
     // seconds since epoch
-    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default();
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default();
     now.as_secs() as i64
 }
 
 pub fn maybe_compress(yaml: &str) -> Vec<u8> {
     #[cfg(feature = "zstd")]
     {
-        let lvl: i32 = std::env::var("ORKA_ZSTD_LEVEL").ok().and_then(|s| s.parse().ok()).unwrap_or(3);
-        return zstd::encode_all(yaml.as_bytes(), lvl as i32).unwrap_or_else(|_| yaml.as_bytes().to_vec());
+        let lvl: i32 = std::env::var("ORKA_ZSTD_LEVEL")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(3);
+        return zstd::encode_all(yaml.as_bytes(), lvl as i32)
+            .unwrap_or_else(|_| yaml.as_bytes().to_vec());
     }
     yaml.as_bytes().to_vec()
 }
@@ -190,7 +218,13 @@ mod tests {
 
     fn temp_log() -> String {
         let dir = std::env::temp_dir();
-        let f = format!("orka-test-{}.log", std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos());
+        let f = format!(
+            "orka-test-{}.log",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        );
         dir.join(f).to_string_lossy().to_string()
     }
 
@@ -200,7 +234,12 @@ mod tests {
         let s = LogStore::open(&path).unwrap();
         let uid = [9u8; 16];
         for i in 0..5 {
-            let la = LastApplied { uid, rv: format!("rv-{}", i), ts: i as i64, yaml_zstd: maybe_compress(&format!("k: v{}\n", i)) };
+            let la = LastApplied {
+                uid,
+                rv: format!("rv-{}", i),
+                ts: i as i64,
+                yaml_zstd: maybe_compress(&format!("k: v{}\n", i)),
+            };
             s.put_last(la).unwrap();
         }
         let rows = s.get_last(uid, Some(3)).unwrap();

@@ -1,33 +1,47 @@
 #![forbid(unsafe_code)]
 
-use std::time::Instant;
-use eframe::egui;
 use chrono::{DateTime, Utc};
+use eframe::egui;
+use std::time::Instant;
 
 use orka_api::LiteEvent;
-use orka_core::{LiteObj, Uid};
-use std::collections::HashMap;
-use orka_core::columns::ColumnSpec;
 use orka_api::ResourceKind;
 use orka_api::{OpsCaps, PortForwardEvent};
+use orka_core::columns::ColumnSpec;
+use orka_core::{LiteObj, Uid};
+use std::collections::HashMap;
 
-use tokio::task::JoinHandle;
 use std::sync::mpsc;
-
+use tokio::task::JoinHandle;
 
 #[derive(Debug)]
 pub enum UiUpdate {
     Snapshot(Vec<LiteObj>),
     Event(LiteEvent),
     Error(String),
-    Detail { uid: Uid, text: String, containers: Option<Vec<String>>, produced_at: Instant },
+    Detail {
+        uid: Uid,
+        text: String,
+        containers: Option<Vec<String>>,
+        produced_at: Instant,
+    },
     // For Secret resources: deliver decoded entries (key + data), values redacted in Details YAML
-    SecretReady { uid: Uid, entries: Vec<SecretEntry> },
+    SecretReady {
+        uid: Uid,
+        entries: Vec<SecretEntry>,
+    },
     DetailError(String),
     Namespaces(Vec<String>),
     Epoch(u64),
-    MetricsReady { index_bytes: Option<u64>, index_docs: Option<u64> },
-    SearchResults { hits: Vec<(Uid, f32)>, explain: SearchExplain, partial: bool },
+    MetricsReady {
+        index_bytes: Option<u64>,
+        index_docs: Option<u64>,
+    },
+    SearchResults {
+        hits: Vec<(Uid, f32)>,
+        explain: SearchExplain,
+        partial: bool,
+    },
     SearchError(String),
     // Logs streaming updates
     LogStarted(orka_api::CancelHandle),
@@ -54,9 +68,16 @@ pub enum UiUpdate {
     PodPorts(Vec<PfPort>),
     // Edit tab updates
     EditStatus(String),
-    EditDryRunDone { summary: String },
-    EditDiffDone { live: String, last: Option<String> },
-    EditApplyDone { message: String },
+    EditDryRunDone {
+        summary: String,
+    },
+    EditDiffDone {
+        live: String,
+        last: Option<String>,
+    },
+    EditApplyDone {
+        message: String,
+    },
     // Ops updates
     OpsCaps(OpsCaps),
     OpsStatus(String),
@@ -66,22 +87,52 @@ pub enum UiUpdate {
     // Stats updates
     StatsReady(orka_api::Stats),
     // Detached windows: per-window details ready/error
-    DetachedDetail { id: egui::ViewportId, uid: Uid, text: String, produced_at: Instant },
-    DetachedDetailError { id: egui::ViewportId, error: String },
+    DetachedDetail {
+        id: egui::ViewportId,
+        uid: Uid,
+        text: String,
+        produced_at: Instant,
+    },
+    DetachedDetailError {
+        id: egui::ViewportId,
+        error: String,
+    },
     // Detached -> Reattach request
-    ReattachDetached { id: egui::ViewportId, uid: Uid },
+    ReattachDetached {
+        id: egui::ViewportId,
+        uid: Uid,
+    },
     // Describe output for Details pane
-    DescribeReady { uid: Uid, text: String },
-    DescribeError { uid: Uid, error: String },
+    DescribeReady {
+        uid: Uid,
+        text: String,
+    },
+    DescribeError {
+        uid: Uid,
+        error: String,
+    },
     // Graph output for Details pane
-    GraphReady { uid: Uid, text: String },
-    GraphError { uid: Uid, error: String },
+    GraphReady {
+        uid: Uid,
+        text: String,
+    },
+    GraphError {
+        uid: Uid,
+        error: String,
+    },
     // Atlas graph model for interactive rendering
-    GraphModelReady { uid: Uid, model: GraphModel },
+    GraphModelReady {
+        uid: Uid,
+        model: GraphModel,
+    },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum VirtualMode { Auto, On, Off }
+pub enum VirtualMode {
+    Auto,
+    On,
+    Off,
+}
 
 #[derive(Clone, Default, Debug)]
 pub struct SearchExplain {
@@ -171,10 +222,19 @@ pub struct DetailsState {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum DetailsPaneTab { Edit, Logs, SvcLogs, Exec, Describe, Graph }
+pub enum DetailsPaneTab {
+    Edit,
+    Logs,
+    SvcLogs,
+    Exec,
+    Describe,
+    Graph,
+}
 
 impl Default for DetailsPaneTab {
-    fn default() -> Self { DetailsPaneTab::Describe }
+    fn default() -> Self {
+        DetailsPaneTab::Describe
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -276,10 +336,17 @@ pub struct ServiceLogsState {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum PrefixTheme { Bright, Basic, Gray, None }
+pub enum PrefixTheme {
+    Bright,
+    Basic,
+    Gray,
+    None,
+}
 
 impl Default for PrefixTheme {
-    fn default() -> Self { PrefixTheme::Bright }
+    fn default() -> Self {
+        PrefixTheme::Bright
+    }
 }
 
 #[derive(Clone)]
@@ -315,7 +382,12 @@ pub struct OpsState {
 }
 
 #[derive(Clone, Debug)]
-pub struct PfInfo { pub namespace: String, pub pod: String, pub local: u16, pub remote: u16 }
+pub struct PfInfo {
+    pub namespace: String,
+    pub pod: String,
+    pub local: u16,
+    pub remote: u16,
+}
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PfPort {
@@ -439,7 +511,12 @@ pub struct WatchState {
 // --------- Toasts ---------
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum ToastKind { Info, Success, Error, Warn }
+pub enum ToastKind {
+    Info,
+    Success,
+    Error,
+    Warn,
+}
 
 #[derive(Clone, Debug)]
 pub struct Toast {
@@ -470,9 +547,16 @@ pub struct StatsState {
 // --------- Atlas/Graph Model ---------
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum GraphViewMode { Classic, Atlas }
+pub enum GraphViewMode {
+    Classic,
+    Atlas,
+}
 
-impl Default for GraphViewMode { fn default() -> Self { GraphViewMode::Classic } }
+impl Default for GraphViewMode {
+    fn default() -> Self {
+        GraphViewMode::Classic
+    }
+}
 
 #[derive(Clone, Debug, Default)]
 pub struct GraphModel {

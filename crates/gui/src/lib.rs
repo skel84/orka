@@ -11,8 +11,8 @@ use orka_core::columns::{ColumnKind, ColumnSpec};
 use orka_core::{LiteObj, Uid};
 use tracing::info;
 
-mod details;
 mod atlas;
+mod details;
 mod logs;
 mod model;
 mod nav;

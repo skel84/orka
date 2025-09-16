@@ -5,7 +5,10 @@
 
 use anyhow::{anyhow, Result};
 use futures::StreamExt;
-use kube::{api::{Api, LogParams, Patch, PatchParams, PostParams, ListParams, DeleteParams}, Client};
+use kube::{
+    api::{Api, DeleteParams, ListParams, LogParams, Patch, PatchParams, PostParams},
+    Client,
+};
 use serde::{Deserialize, Serialize};
 use tokio::sync::{mpsc, oneshot};
 use tracing::{info, warn};
@@ -35,7 +38,9 @@ pub struct CancelHandle {
 
 impl CancelHandle {
     pub fn cancel(mut self) {
-        if let Some(tx) = self.tx.take() { let _ = tx.send(()); }
+        if let Some(tx) = self.tx.take() {
+            let _ = tx.send(());
+        }
     }
 }
 
@@ -65,16 +70,65 @@ pub struct ExecDuplexHandle {
 #[async_trait::async_trait]
 pub trait OrkaOps: Send + Sync {
     /// Stream logs from a pod/container.
-    async fn logs(&self, namespace: Option<&str>, pod: &str, container: Option<&str>, opts: LogOptions) -> Result<StreamHandle<LogChunk>>;
+    async fn logs(
+        &self,
+        namespace: Option<&str>,
+        pod: &str,
+        container: Option<&str>,
+        opts: LogOptions,
+    ) -> Result<StreamHandle<LogChunk>>;
 
     // Stubs for upcoming ops in this milestone
-    async fn exec(&self, namespace: Option<&str>, pod: &str, container: Option<&str>, cmd: &[String], pty: bool) -> Result<()> { Err(anyhow!("exec: not implemented yet")) }
+    async fn exec(
+        &self,
+        namespace: Option<&str>,
+        pod: &str,
+        container: Option<&str>,
+        cmd: &[String],
+        pty: bool,
+    ) -> Result<()> {
+        Err(anyhow!("exec: not implemented yet"))
+    }
     /// Start an interactive exec session returning a duplex handle.
-    async fn exec_stream(&self, namespace: Option<&str>, pod: &str, container: Option<&str>, cmd: &[String], pty: bool) -> Result<ExecDuplexHandle> { Err(anyhow!("exec_stream: not implemented yet")) }
-    async fn port_forward(&self, namespace: Option<&str>, pod: &str, local: u16, remote: u16) -> Result<StreamHandle<ForwardEvent>> { Err(anyhow!("port-forward: not implemented yet")) }
-    async fn scale(&self, gvk_key: &str, namespace: Option<&str>, name: &str, replicas: i32, use_subresource: bool) -> Result<()>;
-    async fn rollout_restart(&self, gvk_key: &str, namespace: Option<&str>, name: &str) -> Result<()>;
-    async fn delete_pod(&self, namespace: &str, pod: &str, grace_seconds: Option<i64>) -> Result<()>;
+    async fn exec_stream(
+        &self,
+        namespace: Option<&str>,
+        pod: &str,
+        container: Option<&str>,
+        cmd: &[String],
+        pty: bool,
+    ) -> Result<ExecDuplexHandle> {
+        Err(anyhow!("exec_stream: not implemented yet"))
+    }
+    async fn port_forward(
+        &self,
+        namespace: Option<&str>,
+        pod: &str,
+        local: u16,
+        remote: u16,
+    ) -> Result<StreamHandle<ForwardEvent>> {
+        Err(anyhow!("port-forward: not implemented yet"))
+    }
+    async fn scale(
+        &self,
+        gvk_key: &str,
+        namespace: Option<&str>,
+        name: &str,
+        replicas: i32,
+        use_subresource: bool,
+    ) -> Result<()>;
+    async fn rollout_restart(
+        &self,
+        gvk_key: &str,
+        namespace: Option<&str>,
+        name: &str,
+    ) -> Result<()>;
+    async fn delete_pod(
+        &self,
+        namespace: &str,
+        pod: &str,
+        grace_seconds: Option<i64>,
+    ) -> Result<()>;
     async fn cordon(&self, node: &str, on: bool) -> Result<()>;
     async fn drain(&self, node: &str) -> Result<()>;
 
@@ -86,11 +140,15 @@ pub trait OrkaOps: Send + Sync {
 pub struct KubeOps;
 
 impl KubeOps {
-    pub fn new() -> Self { Self }
+    pub fn new() -> Self {
+        Self
+    }
 }
 
 impl Default for KubeOps {
-    fn default() -> Self { Self::new() }
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -113,11 +171,24 @@ pub struct ScaleCaps {
 }
 
 impl KubeOps {
-    async fn ssar_check(client: Client, ns: Option<&str>, group: &str, resource: &str, subresource: Option<&str>, verb: &str) -> Result<bool> {
-        use k8s_openapi::api::authorization::v1::{ResourceAttributes, SelfSubjectAccessReview, SelfSubjectAccessReviewSpec};
+    async fn ssar_check(
+        client: Client,
+        ns: Option<&str>,
+        group: &str,
+        resource: &str,
+        subresource: Option<&str>,
+        verb: &str,
+    ) -> Result<bool> {
+        use k8s_openapi::api::authorization::v1::{
+            ResourceAttributes, SelfSubjectAccessReview, SelfSubjectAccessReviewSpec,
+        };
         let api: Api<SelfSubjectAccessReview> = Api::all(client);
         let ra = ResourceAttributes {
-            group: if group.is_empty() { None } else { Some(group.to_string()) },
+            group: if group.is_empty() {
+                None
+            } else {
+                Some(group.to_string())
+            },
             resource: Some(resource.to_string()),
             subresource: subresource.map(|s| s.to_string()),
             verb: Some(verb.to_string()),
@@ -125,7 +196,10 @@ impl KubeOps {
             ..Default::default()
         };
         let ssar = SelfSubjectAccessReview {
-            spec: SelfSubjectAccessReviewSpec { resource_attributes: Some(ra), ..Default::default() },
+            spec: SelfSubjectAccessReviewSpec {
+                resource_attributes: Some(ra),
+                ..Default::default()
+            },
             ..Default::default()
         };
         let created = api.create(&PostParams::default(), &ssar).await?;
@@ -134,31 +208,98 @@ impl KubeOps {
 
     /// Discover imperative ops capabilities (subresources + RBAC) for current user.
     /// If `scale_gvk` is provided (e.g. "apps/v1/Deployment"), also probes Scale subresource.
-    pub async fn discover_caps(namespace: Option<&str>, scale_gvk: Option<&str>) -> Result<OpsCaps> {
+    pub async fn discover_caps(
+        namespace: Option<&str>,
+        scale_gvk: Option<&str>,
+    ) -> Result<OpsCaps> {
         let client = orka_kubehub::get_kube_client().await?;
         let ns_owned = namespace.map(|s| s.to_string());
         // Pods subresources (namespace-scoped)
-        let pods_log_get = KubeOps::ssar_check(client.clone(), namespace, "", "pods", Some("log"), "get").await.unwrap_or(false);
-        let pods_exec_create = KubeOps::ssar_check(client.clone(), namespace, "", "pods", Some("exec"), "create").await.unwrap_or(false);
-        let pods_portforward_create = KubeOps::ssar_check(client.clone(), namespace, "", "pods", Some("portforward"), "create").await.unwrap_or(false);
+        let pods_log_get =
+            KubeOps::ssar_check(client.clone(), namespace, "", "pods", Some("log"), "get")
+                .await
+                .unwrap_or(false);
+        let pods_exec_create = KubeOps::ssar_check(
+            client.clone(),
+            namespace,
+            "",
+            "pods",
+            Some("exec"),
+            "create",
+        )
+        .await
+        .unwrap_or(false);
+        let pods_portforward_create = KubeOps::ssar_check(
+            client.clone(),
+            namespace,
+            "",
+            "pods",
+            Some("portforward"),
+            "create",
+        )
+        .await
+        .unwrap_or(false);
         // Nodes patch (cluster-scoped)
-        let nodes_patch = KubeOps::ssar_check(client.clone(), None, "", "nodes", None, "patch").await.unwrap_or(false);
+        let nodes_patch = KubeOps::ssar_check(client.clone(), None, "", "nodes", None, "patch")
+            .await
+            .unwrap_or(false);
         // Eviction create (namespace-scoped, group=policy)
-        let pods_eviction_create = match namespace { Some(ns) => Some(KubeOps::ssar_check(client.clone(), Some(ns), "policy", "pods", Some("eviction"), "create").await.unwrap_or(false)), None => None };
+        let pods_eviction_create = match namespace {
+            Some(ns) => Some(
+                KubeOps::ssar_check(
+                    client.clone(),
+                    Some(ns),
+                    "policy",
+                    "pods",
+                    Some("eviction"),
+                    "create",
+                )
+                .await
+                .unwrap_or(false),
+            ),
+            None => None,
+        };
 
         // Scale subresource for provided GVK
         let mut scale_caps: Option<ScaleCaps> = None;
         if let Some(gvk_key) = scale_gvk {
             use kube::core::GroupVersionKind;
             let (group, version, kind) = parse_gvk_key(gvk_key)?;
-            let gvk = GroupVersionKind { group, version, kind };
+            let gvk = GroupVersionKind {
+                group,
+                version,
+                kind,
+            };
             let (ar, namespaced) = find_api_resource(client.clone(), &gvk).await?;
             let resource = ar.plural.clone();
             // Check patch on subresource 'scale'
-            let sub_patch = KubeOps::ssar_check(client.clone(), if namespaced { namespace } else { None }, ar.group.as_str(), resource.as_str(), Some("scale"), "patch").await.unwrap_or(false);
+            let sub_patch = KubeOps::ssar_check(
+                client.clone(),
+                if namespaced { namespace } else { None },
+                ar.group.as_str(),
+                resource.as_str(),
+                Some("scale"),
+                "patch",
+            )
+            .await
+            .unwrap_or(false);
             // Check patch on main resource (SSA fallback of .spec.replicas)
-            let spec_patch = KubeOps::ssar_check(client.clone(), if namespaced { namespace } else { None }, ar.group.as_str(), resource.as_str(), None, "patch").await.unwrap_or(false);
-            scale_caps = Some(ScaleCaps { gvk: format!("{}/{}/{}", ar.group, ar.version, ar.kind), resource, subresource_patch: sub_patch, spec_replicas_patch: spec_patch });
+            let spec_patch = KubeOps::ssar_check(
+                client.clone(),
+                if namespaced { namespace } else { None },
+                ar.group.as_str(),
+                resource.as_str(),
+                None,
+                "patch",
+            )
+            .await
+            .unwrap_or(false);
+            scale_caps = Some(ScaleCaps {
+                gvk: format!("{}/{}/{}", ar.group, ar.version, ar.kind),
+                resource,
+                subresource_patch: sub_patch,
+                spec_replicas_patch: spec_patch,
+            });
         }
 
         Ok(OpsCaps {
@@ -181,7 +322,13 @@ impl KubeOps {
 
 #[async_trait::async_trait]
 impl OrkaOps for KubeOps {
-    async fn logs(&self, namespace: Option<&str>, pod: &str, container: Option<&str>, opts: LogOptions) -> Result<StreamHandle<LogChunk>> {
+    async fn logs(
+        &self,
+        namespace: Option<&str>,
+        pod: &str,
+        container: Option<&str>,
+        opts: LogOptions,
+    ) -> Result<StreamHandle<LogChunk>> {
         use k8s_openapi::api::core::v1::Pod;
 
         let client = orka_kubehub::get_kube_client().await?;
@@ -190,13 +337,25 @@ impl OrkaOps for KubeOps {
             None => return Err(anyhow!("namespace is required for pod logs")),
         };
 
-        let mut lp = LogParams { follow: opts.follow, tail_lines: opts.tail_lines, since_seconds: opts.since_seconds, ..Default::default() };
-        if let Some(c) = container { lp.container = Some(c.to_string()); }
+        let mut lp = LogParams {
+            follow: opts.follow,
+            tail_lines: opts.tail_lines,
+            since_seconds: opts.since_seconds,
+            ..Default::default()
+        };
+        if let Some(c) = container {
+            lp.container = Some(c.to_string());
+        }
 
-        let cap = std::env::var("ORKA_OPS_QUEUE_CAP").ok().and_then(|s| s.parse().ok()).unwrap_or(1024);
+        let cap = std::env::var("ORKA_OPS_QUEUE_CAP")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(1024);
         let (tx, rx) = mpsc::channel::<LogChunk>(cap);
         let (cancel_tx, cancel_rx) = oneshot::channel::<()>();
-        let cancel = CancelHandle { tx: Some(cancel_tx) };
+        let cancel = CancelHandle {
+            tx: Some(cancel_tx),
+        };
 
         // Spawn a task to stream logs and forward into bounded channel.
         let pod_name = pod.to_string();
@@ -207,7 +366,10 @@ impl OrkaOps for KubeOps {
             let stream_res = api.log_stream(&pod_name, &lp).await;
             let reader = match stream_res {
                 Ok(r) => r,
-                Err(e) => { warn!(error = %e, "log_stream failed to open"); return; }
+                Err(e) => {
+                    warn!(error = %e, "log_stream failed to open");
+                    return;
+                }
             };
             // Convert futures::io::AsyncRead into tokio::io::AsyncRead, then into a bytes Stream
             let compat_reader = reader.compat();
@@ -218,22 +380,43 @@ impl OrkaOps for KubeOps {
         Ok(StreamHandle { rx, cancel })
     }
 
-    async fn exec(&self, namespace: Option<&str>, pod: &str, container: Option<&str>, cmd: &[String], pty: bool) -> Result<()> {
+    async fn exec(
+        &self,
+        namespace: Option<&str>,
+        pod: &str,
+        container: Option<&str>,
+        cmd: &[String],
+        pty: bool,
+    ) -> Result<()> {
+        use futures::SinkExt;
         use k8s_openapi::api::core::v1::Pod;
         use kube::api::{AttachParams, TerminalSize};
-        use futures::SinkExt;
-        use tokio::io::AsyncWriteExt;
         use std::io::Read;
+        use tokio::io::AsyncWriteExt;
 
         struct RawGuard;
-        impl Drop for RawGuard { fn drop(&mut self) { let _ = crossterm::terminal::disable_raw_mode(); } }
+        impl Drop for RawGuard {
+            fn drop(&mut self) {
+                let _ = crossterm::terminal::disable_raw_mode();
+            }
+        }
 
         let ns = namespace.ok_or_else(|| anyhow!("namespace is required for exec"))?;
         let client = orka_kubehub::get_kube_client().await?;
         let api: Api<Pod> = Api::namespaced(client, ns);
-        let mut ap = if pty { AttachParams::interactive_tty() } else { AttachParams::default() };
-        if let Some(c) = container { ap = ap.container(c); }
-        if pty { ap = ap.stderr(false); } else { ap = ap.stdout(true).stderr(true); }
+        let mut ap = if pty {
+            AttachParams::interactive_tty()
+        } else {
+            AttachParams::default()
+        };
+        if let Some(c) = container {
+            ap = ap.container(c);
+        }
+        if pty {
+            ap = ap.stderr(false);
+        } else {
+            ap = ap.stdout(true).stderr(true);
+        }
 
         let mut attached = api.exec(pod, cmd.to_vec(), &ap).await?;
 
@@ -244,7 +427,12 @@ impl OrkaOps for KubeOps {
             // Initial size and SIGWINCH updates
             if let Some(mut tx) = attached.terminal_size() {
                 let (w, h) = crossterm::terminal::size().unwrap_or((80, 24));
-                let _ = tx.send(TerminalSize { height: h, width: w }).await;
+                let _ = tx
+                    .send(TerminalSize {
+                        height: h,
+                        width: w,
+                    })
+                    .await;
                 #[cfg(unix)]
                 {
                     use tokio::signal::unix::{signal, SignalKind};
@@ -252,14 +440,21 @@ impl OrkaOps for KubeOps {
                     resize_task = Some(tokio::spawn(async move {
                         while sig.recv().await.is_some() {
                             if let Ok((w, h)) = crossterm::terminal::size() {
-                                let _ = tx.send(TerminalSize { height: h, width: w }).await;
+                                let _ = tx
+                                    .send(TerminalSize {
+                                        height: h,
+                                        width: w,
+                                    })
+                                    .await;
                             }
                         }
                     }));
                 }
             }
             Some(RawGuard)
-        } else { None };
+        } else {
+            None
+        };
 
         // stdin: spawn blocking reader thread -> channel -> async writer
         let mut stdin_task = None;
@@ -272,16 +467,28 @@ impl OrkaOps for KubeOps {
                 let mut buf = [0u8; 1024];
                 loop {
                     match input.read(&mut buf) {
-                        Ok(0) => { let _ = tx.blocking_send(Vec::new()); break; }
-                        Ok(n) => { let _ = tx.blocking_send(buf[..n].to_vec()); }
-                        Err(_) => { let _ = tx.blocking_send(Vec::new()); break; }
+                        Ok(0) => {
+                            let _ = tx.blocking_send(Vec::new());
+                            break;
+                        }
+                        Ok(n) => {
+                            let _ = tx.blocking_send(buf[..n].to_vec());
+                        }
+                        Err(_) => {
+                            let _ = tx.blocking_send(Vec::new());
+                            break;
+                        }
                     }
                 }
             });
             stdin_task = Some(tokio::spawn(async move {
                 while let Some(chunk) = rx.recv().await {
-                    if chunk.is_empty() { break; }
-                    if writer.write_all(&chunk).await.is_err() { break; }
+                    if chunk.is_empty() {
+                        break;
+                    }
+                    if writer.write_all(&chunk).await.is_err() {
+                        break;
+                    }
                 }
             }));
         }
@@ -291,7 +498,9 @@ impl OrkaOps for KubeOps {
         if let Some(stdout_reader) = attached.stdout() {
             let mut stream = tokio_util::io::ReaderStream::new(stdout_reader);
             let task = tokio::spawn(async move {
-                while let Some(Ok(bytes)) = stream.next().await { print!("{}", String::from_utf8_lossy(&bytes)); }
+                while let Some(Ok(bytes)) = stream.next().await {
+                    print!("{}", String::from_utf8_lossy(&bytes));
+                }
             });
             out_task = Some(task);
         }
@@ -299,7 +508,9 @@ impl OrkaOps for KubeOps {
         if let Some(stderr_reader) = attached.stderr() {
             let mut stream = tokio_util::io::ReaderStream::new(stderr_reader);
             let task = tokio::spawn(async move {
-                while let Some(Ok(bytes)) = stream.next().await { eprint!("{}", String::from_utf8_lossy(&bytes)); }
+                while let Some(Ok(bytes)) = stream.next().await {
+                    eprint!("{}", String::from_utf8_lossy(&bytes));
+                }
             });
             err_task = Some(task);
         }
@@ -315,41 +526,78 @@ impl OrkaOps for KubeOps {
             }
         }
         // Don't await stdin task; process is over. It will end when process exits.
-        if let Some(t) = stdin_task { t.abort(); }
-        if let Some(t) = out_task { let _ = t.await; }
-        if let Some(t) = err_task { let _ = t.await; }
-        if let Some(t) = resize_task { let _ = t.await; }
+        if let Some(t) = stdin_task {
+            t.abort();
+        }
+        if let Some(t) = out_task {
+            let _ = t.await;
+        }
+        if let Some(t) = err_task {
+            let _ = t.await;
+        }
+        if let Some(t) = resize_task {
+            let _ = t.await;
+        }
         drop(_raw_guard); // ensure raw mode disabled
         Ok(())
     }
 
-    async fn exec_stream(&self, namespace: Option<&str>, pod: &str, container: Option<&str>, cmd: &[String], pty: bool) -> Result<ExecDuplexHandle> {
+    async fn exec_stream(
+        &self,
+        namespace: Option<&str>,
+        pod: &str,
+        container: Option<&str>,
+        cmd: &[String],
+        pty: bool,
+    ) -> Result<ExecDuplexHandle> {
+        use futures::SinkExt;
         use k8s_openapi::api::core::v1::Pod;
         use kube::api::{AttachParams, TerminalSize};
-        use futures::SinkExt;
 
         let ns = namespace.ok_or_else(|| anyhow!("namespace is required for exec"))?;
         let client = orka_kubehub::get_kube_client().await?;
         let api: Api<Pod> = Api::namespaced(client, ns);
-        let mut ap = if pty { AttachParams::interactive_tty() } else { AttachParams::default() };
-        if let Some(c) = container { ap = ap.container(c); }
-        if pty { ap = ap.stderr(false); } else { ap = ap.stdout(true).stderr(true); }
+        let mut ap = if pty {
+            AttachParams::interactive_tty()
+        } else {
+            AttachParams::default()
+        };
+        if let Some(c) = container {
+            ap = ap.container(c);
+        }
+        if pty {
+            ap = ap.stderr(false);
+        } else {
+            ap = ap.stdout(true).stderr(true);
+        }
 
         let mut attached = api.exec(pod, cmd.to_vec(), &ap).await?;
 
         // Output channel to caller
-        let cap = std::env::var("ORKA_OPS_QUEUE_CAP").ok().and_then(|s| s.parse().ok()).unwrap_or(1024);
+        let cap = std::env::var("ORKA_OPS_QUEUE_CAP")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(1024);
         let (tx_out, rx_out) = mpsc::channel::<ExecChunk>(cap);
         let (cancel_tx, cancel_rx) = oneshot::channel::<()>();
-        let cancel = CancelHandle { tx: Some(cancel_tx) };
+        let cancel = CancelHandle {
+            tx: Some(cancel_tx),
+        };
 
         // stdin pump: caller sends bytes here
         let (stdin_tx, mut stdin_rx) = mpsc::channel::<Vec<u8>>(64);
         if let Some(mut writer) = attached.stdin() {
             tokio::spawn(async move {
                 while let Some(buf) = stdin_rx.recv().await {
-                    if buf.is_empty() { break; }
-                    if tokio::io::AsyncWriteExt::write_all(&mut writer, &buf).await.is_err() { break; }
+                    if buf.is_empty() {
+                        break;
+                    }
+                    if tokio::io::AsyncWriteExt::write_all(&mut writer, &buf)
+                        .await
+                        .is_err()
+                    {
+                        break;
+                    }
                 }
             });
         }
@@ -361,7 +609,12 @@ impl OrkaOps for KubeOps {
             tokio::spawn(async move {
                 while let Some(item) = stream.next().await {
                     match item {
-                        Ok(bytes) => { let _ = tx.try_send(ExecChunk { bytes, stderr: false }); },
+                        Ok(bytes) => {
+                            let _ = tx.try_send(ExecChunk {
+                                bytes,
+                                stderr: false,
+                            });
+                        }
                         Err(_) => break,
                     }
                 }
@@ -375,7 +628,12 @@ impl OrkaOps for KubeOps {
                 tokio::spawn(async move {
                     while let Some(item) = stream.next().await {
                         match item {
-                            Ok(bytes) => { let _ = tx.try_send(ExecChunk { bytes, stderr: true }); },
+                            Ok(bytes) => {
+                                let _ = tx.try_send(ExecChunk {
+                                    bytes,
+                                    stderr: true,
+                                });
+                            }
                             Err(_) => break,
                         }
                     }
@@ -389,12 +647,21 @@ impl OrkaOps for KubeOps {
                 let (tx, mut rx) = mpsc::channel::<(u16, u16)>(8);
                 tokio::spawn(async move {
                     while let Some((cols, rows)) = rx.recv().await {
-                        let _ = term_size_tx.send(TerminalSize { width: cols, height: rows }).await;
+                        let _ = term_size_tx
+                            .send(TerminalSize {
+                                width: cols,
+                                height: rows,
+                            })
+                            .await;
                     }
                 });
                 Some(tx)
-            } else { None }
-        } else { None };
+            } else {
+                None
+            }
+        } else {
+            None
+        };
 
         // Join or cancel watcher: dropping this task closes the session
         tokio::spawn(async move {
@@ -405,23 +672,50 @@ impl OrkaOps for KubeOps {
             // dropping attached ends IO pumps
         });
 
-        Ok(ExecDuplexHandle { rx: rx_out, stdin_tx, resize_tx, cancel })
+        Ok(ExecDuplexHandle {
+            rx: rx_out,
+            stdin_tx,
+            resize_tx,
+            cancel,
+        })
     }
 
-    async fn port_forward(&self, namespace: Option<&str>, pod: &str, local: u16, remote: u16) -> Result<StreamHandle<ForwardEvent>> {
+    async fn port_forward(
+        &self,
+        namespace: Option<&str>,
+        pod: &str,
+        local: u16,
+        remote: u16,
+    ) -> Result<StreamHandle<ForwardEvent>> {
         let ns = namespace.ok_or_else(|| anyhow!("namespace is required for port-forward"))?;
         KubeOps::pf_internal(ns, pod, local, remote).await
     }
 
-    async fn scale(&self, gvk_key: &str, namespace: Option<&str>, name: &str, replicas: i32, use_subresource: bool) -> Result<()> {
+    async fn scale(
+        &self,
+        gvk_key: &str,
+        namespace: Option<&str>,
+        name: &str,
+        replicas: i32,
+        use_subresource: bool,
+    ) -> Result<()> {
         use kube::core::{DynamicObject, GroupVersionKind};
         let client = orka_kubehub::get_kube_client().await?;
         let (group, version, kind) = parse_gvk_key(gvk_key)?;
-        let gvk = GroupVersionKind { group, version, kind };
+        let gvk = GroupVersionKind {
+            group,
+            version,
+            kind,
+        };
         let (ar, namespaced) = find_api_resource(client.clone(), &gvk).await?;
         let api_do: Api<DynamicObject> = if namespaced {
-            match namespace { Some(ns) => Api::namespaced_with(client.clone(), ns, &ar), None => return Err(anyhow!("namespace required for namespaced kind")), }
-        } else { Api::all_with(client.clone(), &ar) };
+            match namespace {
+                Some(ns) => Api::namespaced_with(client.clone(), ns, &ar),
+                None => return Err(anyhow!("namespace required for namespaced kind")),
+            }
+        } else {
+            Api::all_with(client.clone(), &ar)
+        };
 
         // Try scale subresource if requested
         if use_subresource {
@@ -439,15 +733,29 @@ impl OrkaOps for KubeOps {
         Ok(())
     }
 
-    async fn rollout_restart(&self, gvk_key: &str, namespace: Option<&str>, name: &str) -> Result<()> {
-        use kube::{core::{DynamicObject, GroupVersionKind}};
+    async fn rollout_restart(
+        &self,
+        gvk_key: &str,
+        namespace: Option<&str>,
+        name: &str,
+    ) -> Result<()> {
+        use kube::core::{DynamicObject, GroupVersionKind};
         let client = orka_kubehub::get_kube_client().await?;
         let (group, version, kind) = parse_gvk_key(gvk_key)?;
-        let gvk = GroupVersionKind { group, version, kind };
+        let gvk = GroupVersionKind {
+            group,
+            version,
+            kind,
+        };
         let (ar, namespaced) = find_api_resource(client.clone(), &gvk).await?;
         let api_do: Api<DynamicObject> = if namespaced {
-            match namespace { Some(ns) => Api::namespaced_with(client.clone(), ns, &ar), None => return Err(anyhow!("namespace required for namespaced kind")), }
-        } else { Api::all_with(client.clone(), &ar) };
+            match namespace {
+                Some(ns) => Api::namespaced_with(client.clone(), ns, &ar),
+                None => return Err(anyhow!("namespace required for namespaced kind")),
+            }
+        } else {
+            Api::all_with(client.clone(), &ar)
+        };
         let ts = chrono::Utc::now().to_rfc3339();
         let patch = serde_json::json!({
             "spec": {"template": {"metadata": {"annotations": {"kubectl.kubernetes.io/restartedAt": ts}}}}
@@ -457,11 +765,19 @@ impl OrkaOps for KubeOps {
         Ok(())
     }
 
-    async fn delete_pod(&self, namespace: &str, pod: &str, grace_seconds: Option<i64>) -> Result<()> {
+    async fn delete_pod(
+        &self,
+        namespace: &str,
+        pod: &str,
+        grace_seconds: Option<i64>,
+    ) -> Result<()> {
         use k8s_openapi::api::core::v1::Pod;
         let client = orka_kubehub::get_kube_client().await?;
         let api: Api<Pod> = Api::namespaced(client, namespace);
-        let dp = DeleteParams { grace_period_seconds: grace_seconds.map(|v| v as u32), ..Default::default() };
+        let dp = DeleteParams {
+            grace_period_seconds: grace_seconds.map(|v| v as u32),
+            ..Default::default()
+        };
         let _ = api.delete(pod, &dp).await?;
         Ok(())
     }
@@ -483,30 +799,52 @@ impl OrkaOps for KubeOps {
         let all_pods: Api<Pod> = Api::all(client.clone());
         let lp = ListParams::default().fields(&format!("spec.nodeName={}", node));
 
-        let timeout_secs: u64 = std::env::var("ORKA_DRAIN_TIMEOUT_SECS").ok().and_then(|s| s.parse().ok()).unwrap_or(300);
-        let poll_secs: u64 = std::env::var("ORKA_DRAIN_POLL_SECS").ok().and_then(|s| s.parse().ok()).unwrap_or(2);
+        let timeout_secs: u64 = std::env::var("ORKA_DRAIN_TIMEOUT_SECS")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(300);
+        let poll_secs: u64 = std::env::var("ORKA_DRAIN_POLL_SECS")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(2);
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(timeout_secs);
 
         // Helper to filter target pods for eviction
         let list_target = || async {
-            let mut targets: Vec<(String,String)> = Vec::new();
+            let mut targets: Vec<(String, String)> = Vec::new();
             let pods = all_pods.list(&lp).await?;
             for p in pods.items {
                 let meta = &p.metadata;
-                let ns = match meta.namespace.clone() { Some(ns) => ns, None => continue };
-                let name = match meta.name.clone() { Some(n) => n, None => continue };
+                let ns = match meta.namespace.clone() {
+                    Some(ns) => ns,
+                    None => continue,
+                };
+                let name = match meta.name.clone() {
+                    Some(n) => n,
+                    None => continue,
+                };
                 // Skip DaemonSet-managed pods (ownerReferences contains DaemonSet)
-                let skip_ds = meta.owner_references.as_ref().map(|ors| ors.iter().any(|o| o.kind == "DaemonSet")).unwrap_or(false);
+                let skip_ds = meta
+                    .owner_references
+                    .as_ref()
+                    .map(|ors| ors.iter().any(|o| o.kind == "DaemonSet"))
+                    .unwrap_or(false);
                 // Skip mirror/static pods
-                let is_mirror = meta.annotations.as_ref().and_then(|a| a.get("kubernetes.io/config.mirror")).is_some();
-                if skip_ds || is_mirror { continue; }
+                let is_mirror = meta
+                    .annotations
+                    .as_ref()
+                    .and_then(|a| a.get("kubernetes.io/config.mirror"))
+                    .is_some();
+                if skip_ds || is_mirror {
+                    continue;
+                }
                 targets.push((ns, name));
             }
-            Ok::<Vec<(String,String)>, anyhow::Error>(targets)
+            Ok::<Vec<(String, String)>, anyhow::Error>(targets)
         };
 
         // Initial eviction attempts
-        let mut pending: HashSet<(String,String)> = list_target().await?.into_iter().collect();
+        let mut pending: HashSet<(String, String)> = list_target().await?.into_iter().collect();
         let ep = kube::api::EvictParams::default();
         for (ns, name) in pending.clone().into_iter() {
             let pods_ns: Api<Pod> = Api::namespaced(client.clone(), &ns);
@@ -527,9 +865,14 @@ impl OrkaOps for KubeOps {
             // Refresh pending set from live cluster
             let fresh = list_target().await?;
             pending = fresh.into_iter().collect();
-            if pending.is_empty() { break; }
+            if pending.is_empty() {
+                break;
+            }
             if std::time::Instant::now() >= deadline {
-                let remain: Vec<String> = pending.iter().map(|(ns,n)| format!("{}/{}", ns, n)).collect();
+                let remain: Vec<String> = pending
+                    .iter()
+                    .map(|(ns, n)| format!("{}/{}", ns, n))
+                    .collect();
                 return Err(anyhow!("drain timeout; remaining: {}", remain.join(", ")));
             }
             // Re-attempt evictions for remaining pods
@@ -562,7 +905,12 @@ pub enum ForwardEvent {
 }
 
 impl KubeOps {
-    async fn pf_internal(namespace: &str, pod: &str, local: u16, remote: u16) -> Result<StreamHandle<ForwardEvent>> {
+    async fn pf_internal(
+        namespace: &str,
+        pod: &str,
+        local: u16,
+        remote: u16,
+    ) -> Result<StreamHandle<ForwardEvent>> {
         use k8s_openapi::api::core::v1::Pod;
         use tokio::net::TcpListener;
         let client = orka_kubehub::get_kube_client().await?;
@@ -570,7 +918,9 @@ impl KubeOps {
         info!(ns = %namespace, pod = %pod, local, remote, "pf: internal start");
         let (tx, rx) = mpsc::channel::<ForwardEvent>(16);
         let (cancel_tx, mut cancel_rx) = oneshot::channel::<()>();
-        let cancel = CancelHandle { tx: Some(cancel_tx) };
+        let cancel = CancelHandle {
+            tx: Some(cancel_tx),
+        };
         let bind_addr = std::env::var("ORKA_PF_BIND").unwrap_or_else(|_| "127.0.0.1".to_string());
         let listener = TcpListener::bind((bind_addr.as_str(), local)).await?;
         info!(bind = %bind_addr, local, "pf: listener bound");
@@ -633,8 +983,12 @@ impl KubeOps {
 
 /// Internal: consume a stream of bytes, split into lines, send via bounded channel.
 /// Drops lines when channel is full. Flushes last partial line on end.
-async fn pump_bytes_to_lines<S, E>(stream: S, tx: mpsc::Sender<LogChunk>, mut cancel_rx: oneshot::Receiver<()>, ctx: Option<&str>)
-where
+async fn pump_bytes_to_lines<S, E>(
+    stream: S,
+    tx: mpsc::Sender<LogChunk>,
+    mut cancel_rx: oneshot::Receiver<()>,
+    ctx: Option<&str>,
+) where
     S: futures::Stream<Item = Result<bytes::Bytes, E>>,
     E: std::fmt::Display,
 {
@@ -664,22 +1018,38 @@ where
     }
     if !buf.is_empty() {
         if let Ok(s) = std::str::from_utf8(&buf) {
-            let _ = tx.try_send(LogChunk { line: s.to_string() });
+            let _ = tx.try_send(LogChunk {
+                line: s.to_string(),
+            });
         }
     }
-    if let Some(c) = ctx { info!(ctx = %c, "log pump ended"); } else { info!("log pump ended"); }
+    if let Some(c) = ctx {
+        info!(ctx = %c, "log pump ended");
+    } else {
+        info!("log pump ended");
+    }
 }
 
 fn parse_gvk_key(key: &str) -> Result<(String, String, String)> {
     let parts: Vec<_> = key.split('/').collect();
     match parts.as_slice() {
         [version, kind] => Ok((String::new(), (*version).to_string(), (*kind).to_string())),
-        [group, version, kind] => Ok(((*group).to_string(), (*version).to_string(), (*kind).to_string())),
-        _ => Err(anyhow!("invalid gvk key: {} (expect v1/Kind or group/v1/Kind)", key)),
+        [group, version, kind] => Ok((
+            (*group).to_string(),
+            (*version).to_string(),
+            (*kind).to_string(),
+        )),
+        _ => Err(anyhow!(
+            "invalid gvk key: {} (expect v1/Kind or group/v1/Kind)",
+            key
+        )),
     }
 }
 
-async fn find_api_resource(client: Client, gvk: &kube::core::GroupVersionKind) -> Result<(kube::core::ApiResource, bool)> {
+async fn find_api_resource(
+    client: Client,
+    gvk: &kube::core::GroupVersionKind,
+) -> Result<(kube::core::ApiResource, bool)> {
     use kube::discovery::{Discovery, Scope};
     let discovery = Discovery::new(client).run().await?;
     for group in discovery.groups() {
@@ -690,7 +1060,12 @@ async fn find_api_resource(client: Client, gvk: &kube::core::GroupVersionKind) -
             }
         }
     }
-    Err(anyhow!("GVK not found: {}/{}/{}", gvk.group, gvk.version, gvk.kind))
+    Err(anyhow!(
+        "GVK not found: {}/{}/{}",
+        gvk.group,
+        gvk.version,
+        gvk.kind
+    ))
 }
 
 #[cfg(test)]
@@ -710,7 +1085,9 @@ mod tests {
         let s = stream::iter(chunks);
         pump_bytes_to_lines(s, tx, cancel_rx, Some("test")).await;
         let mut out = Vec::new();
-        while let Some(c) = rx.recv().await { out.push(c.line); }
+        while let Some(c) = rx.recv().await {
+            out.push(c.line);
+        }
         assert_eq!(out, vec!["hello", "world", "tail"]);
     }
 
@@ -727,9 +1104,17 @@ mod tests {
         pump_bytes_to_lines(s, tx, cancel_rx, Some("drop-test")).await;
         // We expect at least 1 line (the first), subsequent may be dropped due to full channel
         let mut recv = Vec::new();
-        while let Ok(Some(c)) = tokio::time::timeout(std::time::Duration::from_millis(50), rx.recv()).await { recv.push(c.line); }
+        while let Ok(Some(c)) =
+            tokio::time::timeout(std::time::Duration::from_millis(50), rx.recv()).await
+        {
+            recv.push(c.line);
+        }
         assert!(!recv.is_empty());
-        assert!(recv.len() <= 2, "expected dropping when full (got {} lines)", recv.len());
+        assert!(
+            recv.len() <= 2,
+            "expected dropping when full (got {} lines)",
+            recv.len()
+        );
     }
 
     #[tokio::test]
@@ -748,7 +1133,9 @@ mod tests {
         tokio::time::sleep(std::time::Duration::from_millis(120)).await;
         let _ = cancel_tx.send(());
         // Join with timeout to ensure it exits
-        let _ = tokio::time::timeout(std::time::Duration::from_secs(1), handle).await.expect("pump did not stop");
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(1), handle)
+            .await
+            .expect("pump did not stop");
         // Drain anything left
         let _ = tokio::time::timeout(std::time::Duration::from_millis(50), rx.recv()).await;
     }

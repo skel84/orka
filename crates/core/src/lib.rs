@@ -43,7 +43,7 @@ pub struct WorldSnapshot {
 }
 
 pub mod prelude {
-    pub use super::{Delta, DeltaKind, LiteObj, Uid, WorldSnapshot, Projector, ProjectedEntry};
+    pub use super::{Delta, DeltaKind, LiteObj, ProjectedEntry, Projector, Uid, WorldSnapshot};
 }
 
 /// Entry representing a projected field: `(PathId, RenderedValue)`

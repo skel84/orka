@@ -1,8 +1,8 @@
 #![forbid(unsafe_code)]
 
 use eframe::egui;
-use egui_table::{CellInfo, Column, HeaderCellInfo, HeaderRow, Table, TableDelegate};
 use egui::ScrollArea;
+use egui_table::{CellInfo, Column, HeaderCellInfo, HeaderRow, Table, TableDelegate};
 use orka_core::columns::ColumnKind;
 
 // render_age is used via app.display_cell_string for Age; no direct import here
@@ -30,11 +30,19 @@ impl OrkaGuiApp {
                 ui.separator();
             }
             let total = self.results.rows.len();
-            let showing = if self.results.filter.is_empty() { total.min(self.results.soft_cap) } else { self.compute_filtered_ix().len() };
+            let showing = if self.results.filter.is_empty() {
+                total.min(self.results.soft_cap)
+            } else {
+                self.compute_filtered_ix().len()
+            };
             ui.label(format!("Showing {} of {}", showing, total));
             ui.separator();
             egui::ComboBox::from_label("Rows")
-                .selected_text(match self.results.virtual_mode { VirtualMode::Auto => "Auto", VirtualMode::On => "Virtual", VirtualMode::Off => "Table" })
+                .selected_text(match self.results.virtual_mode {
+                    VirtualMode::Auto => "Auto",
+                    VirtualMode::On => "Virtual",
+                    VirtualMode::Off => "Table",
+                })
                 .show_ui(ui, |ui| {
                     ui.selectable_value(&mut self.results.virtual_mode, VirtualMode::Auto, "Auto");
                     ui.selectable_value(&mut self.results.virtual_mode, VirtualMode::On, "Virtual");
@@ -60,7 +68,9 @@ impl OrkaGuiApp {
         let should_virtual = match self.results.virtual_mode {
             VirtualMode::On => true,
             VirtualMode::Off => false,
-            VirtualMode::Auto => self.results.filter.is_empty() && filtered_ix.len() > self.results.soft_cap,
+            VirtualMode::Auto => {
+                self.results.filter.is_empty() && filtered_ix.len() > self.results.soft_cap
+            }
         };
         if should_virtual {
             self.ui_results_virtual(ui, &filtered_ix);
@@ -72,7 +82,8 @@ impl OrkaGuiApp {
                 ui.visuals().warn_fg_color,
                 format!(
                     "Large result set: showing the first {} of {}. Refine filters to narrow down.",
-                    self.results.soft_cap, self.results.rows.len()
+                    self.results.soft_cap,
+                    self.results.rows.len()
                 ),
             );
         }
@@ -80,16 +91,26 @@ impl OrkaGuiApp {
         // Build columns vector before creating the delegate to avoid borrow conflicts
         let cols_spec = self.results.active_cols.clone();
         let cols: Vec<Column> = if cols_spec.is_empty() {
-            vec![Column::new(160.0).resizable(true), Column::new(240.0).resizable(true), Column::new(70.0).resizable(true)]
+            vec![
+                Column::new(160.0).resizable(true),
+                Column::new(240.0).resizable(true),
+                Column::new(70.0).resizable(true),
+            ]
         } else {
-            cols_spec.iter().map(|c| Column::new(c.width).resizable(true)).collect()
+            cols_spec
+                .iter()
+                .map(|c| Column::new(c.width).resizable(true))
+                .collect()
         };
         if rows_len == 0 && !self.results.rows.is_empty() && !self.results.filter.is_empty() {
             ui.add_space(8.0);
             ui.label(egui::RichText::new("No matches").italics().weak());
             return;
         }
-        let mut delegate = ResultsDelegate { app: self, filtered_ix };
+        let mut delegate = ResultsDelegate {
+            app: self,
+            filtered_ix,
+        };
         Table::new()
             .id_salt("results_table")
             .headers(vec![HeaderRow::new(20.0)])
@@ -107,17 +128,27 @@ impl OrkaGuiApp {
         let mut out = Vec::with_capacity(self.results.rows.len());
         'outer: for (i, it) in self.results.rows.iter().enumerate() {
             if let Some(h) = self.results.filter_cache.get(&it.uid) {
-                if h.contains(&q) { out.push(i); continue 'outer; }
+                if h.contains(&q) {
+                    out.push(i);
+                    continue 'outer;
+                }
             } else {
                 // Fallback (rare)
                 let hay = format!(
                     "{} {} {}",
                     it.name,
                     it.namespace.as_deref().unwrap_or(""),
-                    it.projected.iter().map(|(_, v)| v.as_str()).collect::<Vec<_>>().join(" ")
+                    it.projected
+                        .iter()
+                        .map(|(_, v)| v.as_str())
+                        .collect::<Vec<_>>()
+                        .join(" ")
                 )
                 .to_lowercase();
-                if hay.contains(&q) { out.push(i); continue 'outer; }
+                if hay.contains(&q) {
+                    out.push(i);
+                    continue 'outer;
+                }
             }
         }
         out
@@ -131,13 +162,29 @@ impl OrkaGuiApp {
         ui.horizontal(|ui| {
             for (col_idx, spec) in self.results.active_cols.clone().into_iter().enumerate() {
                 let label = spec.label;
-                if label.is_empty() { continue; }
+                if label.is_empty() {
+                    continue;
+                }
                 let is_sorted = self.results.sort_col == Some(col_idx);
                 let mut text = label.to_string();
-                if is_sorted { text.push_str(if self.results.sort_asc { " ↑" } else { " ↓" }); }
-                let resp = ui.add_sized([spec.width, row_h], egui::Button::new(egui::RichText::new(text).strong()).selected(is_sorted));
+                if is_sorted {
+                    text.push_str(if self.results.sort_asc {
+                        " ↑"
+                    } else {
+                        " ↓"
+                    });
+                }
+                let resp = ui.add_sized(
+                    [spec.width, row_h],
+                    egui::Button::new(egui::RichText::new(text).strong()).selected(is_sorted),
+                );
                 if resp.clicked() {
-                    if is_sorted { self.results.sort_asc = !self.results.sort_asc; } else { self.results.sort_col = Some(col_idx); self.results.sort_asc = true; }
+                    if is_sorted {
+                        self.results.sort_asc = !self.results.sort_asc;
+                    } else {
+                        self.results.sort_col = Some(col_idx);
+                        self.results.sort_asc = true;
+                    }
                     self.results.sort_dirty = true;
                 }
             }
@@ -245,7 +292,8 @@ impl<'a> TableDelegate for ResultsDelegate<'a> {
             let col_idx = cell.col_range.start as usize;
             let label = self
                 .app
-                .results.active_cols
+                .results
+                .active_cols
                 .get(col_idx)
                 .map(|c| c.label)
                 .unwrap_or("");
@@ -254,7 +302,11 @@ impl<'a> TableDelegate for ResultsDelegate<'a> {
                 let is_sorted = self.app.results.sort_col == Some(col_idx);
                 let mut text = label.to_string();
                 if is_sorted {
-                    text.push_str(if self.app.results.sort_asc { " ↑" } else { " ↓" });
+                    text.push_str(if self.app.results.sort_asc {
+                        " ↑"
+                    } else {
+                        " ↓"
+                    });
                 }
                 let resp = ui.selectable_label(is_sorted, egui::RichText::new(text).strong());
                 if resp.clicked() {
@@ -274,7 +326,12 @@ impl<'a> TableDelegate for ResultsDelegate<'a> {
         let idx = cell.row_nr as usize;
         let real_idx = *self.filtered_ix.get(idx).unwrap_or(&idx);
         if let Some(it) = self.app.results.rows.get(real_idx).cloned() {
-            let is_sel = self.app.details.selected.map(|u| u == it.uid).unwrap_or(false);
+            let is_sel = self
+                .app
+                .details
+                .selected
+                .map(|u| u == it.uid)
+                .unwrap_or(false);
             let is_hit = self.app.search.hits.contains_key(&it.uid);
             // zebra stripes and selection background
             let rect = ui.max_rect();
@@ -288,11 +345,18 @@ impl<'a> TableDelegate for ResultsDelegate<'a> {
             let col_idx = cell.col_nr as usize;
             if let Some(spec) = self.app.results.active_cols.get(col_idx).cloned() {
                 let mut text = self.app.display_cell_string(&it, col_idx, &spec);
-                if is_hit && matches!(spec.kind, ColumnKind::Name) { text = format!("★ {}", text); }
+                if is_hit && matches!(spec.kind, ColumnKind::Name) {
+                    text = format!("★ {}", text);
+                }
                 match spec.kind {
                     ColumnKind::Name | ColumnKind::Namespace => {
-                        let resp = ui.add(egui::Button::new(egui::RichText::new(text).monospace()).selected(is_sel));
-                        if resp.clicked() { self.app.select_row(it.clone()); }
+                        let resp = ui.add(
+                            egui::Button::new(egui::RichText::new(text).monospace())
+                                .selected(is_sel),
+                        );
+                        if resp.clicked() {
+                            self.app.select_row(it.clone());
+                        }
                         // Row context menu
                         resp.context_menu(|ui| {
                             if ui.button("Open Details").clicked() {

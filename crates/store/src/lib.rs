@@ -4,13 +4,13 @@
 
 use std::collections::VecDeque;
 
-use orka_core::{Delta, LiteObj, WorldSnapshot, Projector};
+use arc_swap::ArcSwap;
+use metrics::{counter, gauge, histogram};
+use orka_core::{Delta, LiteObj, Projector, WorldSnapshot};
 use rustc_hash::FxHashMap;
+use std::sync::Arc;
 use tokio::sync::{mpsc, watch};
 use tracing::{debug, info};
-use arc_swap::ArcSwap;
-use std::sync::Arc;
-use metrics::{counter, gauge, histogram};
 
 /// Coalescing queue keyed by UID with FIFO order and fixed capacity.
 pub struct Coalescer {
@@ -22,12 +22,23 @@ pub struct Coalescer {
 
 impl Coalescer {
     pub fn with_capacity(cap: usize) -> Self {
-        Self { map: FxHashMap::default(), order: VecDeque::new(), cap, dropped: 0 }
+        Self {
+            map: FxHashMap::default(),
+            order: VecDeque::new(),
+            cap,
+            dropped: 0,
+        }
     }
 
-    pub fn len(&self) -> usize { self.map.len() }
-    pub fn is_empty(&self) -> bool { self.map.is_empty() }
-    pub fn dropped(&self) -> u64 { self.dropped }
+    pub fn len(&self) -> usize {
+        self.map.len()
+    }
+    pub fn is_empty(&self) -> bool {
+        self.map.is_empty()
+    }
+    pub fn dropped(&self) -> u64 {
+        self.dropped
+    }
 
     pub fn push(&mut self, d: Delta) {
         let uid = d.uid;
@@ -70,12 +81,27 @@ pub struct WorldBuilder {
 }
 
 impl WorldBuilder {
-    pub fn new() -> Self { Self::with_projector(None) }
+    pub fn new() -> Self {
+        Self::with_projector(None)
+    }
 
     pub fn with_projector(projector: Option<std::sync::Arc<dyn Projector + Send + Sync>>) -> Self {
-        let max_labels_per_obj = std::env::var("ORKA_MAX_LABELS_PER_OBJ").ok().and_then(|s| s.parse::<usize>().ok()).or(Some(128));
-        let max_annos_per_obj = std::env::var("ORKA_MAX_ANNOS_PER_OBJ").ok().and_then(|s| s.parse::<usize>().ok()).or(Some(64));
-        Self { epoch: 0, items: Vec::new(), index: FxHashMap::default(), projector, max_labels_per_obj, max_annos_per_obj }
+        let max_labels_per_obj = std::env::var("ORKA_MAX_LABELS_PER_OBJ")
+            .ok()
+            .and_then(|s| s.parse::<usize>().ok())
+            .or(Some(128));
+        let max_annos_per_obj = std::env::var("ORKA_MAX_ANNOS_PER_OBJ")
+            .ok()
+            .and_then(|s| s.parse::<usize>().ok())
+            .or(Some(64));
+        Self {
+            epoch: 0,
+            items: Vec::new(),
+            index: FxHashMap::default(),
+            projector,
+            max_labels_per_obj,
+            max_annos_per_obj,
+        }
     }
 
     /// Apply a batch of deltas and update in-memory items.
@@ -85,34 +111,67 @@ impl WorldBuilder {
                 orka_core::DeltaKind::Applied => {
                     // Convert raw to LiteObj (placeholder)
                     if let Some(meta) = d.raw.get("metadata") {
-                        let name = meta.get("name").and_then(|v| v.as_str()).unwrap_or("").to_string();
-                        let namespace = meta.get("namespace").and_then(|v| v.as_str()).map(|s| s.to_string());
+                        let name = meta
+                            .get("name")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("")
+                            .to_string();
+                        let namespace = meta
+                            .get("namespace")
+                            .and_then(|v| v.as_str())
+                            .map(|s| s.to_string());
                         let creation_ts = meta
                             .get("creationTimestamp")
                             .and_then(|v| v.as_str())
                             .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
                             .map(|dt| dt.timestamp())
                             .unwrap_or(0);
-                        let projected = if let Some(p) = &self.projector { p.project(&d.raw) } else { smallvec::SmallVec::<[(u32, String); 8]>::new() };
+                        let projected = if let Some(p) = &self.projector {
+                            p.project(&d.raw)
+                        } else {
+                            smallvec::SmallVec::<[(u32, String); 8]>::new()
+                        };
                         // Extract labels and annotations from metadata
                         let mut labels = smallvec::SmallVec::<[(String, String); 8]>::new();
                         let mut annotations = smallvec::SmallVec::<[(String, String); 4]>::new();
                         if let Some(meta_obj) = d.raw.get("metadata").and_then(|m| m.as_object()) {
                             if let Some(lbls) = meta_obj.get("labels").and_then(|m| m.as_object()) {
                                 for (k, v) in lbls.iter() {
-                                    if let Some(val) = v.as_str() { labels.push((k.clone(), val.to_string())); }
-                                    if let Some(cap) = self.max_labels_per_obj { if labels.len() >= cap { break; } }
+                                    if let Some(val) = v.as_str() {
+                                        labels.push((k.clone(), val.to_string()));
+                                    }
+                                    if let Some(cap) = self.max_labels_per_obj {
+                                        if labels.len() >= cap {
+                                            break;
+                                        }
+                                    }
                                 }
                             }
-                            if let Some(ann) = meta_obj.get("annotations").and_then(|m| m.as_object()) {
+                            if let Some(ann) =
+                                meta_obj.get("annotations").and_then(|m| m.as_object())
+                            {
                                 for (k, v) in ann.iter() {
-                                    if let Some(val) = v.as_str() { annotations.push((k.clone(), val.to_string())); }
-                                    if let Some(cap) = self.max_annos_per_obj { if annotations.len() >= cap { break; } }
+                                    if let Some(val) = v.as_str() {
+                                        annotations.push((k.clone(), val.to_string()));
+                                    }
+                                    if let Some(cap) = self.max_annos_per_obj {
+                                        if annotations.len() >= cap {
+                                            break;
+                                        }
+                                    }
                                 }
                             }
                         }
 
-                        let lo = LiteObj { uid: d.uid, namespace, name, creation_ts, projected, labels, annotations };
+                        let lo = LiteObj {
+                            uid: d.uid,
+                            namespace,
+                            name,
+                            creation_ts,
+                            projected,
+                            labels,
+                            annotations,
+                        };
                         // O(1) upsert via index
                         if let Some(&idx) = self.index.get(&d.uid) {
                             self.items[idx] = Some(lo);
@@ -146,26 +205,39 @@ impl WorldBuilder {
     pub fn freeze(&self) -> std::sync::Arc<WorldSnapshot> {
         let mut compact: Vec<LiteObj> = Vec::with_capacity(self.index.len());
         self.extend_live_items(&mut compact);
-        std::sync::Arc::new(WorldSnapshot { epoch: self.epoch, items: compact })
+        std::sync::Arc::new(WorldSnapshot {
+            epoch: self.epoch,
+            items: compact,
+        })
     }
 }
 
 impl Default for WorldBuilder {
-    fn default() -> Self { Self::new() }
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 /// Handle for readers to access the current snapshot and subscribe to swaps.
 pub struct BackendHandle {
-    snap: Arc<ArcSwap<WorldSnapshot> >,
+    snap: Arc<ArcSwap<WorldSnapshot>>,
     epoch_rx: watch::Receiver<u64>,
     partial_rx: watch::Receiver<bool>,
 }
 
 impl BackendHandle {
-    pub fn current(&self) -> std::sync::Arc<WorldSnapshot> { self.snap.load_full() }
-    pub fn subscribe_epoch(&self) -> watch::Receiver<u64> { self.epoch_rx.clone() }
-    pub fn subscribe_partial(&self) -> watch::Receiver<bool> { self.partial_rx.clone() }
-    pub fn partial(&self) -> bool { *self.partial_rx.borrow() }
+    pub fn current(&self) -> std::sync::Arc<WorldSnapshot> {
+        self.snap.load_full()
+    }
+    pub fn subscribe_epoch(&self) -> watch::Receiver<u64> {
+        self.epoch_rx.clone()
+    }
+    pub fn subscribe_partial(&self) -> watch::Receiver<bool> {
+        self.partial_rx.clone()
+    }
+    pub fn partial(&self) -> bool {
+        *self.partial_rx.borrow()
+    }
 }
 
 /// Spawn an ingest loop consuming deltas and swapping snapshots. Returns a sender for deltas and a handle for reads.
@@ -315,7 +387,14 @@ pub fn spawn_ingest_with_projector(
         info!("ingest loop stopped");
     });
 
-    (tx, BackendHandle { snap, epoch_rx, partial_rx })
+    (
+        tx,
+        BackendHandle {
+            snap,
+            epoch_rx,
+            partial_rx,
+        },
+    )
 }
 
 /// Variant that accepted a shard planner (removed).
@@ -337,15 +416,24 @@ pub fn spawn_ingest_with_planner(
 
     tokio::spawn(async move {
         // Build shard workers
-        struct Shard { coalescer: Coalescer, builder: WorldBuilder, partial: bool }
+        struct Shard {
+            coalescer: Coalescer,
+            builder: WorldBuilder,
+            partial: bool,
+        }
         let mut shard_workers: Vec<Shard> = (0..shards)
-            .map(|_| Shard { coalescer: Coalescer::with_capacity(cap), builder: WorldBuilder::with_projector(projector.clone()), partial: false })
+            .map(|_| Shard {
+                coalescer: Coalescer::with_capacity(cap),
+                builder: WorldBuilder::with_projector(projector.clone()),
+                partial: false,
+            })
             .collect();
 
         // Track per-shard dropped increments to export labeled counters without double counting
         let mut dropped_reported: Vec<u64> = vec![0; shards];
         // Track in-flight auto-relist per shard
-        let mut relist_handles: Vec<Option<tokio::task::JoinHandle<()>>> = (0..shards).map(|_| None).collect();
+        let mut relist_handles: Vec<Option<tokio::task::JoinHandle<()>>> =
+            (0..shards).map(|_| None).collect();
 
         let mut ticker = tokio::time::interval(std::time::Duration::from_millis(8));
         // Track arrival times to compute ingest lag across coalescing/batching
@@ -353,15 +441,21 @@ pub fn spawn_ingest_with_planner(
 
         // Namespace bucket function (simple hash modulo shards)
         fn ns_bucket(d: &Delta, shards: usize) -> usize {
-            if shards <= 1 { return 0; }
-            let ns = d.raw
+            if shards <= 1 {
+                return 0;
+            }
+            let ns = d
+                .raw
                 .get("metadata")
                 .and_then(|m| m.get("namespace"))
                 .and_then(|v| v.as_str())
                 .unwrap_or("");
             // A tiny FNV-1a style hash
             let mut h: u64 = 0xcbf29ce484222325;
-            for b in ns.as_bytes() { h ^= *b as u64; h = h.wrapping_mul(0x100000001b3); }
+            for b in ns.as_bytes() {
+                h ^= *b as u64;
+                h = h.wrapping_mul(0x100000001b3);
+            }
             (h as usize) % shards
         }
         fn gvk_id_from(raw: &serde_json::Value) -> u32 {
@@ -369,7 +463,10 @@ pub fn spawn_ingest_with_planner(
             let kind = raw.get("kind").and_then(|v| v.as_str()).unwrap_or("");
             let s = format!("{}/{}", api, kind);
             let mut h: u32 = 0x811c9dc5; // FNV-1a 32-bit offset
-            for b in s.as_bytes() { h ^= *b as u32; h = h.wrapping_mul(0x01000193); }
+            for b in s.as_bytes() {
+                h ^= *b as u32;
+                h = h.wrapping_mul(0x01000193);
+            }
             h
         }
         fn gvk_key_from(raw: &serde_json::Value) -> Option<String> {
@@ -587,7 +684,14 @@ pub fn spawn_ingest_with_planner(
         info!("ingest loop stopped");
     });
 
-    (tx, BackendHandle { snap, epoch_rx, partial_rx })
+    (
+        tx,
+        BackendHandle {
+            snap,
+            epoch_rx,
+            partial_rx,
+        },
+    )
 }
 
 #[allow(dead_code)]
@@ -600,10 +704,18 @@ fn approx_items_bytes(items: &[LiteObj]) -> usize {
     for o in items.iter() {
         total += std::mem::size_of::<LiteObj>();
         total += o.name.len();
-        if let Some(ns) = &o.namespace { total += ns.len(); }
-        for (_id, v) in &o.projected { total += v.len(); }
-        for (k, v) in &o.labels { total += k.len() + v.len(); }
-        for (k, v) in &o.annotations { total += k.len() + v.len(); }
+        if let Some(ns) = &o.namespace {
+            total += ns.len();
+        }
+        for (_id, v) in &o.projected {
+            total += v.len();
+        }
+        for (k, v) in &o.labels {
+            total += k.len() + v.len();
+        }
+        for (k, v) in &o.annotations {
+            total += k.len() + v.len();
+        }
     }
     total
 }
@@ -612,21 +724,39 @@ fn trim_items_for_memory(items: &mut [LiteObj], cap_bytes: usize) -> usize {
     // Stage 1: drop annotations
     let mut approx = approx_items_bytes(items);
     if approx > cap_bytes {
-        for o in items.iter_mut() { o.annotations.clear(); }
+        for o in items.iter_mut() {
+            o.annotations.clear();
+        }
         approx = approx_items_bytes(items);
-        tracing::warn!(approx, cap_bytes, "memory pressure: dropped annotations to honor ORKA_MAX_RSS_MB");
+        tracing::warn!(
+            approx,
+            cap_bytes,
+            "memory pressure: dropped annotations to honor ORKA_MAX_RSS_MB"
+        );
     }
     // Stage 2: drop labels
     if approx > cap_bytes {
-        for o in items.iter_mut() { o.labels.clear(); }
+        for o in items.iter_mut() {
+            o.labels.clear();
+        }
         approx = approx_items_bytes(items);
-        tracing::warn!(approx, cap_bytes, "memory pressure: dropped labels to honor ORKA_MAX_RSS_MB");
+        tracing::warn!(
+            approx,
+            cap_bytes,
+            "memory pressure: dropped labels to honor ORKA_MAX_RSS_MB"
+        );
     }
     // Stage 3: drop projected fields
     if approx > cap_bytes {
-        for o in items.iter_mut() { o.projected.clear(); }
+        for o in items.iter_mut() {
+            o.projected.clear();
+        }
         approx = approx_items_bytes(items);
-        tracing::warn!(approx, cap_bytes, "memory pressure: dropped projected fields to honor ORKA_MAX_RSS_MB");
+        tracing::warn!(
+            approx,
+            cap_bytes,
+            "memory pressure: dropped projected fields to honor ORKA_MAX_RSS_MB"
+        );
     }
     approx
 }
@@ -648,7 +778,9 @@ mod tests {
             "uid": format!("00000000-0000-0000-0000-{:012}", 1),
             "creationTimestamp": "2020-01-01T00:00:00Z",
         });
-        if let Some(ns) = ns { meta["namespace"] = serde_json::Value::String(ns.to_string()); }
+        if let Some(ns) = ns {
+            meta["namespace"] = serde_json::Value::String(ns.to_string());
+        }
         serde_json::json!({ "metadata": meta })
     }
 
@@ -657,7 +789,11 @@ mod tests {
         let mut c = Coalescer::with_capacity(2);
         // push 3 unique uids -> 1 drop expected
         for i in 0..3u8 {
-            c.push(Delta { uid: uid(i), kind: DeltaKind::Applied, raw: serde_json::json!({}) });
+            c.push(Delta {
+                uid: uid(i),
+                kind: DeltaKind::Applied,
+                raw: serde_json::json!({}),
+            });
         }
         assert_eq!(c.len(), 2);
         assert_eq!(c.dropped(), 1);
@@ -671,8 +807,16 @@ mod tests {
     fn coalescer_overwrite_same_uid() {
         let mut c = Coalescer::with_capacity(4);
         let u = uid(42);
-        c.push(Delta { uid: u, kind: DeltaKind::Applied, raw: serde_json::json!({"a":1}) });
-        c.push(Delta { uid: u, kind: DeltaKind::Applied, raw: serde_json::json!({"a":2}) });
+        c.push(Delta {
+            uid: u,
+            kind: DeltaKind::Applied,
+            raw: serde_json::json!({"a":1}),
+        });
+        c.push(Delta {
+            uid: u,
+            kind: DeltaKind::Applied,
+            raw: serde_json::json!({"a":2}),
+        });
         let drained = c.drain_ready();
         assert_eq!(drained.len(), 1);
         assert_eq!(drained[0].raw["a"], 2);
@@ -686,8 +830,16 @@ mod tests {
 
         // add two
         wb.apply(vec![
-            Delta { uid: u1, kind: DeltaKind::Applied, raw: obj("a", Some("ns")) },
-            Delta { uid: u2, kind: DeltaKind::Applied, raw: obj("b", None) },
+            Delta {
+                uid: u1,
+                kind: DeltaKind::Applied,
+                raw: obj("a", Some("ns")),
+            },
+            Delta {
+                uid: u2,
+                kind: DeltaKind::Applied,
+                raw: obj("b", None),
+            },
         ]);
         let mut tmp: Vec<LiteObj> = Vec::new();
         wb.extend_live_items(&mut tmp);
@@ -695,14 +847,23 @@ mod tests {
 
         // update one (rename)
         let mut o = obj("a2", Some("ns"));
-        o["metadata"]["uid"] = serde_json::Value::String("00000000-0000-0000-0000-000000000001".to_string());
-        wb.apply(vec![Delta { uid: u1, kind: DeltaKind::Applied, raw: o }]);
+        o["metadata"]["uid"] =
+            serde_json::Value::String("00000000-0000-0000-0000-000000000001".to_string());
+        wb.apply(vec![Delta {
+            uid: u1,
+            kind: DeltaKind::Applied,
+            raw: o,
+        }]);
         tmp.clear();
         wb.extend_live_items(&mut tmp);
         assert_eq!(tmp.iter().find(|x| x.uid == u1).unwrap().name, "a2");
 
         // delete one
-        wb.apply(vec![Delta { uid: u2, kind: DeltaKind::Deleted, raw: serde_json::json!({}) }]);
+        wb.apply(vec![Delta {
+            uid: u2,
+            kind: DeltaKind::Deleted,
+            raw: serde_json::json!({}),
+        }]);
         tmp.clear();
         wb.extend_live_items(&mut tmp);
         assert_eq!(tmp.len(), 1);

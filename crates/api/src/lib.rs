@@ -5,12 +5,12 @@
 
 #![forbid(unsafe_code)]
 
-use serde::{Deserialize, Serialize};
+use metrics::histogram;
 use orka_persist::Store;
+use serde::{Deserialize, Serialize};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
 use tracing::info;
-use std::sync::atomic::{AtomicU64, Ordering};
-use metrics::histogram;
 // Delegate kube client management to kubehub so GUI context switches are honored.
 async fn get_kube_client() -> OrkaResult<kube::Client> {
     orka_kubehub::get_kube_client()
@@ -18,17 +18,17 @@ async fn get_kube_client() -> OrkaResult<kube::Client> {
         .map_err(|e| OrkaError::Internal(e.to_string()))
 }
 
-pub use orka_ops::OrkaOps; // Re-export imperative ops trait
-pub use orka_ops::LogOptions as OpsLogOptions; // Re-export ops types for frontends
 pub use orka_ops::CancelHandle as OpsCancelHandle;
-pub use orka_ops::LogChunk as OpsLogChunk;
-pub use orka_ops::StreamHandle as OpsStreamHandle;
-pub use orka_ops::ForwardEvent as OpsForwardEvent;
-pub use orka_ops::OpsCaps as OpsCaps;
-pub use orka_ops::ScaleCaps as OpsScaleCaps;
 pub use orka_ops::ExecChunk as OpsExecChunk;
-pub use orka_schema::CrdSchema; // Re-export schema type
+pub use orka_ops::ForwardEvent as OpsForwardEvent;
+pub use orka_ops::LogChunk as OpsLogChunk;
+pub use orka_ops::LogOptions as OpsLogOptions; // Re-export ops types for frontends
+pub use orka_ops::OpsCaps;
+pub use orka_ops::OrkaOps; // Re-export imperative ops trait
+pub use orka_ops::ScaleCaps as OpsScaleCaps;
+pub use orka_ops::StreamHandle as OpsStreamHandle;
 pub use orka_persist::LastApplied; // Re-export last-applied row
+pub use orka_schema::CrdSchema; // Re-export schema type
 use std::collections::HashMap;
 
 // ------------- Env helpers (feature flags) -------------
@@ -40,8 +40,12 @@ fn env_flag(name: &str, default: bool) -> bool {
         .unwrap_or(default)
 }
 
-fn schema_offline_only() -> bool { env_flag("ORKA_SCHEMA_OFFLINE_ONLY", false) }
-fn schema_builtin_skip() -> bool { env_flag("ORKA_SCHEMA_BUILTIN_SKIP", true) }
+fn schema_offline_only() -> bool {
+    env_flag("ORKA_SCHEMA_OFFLINE_ONLY", false)
+}
+fn schema_builtin_skip() -> bool {
+    env_flag("ORKA_SCHEMA_BUILTIN_SKIP", true)
+}
 
 /// A served Kubernetes resource kind (incl. CRDs).
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -54,7 +58,12 @@ pub struct ResourceKind {
 
 impl From<orka_kubehub::DiscoveredResource> for ResourceKind {
     fn from(v: orka_kubehub::DiscoveredResource) -> Self {
-        Self { group: v.group, version: v.version, kind: v.kind, namespaced: v.namespaced }
+        Self {
+            group: v.group,
+            version: v.version,
+            kind: v.kind,
+            namespaced: v.namespaced,
+        }
     }
 }
 
@@ -93,16 +102,30 @@ pub struct Stats {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
-pub struct PressureEvents { pub dropped: u64, pub trimmed_bytes: u64 }
+pub struct PressureEvents {
+    pub dropped: u64,
+    pub trimmed_bytes: u64,
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
-pub struct ResponseMeta { pub partial: bool, pub pressure_events: PressureEvents, pub explain_available: bool }
+pub struct ResponseMeta {
+    pub partial: bool,
+    pub pressure_events: PressureEvents,
+    pub explain_available: bool,
+}
 
 #[derive(Debug, Clone)]
-pub struct SnapshotResponse { pub data: orka_core::WorldSnapshot, pub meta: ResponseMeta }
+pub struct SnapshotResponse {
+    pub data: orka_core::WorldSnapshot,
+    pub meta: ResponseMeta,
+}
 
 #[derive(Debug, Clone)]
-pub struct SearchResponse { pub hits: Vec<orka_search::Hit>, pub debug: orka_search::SearchDebugInfo, pub meta: ResponseMeta }
+pub struct SearchResponse {
+    pub hits: Vec<orka_search::Hit>,
+    pub debug: orka_search::SearchDebugInfo,
+    pub meta: ResponseMeta,
+}
 
 /// API errors suitable for transport over RPC later.
 #[derive(Debug, thiserror::Error, Serialize, Deserialize)]
@@ -229,7 +252,11 @@ impl Default for MockApi {
     }
 }
 
-impl MockApi { pub fn new() -> Self { Self::default() } }
+impl MockApi {
+    pub fn new() -> Self {
+        Self::default()
+    }
+}
 
 // ----------------- In-process implementation -----------------
 
@@ -237,17 +264,27 @@ impl MockApi { pub fn new() -> Self { Self::default() } }
 pub struct InProcApi;
 
 impl InProcApi {
-    pub fn new() -> Self { Self }
+    pub fn new() -> Self {
+        Self
+    }
 
-    fn map_err(e: anyhow::Error) -> OrkaError { OrkaError::Internal(e.to_string()) }
+    fn map_err(e: anyhow::Error) -> OrkaError {
+        OrkaError::Internal(e.to_string())
+    }
 
     fn gvk_key(gvk: &ResourceKind) -> String {
-        if gvk.group.is_empty() { format!("{}/{}", gvk.version, gvk.kind) } else { format!("{}/{}/{}", gvk.group, gvk.version, gvk.kind) }
+        if gvk.group.is_empty() {
+            format!("{}/{}", gvk.version, gvk.kind)
+        } else {
+            format!("{}/{}/{}", gvk.group, gvk.version, gvk.kind)
+        }
     }
 }
 
 impl Default for InProcApi {
-    fn default() -> Self { Self::new() }
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 static TRAFFIC_DETAILS_BYTES: AtomicU64 = AtomicU64::new(0);
@@ -274,13 +311,23 @@ impl OrkaApi for InProcApi {
             .ok()
             .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
             .unwrap_or(true);
-        let lite_groups_env = std::env::var("ORKA_LIST_LITE_GROUPS").unwrap_or_else(|_| "*".to_string());
-        let group_key = if selector.gvk.group.is_empty() { "core".to_string() } else { selector.gvk.group.clone() };
+        let lite_groups_env =
+            std::env::var("ORKA_LIST_LITE_GROUPS").unwrap_or_else(|_| "*".to_string());
+        let group_key = if selector.gvk.group.is_empty() {
+            "core".to_string()
+        } else {
+            selector.gvk.group.clone()
+        };
         let allowed = {
             let mut ok = false;
             for s in lite_groups_env.split(',').map(|s| s.trim()) {
-                if s.is_empty() { continue; }
-                if s == "*" || s.eq_ignore_ascii_case(&group_key) { ok = true; break; }
+                if s.is_empty() {
+                    continue;
+                }
+                if s == "*" || s.eq_ignore_ascii_case(&group_key) {
+                    ok = true;
+                    break;
+                }
             }
             ok
         };
@@ -293,7 +340,11 @@ impl OrkaApi for InProcApi {
                     let ws = orka_core::WorldSnapshot { epoch: 0, items };
                     return Ok(SnapshotResponse {
                         data: ws,
-                        meta: ResponseMeta { partial: false, pressure_events: PressureEvents::default(), explain_available: false },
+                        meta: ResponseMeta {
+                            partial: false,
+                            pressure_events: PressureEvents::default(),
+                            explain_available: false,
+                        },
                     });
                 }
                 Err(e) => {
@@ -314,15 +365,29 @@ impl OrkaApi for InProcApi {
         let should_try_schema = !(defer_schema || offline_only || (is_builtin && skip_builtins));
         let (mut projector, explain_available) = if should_try_schema {
             match orka_schema::fetch_crd_schema(&gvk_key).await {
-                Ok(Some(schema)) => (Some(Arc::new(schema.projector()) as Arc<dyn orka_core::Projector + Send + Sync>), true),
+                Ok(Some(schema)) => (
+                    Some(
+                        Arc::new(schema.projector()) as Arc<dyn orka_core::Projector + Send + Sync>
+                    ),
+                    true,
+                ),
                 _ => (None, false),
             }
-        } else { (None, false) };
+        } else {
+            (None, false)
+        };
         // If no schema projector, try built-in projector for known core kinds
         if projector.is_none() {
-            projector = orka_core::columns::builtin_projector_for(&selector.gvk.group, &selector.gvk.version, &selector.gvk.kind);
+            projector = orka_core::columns::builtin_projector_for(
+                &selector.gvk.group,
+                &selector.gvk.version,
+                &selector.gvk.kind,
+            );
         }
-        let cap = std::env::var("ORKA_QUEUE_CAP").ok().and_then(|s| s.parse::<usize>().ok()).unwrap_or(2048);
+        let cap = std::env::var("ORKA_QUEUE_CAP")
+            .ok()
+            .and_then(|s| s.parse::<usize>().ok())
+            .unwrap_or(2048);
         let (tx, mut rx) = mpsc::channel::<orka_core::Delta>(cap);
         // Fire a one-shot list in background to overlap with shaping
         let list_key = gvk_key.clone();
@@ -332,8 +397,12 @@ impl OrkaApi for InProcApi {
         let list_task = tokio::spawn(async move {
             let res = orka_kubehub::prime_list(&list_key, list_ns.as_deref(), &tx_clone).await;
             match &res {
-                Ok(sent) => info!(sent, took_ms = %l0.elapsed().as_millis(), "api: snapshot list done"),
-                Err(e) => info!(error = %e, took_ms = %l0.elapsed().as_millis(), "api: snapshot list failed"),
+                Ok(sent) => {
+                    info!(sent, took_ms = %l0.elapsed().as_millis(), "api: snapshot list done")
+                }
+                Err(e) => {
+                    info!(error = %e, took_ms = %l0.elapsed().as_millis(), "api: snapshot list failed")
+                }
             }
             res
         });
@@ -357,7 +426,11 @@ impl OrkaApi for InProcApi {
             applied += n;
         }
         // Ensure listing finished successfully
-        if let Err(e) = list_task.await.map_err(|e| OrkaError::Internal(e.to_string()))?.map(|_| ()) {
+        if let Err(e) = list_task
+            .await
+            .map_err(|e| OrkaError::Internal(e.to_string()))?
+            .map(|_| ())
+        {
             return Err(OrkaError::Internal(e.to_string()));
         }
         info!(applied, "api: snapshot deltas applied");
@@ -365,7 +438,14 @@ impl OrkaApi for InProcApi {
         info!(items = snap.items.len(), took_ms = %t0.elapsed().as_millis(), "api: snapshot ok");
         Ok(SnapshotResponse {
             data: (*snap).clone(),
-            meta: ResponseMeta { partial: false, pressure_events: PressureEvents { dropped: 0, trimmed_bytes: 0 }, explain_available },
+            meta: ResponseMeta {
+                partial: false,
+                pressure_events: PressureEvents {
+                    dropped: 0,
+                    trimmed_bytes: 0,
+                },
+                explain_available,
+            },
         })
     }
 
@@ -386,28 +466,55 @@ impl OrkaApi for InProcApi {
         let offline_only = schema_offline_only();
         let skip_builtins = schema_builtin_skip();
         let is_builtin = group.is_empty();
-        let pairs: Option<Vec<(String, u32)>> = if !(offline_only || (is_builtin && skip_builtins)) {
+        let pairs: Option<Vec<(String, u32)>> = if !(offline_only || (is_builtin && skip_builtins))
+        {
             match orka_schema::fetch_crd_schema(&gvk_key).await {
-                Ok(Some(schema)) => Some(schema.projected_paths.iter().map(|p| (p.json_path.clone(), p.id)).collect()),
+                Ok(Some(schema)) => Some(
+                    schema
+                        .projected_paths
+                        .iter()
+                        .map(|p| (p.json_path.clone(), p.id))
+                        .collect(),
+                ),
                 _ => None,
             }
-        } else { None };
+        } else {
+            None
+        };
         let i0 = Instant::now();
         let index = match pairs {
-            Some(p) => orka_search::Index::build_from_snapshot_with_meta(&snap, Some(&p), Some(&kind), Some(&group)),
-            None => orka_search::Index::build_from_snapshot_with_meta(&snap, None, Some(&kind), Some(&group)),
+            Some(p) => orka_search::Index::build_from_snapshot_with_meta(
+                &snap,
+                Some(&p),
+                Some(&kind),
+                Some(&group),
+            ),
+            None => orka_search::Index::build_from_snapshot_with_meta(
+                &snap,
+                None,
+                Some(&kind),
+                Some(&group),
+            ),
         };
         info!(index_ms = %i0.elapsed().as_millis(), "api: search index built");
         let (hits, dbg) = index.search_with_debug_opts(query, limit, Default::default());
         info!(hits = hits.len(), took_ms = %t0.elapsed().as_millis(), "api: search ok");
-        Ok(SearchResponse { hits, debug: dbg, meta: ResponseMeta { partial: resp.meta.partial, pressure_events: resp.meta.pressure_events, explain_available: resp.meta.explain_available } })
+        Ok(SearchResponse {
+            hits,
+            debug: dbg,
+            meta: ResponseMeta {
+                partial: resp.meta.partial,
+                pressure_events: resp.meta.pressure_events,
+                explain_available: resp.meta.explain_available,
+            },
+        })
     }
 
     async fn get_raw(&self, reference: ResourceRef) -> OrkaResult<Vec<u8>> {
         let t0 = Instant::now();
         let gvk_key = Self::gvk_key(&reference.gvk);
         info!(gvk = %gvk_key, name = %reference.name, ns = %reference.namespace.as_deref().unwrap_or("-"), "api: get_raw start");
-        use kube::{core::DynamicObject, api::Api};
+        use kube::{api::Api, core::DynamicObject};
         let c0 = Instant::now();
         let client = get_kube_client().await?;
         let client_ms = c0.elapsed().as_millis() as f64;
@@ -415,19 +522,30 @@ impl OrkaApi for InProcApi {
         info!(ms = %client_ms, "api: get_raw client ready");
         // Locate ApiResource via cached discovery in kubehub
         let l0 = Instant::now();
-        let (ar, namespaced) = orka_kubehub::get_api_resource(&gvk_key).await.map_err(Self::map_err)?;
+        let (ar, namespaced) = orka_kubehub::get_api_resource(&gvk_key)
+            .await
+            .map_err(Self::map_err)?;
         let lookup_ms = l0.elapsed().as_millis() as f64;
         histogram!("api_get_raw_lookup_ms", lookup_ms);
         info!(ms = %lookup_ms, namespaced, kind = %ar.kind, group = %ar.group, version = %ar.version, "api: get_raw ar lookup");
         let api: Api<DynamicObject> = if namespaced {
             match reference.namespace.as_deref() {
                 Some(ns) => Api::namespaced_with(client.clone(), ns, &ar),
-                None => return Err(OrkaError::Validation("namespace required for namespaced kind".into())),
+                None => {
+                    return Err(OrkaError::Validation(
+                        "namespace required for namespaced kind".into(),
+                    ))
+                }
             }
-        } else { Api::all_with(client.clone(), &ar) };
+        } else {
+            Api::all_with(client.clone(), &ar)
+        };
         let h0 = Instant::now();
         info!("api: get_raw http get start");
-        let obj = api.get(&reference.name).await.map_err(|e| OrkaError::Internal(e.to_string()))?;
+        let obj = api
+            .get(&reference.name)
+            .await
+            .map_err(|e| OrkaError::Internal(e.to_string()))?;
         let http_ms = h0.elapsed().as_millis() as f64;
         histogram!("api_get_raw_http_ms", http_ms);
         info!(ms = %http_ms, "api: get_raw http get ok");
@@ -446,7 +564,9 @@ impl OrkaApi for InProcApi {
     async fn dry_run(&self, yaml: &str) -> OrkaResult<orka_apply::DiffSummary> {
         let t0 = Instant::now();
         info!("api: dry_run start");
-        let (live, _last) = orka_apply::diff_from_yaml(yaml, None).await.map_err(|e| OrkaError::Internal(e.to_string()))?;
+        let (live, _last) = orka_apply::diff_from_yaml(yaml, None)
+            .await
+            .map_err(|e| OrkaError::Internal(e.to_string()))?;
         info!(took_ms = %t0.elapsed().as_millis(), "api: dry_run ok");
         Ok(live)
     }
@@ -468,7 +588,9 @@ impl OrkaApi for InProcApi {
     async fn apply(&self, yaml: &str) -> OrkaResult<orka_apply::ApplyResult> {
         let t0 = Instant::now();
         info!("api: apply start");
-        let res = orka_apply::edit_from_yaml(yaml, None, false, true).await.map_err(|e| OrkaError::Internal(e.to_string()))?;
+        let res = orka_apply::edit_from_yaml(yaml, None, false, true)
+            .await
+            .map_err(|e| OrkaError::Internal(e.to_string()))?;
         info!(took_ms = %t0.elapsed().as_millis(), "api: apply ok");
         Ok(res)
     }
@@ -477,13 +599,29 @@ impl OrkaApi for InProcApi {
         let t0 = Instant::now();
         info!("api: stats start");
         let shards: usize = 1; // sharding removed; single pipeline
-        let relist_secs: u64 = std::env::var("ORKA_RELIST_SECS").ok().and_then(|s| s.parse().ok()).unwrap_or(300);
-        let watch_backoff_max_secs: u64 = std::env::var("ORKA_WATCH_BACKOFF_MAX_SECS").ok().and_then(|s| s.parse().ok()).unwrap_or(30);
-        let max_labels_per_obj = std::env::var("ORKA_MAX_LABELS_PER_OBJ").ok().and_then(|s| s.parse().ok());
-        let max_annos_per_obj = std::env::var("ORKA_MAX_ANNOS_PER_OBJ").ok().and_then(|s| s.parse().ok());
-        let max_postings_per_key = std::env::var("ORKA_MAX_POSTINGS_PER_KEY").ok().and_then(|s| s.parse().ok());
-        let max_rss_mb = std::env::var("ORKA_MAX_RSS_MB").ok().and_then(|s| s.parse().ok());
-        let max_index_bytes = std::env::var("ORKA_MAX_INDEX_BYTES").ok().and_then(|s| s.parse().ok());
+        let relist_secs: u64 = std::env::var("ORKA_RELIST_SECS")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(300);
+        let watch_backoff_max_secs: u64 = std::env::var("ORKA_WATCH_BACKOFF_MAX_SECS")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(30);
+        let max_labels_per_obj = std::env::var("ORKA_MAX_LABELS_PER_OBJ")
+            .ok()
+            .and_then(|s| s.parse().ok());
+        let max_annos_per_obj = std::env::var("ORKA_MAX_ANNOS_PER_OBJ")
+            .ok()
+            .and_then(|s| s.parse().ok());
+        let max_postings_per_key = std::env::var("ORKA_MAX_POSTINGS_PER_KEY")
+            .ok()
+            .and_then(|s| s.parse().ok());
+        let max_rss_mb = std::env::var("ORKA_MAX_RSS_MB")
+            .ok()
+            .and_then(|s| s.parse().ok());
+        let max_index_bytes = std::env::var("ORKA_MAX_INDEX_BYTES")
+            .ok()
+            .and_then(|s| s.parse().ok());
         let metrics_addr = std::env::var("ORKA_METRICS_ADDR").ok();
         let (snap_b, watch_b) = orka_kubehub::traffic_bytes();
         let details_b = TRAFFIC_DETAILS_BYTES.load(Ordering::Relaxed);
@@ -508,7 +646,10 @@ impl OrkaApi for InProcApi {
     async fn watch(&self, selector: Selector) -> OrkaResult<StreamHandle<orka_core::Delta>> {
         use tokio::sync::mpsc;
         info!(gvk = %Self::gvk_key(&selector.gvk), ns = %selector.namespace.as_deref().unwrap_or("(all)"), "api: watch start");
-        let cap = std::env::var("ORKA_QUEUE_CAP").ok().and_then(|s| s.parse::<usize>().ok()).unwrap_or(2048);
+        let cap = std::env::var("ORKA_QUEUE_CAP")
+            .ok()
+            .and_then(|s| s.parse::<usize>().ok())
+            .unwrap_or(2048);
         let (tx, rx) = mpsc::channel::<orka_core::Delta>(cap);
         let gvk_key = Self::gvk_key(&selector.gvk);
         let ns = selector.namespace.clone();
@@ -517,18 +658,26 @@ impl OrkaApi for InProcApi {
             let _ = orka_kubehub::start_watcher(&gvk_key, ns.as_deref(), tx).await;
             info!("api: watcher task ended");
         });
-        Ok(StreamHandle { rx, cancel: CancelHandle { task: Some(handle) } })
+        Ok(StreamHandle {
+            rx,
+            cancel: CancelHandle { task: Some(handle) },
+        })
     }
 
     async fn watch_lite(&self, selector: Selector) -> OrkaResult<StreamHandle<LiteEvent>> {
         use tokio::sync::mpsc;
         info!(gvk = %Self::gvk_key(&selector.gvk), ns = %selector.namespace.as_deref().unwrap_or("(all)"), "api: watch_lite start");
-        let cap = std::env::var("ORKA_QUEUE_CAP").ok().and_then(|s| s.parse::<usize>().ok()).unwrap_or(2048);
+        let cap = std::env::var("ORKA_QUEUE_CAP")
+            .ok()
+            .and_then(|s| s.parse::<usize>().ok())
+            .unwrap_or(2048);
         let (evt_tx, evt_rx) = mpsc::channel::<LiteEvent>(cap);
         let gvk_key = Self::gvk_key(&selector.gvk);
         let ns = selector.namespace.clone();
         // Resolve ApiResource once and pass it to the lite watcher to skip discovery
-        let (ar, namespaced) = orka_kubehub::get_api_resource(&gvk_key).await.map_err(Self::map_err)?;
+        let (ar, namespaced) = orka_kubehub::get_api_resource(&gvk_key)
+            .await
+            .map_err(Self::map_err)?;
         let handle = tokio::spawn(async move {
             info!("api: watcher(lite) task starting");
             let (tx_internal, mut rx_internal) = mpsc::channel::<orka_kubehub::LiteEvent>(cap);
@@ -536,21 +685,44 @@ impl OrkaApi for InProcApi {
             let watch_task = tokio::spawn({
                 async move {
                     // We already have ApiResource; reuse to avoid discovery cost
-                    let client = match get_kube_client().await { Ok(c) => c, Err(_) => { return; } };
-                    let _ = orka_kubehub::start_watcher_lite_with(client, ar, namespaced, ns.as_deref(), tx_internal).await;
+                    let client = match get_kube_client().await {
+                        Ok(c) => c,
+                        Err(_) => {
+                            return;
+                        }
+                    };
+                    let _ = orka_kubehub::start_watcher_lite_with(
+                        client,
+                        ar,
+                        namespaced,
+                        ns.as_deref(),
+                        tx_internal,
+                    )
+                    .await;
                 }
             });
             // forward events into API channel
             while let Some(ev) = rx_internal.recv().await {
                 match ev {
-                    orka_kubehub::LiteEvent::Applied(lo) => { if evt_tx.send(LiteEvent::Applied(lo)).await.is_err() { break; } }
-                    orka_kubehub::LiteEvent::Deleted(lo) => { if evt_tx.send(LiteEvent::Deleted(lo)).await.is_err() { break; } }
+                    orka_kubehub::LiteEvent::Applied(lo) => {
+                        if evt_tx.send(LiteEvent::Applied(lo)).await.is_err() {
+                            break;
+                        }
+                    }
+                    orka_kubehub::LiteEvent::Deleted(lo) => {
+                        if evt_tx.send(LiteEvent::Deleted(lo)).await.is_err() {
+                            break;
+                        }
+                    }
                 }
             }
             let _ = watch_task.abort();
             info!("api: watcher(lite) task ended");
         });
-        Ok(StreamHandle { rx: evt_rx, cancel: CancelHandle { task: Some(handle) } })
+        Ok(StreamHandle {
+            rx: evt_rx,
+            cancel: CancelHandle { task: Some(handle) },
+        })
     }
 
     async fn schema(&self, gvk_key: &str) -> OrkaResult<Option<CrdSchema>> {
@@ -589,7 +761,10 @@ impl OrkaApi for InProcApi {
         namespace: Option<&str>,
         limit: Option<usize>,
     ) -> OrkaResult<Vec<LastApplied>> {
-        use kube::{api::Api, core::{DynamicObject, GroupVersionKind}};
+        use kube::{
+            api::Api,
+            core::{DynamicObject, GroupVersionKind},
+        };
         let t0 = Instant::now();
         info!(gvk = %gvk_key, name = %name, ns = %namespace.unwrap_or("-"), limit = ?limit, "api: last_applied start");
         // Resolve UID via live object fetch
@@ -597,26 +772,56 @@ impl OrkaApi for InProcApi {
         // Parse GVK key -> GroupVersionKind
         let parts: Vec<&str> = gvk_key.split('/').collect();
         let gvk = match parts.as_slice() {
-            [version, kind] => GroupVersionKind { group: String::new(), version: (*version).to_string(), kind: (*kind).to_string() },
-            [group, version, kind] => GroupVersionKind { group: (*group).to_string(), version: (*version).to_string(), kind: (*kind).to_string() },
+            [version, kind] => GroupVersionKind {
+                group: String::new(),
+                version: (*version).to_string(),
+                kind: (*kind).to_string(),
+            },
+            [group, version, kind] => GroupVersionKind {
+                group: (*group).to_string(),
+                version: (*version).to_string(),
+                kind: (*kind).to_string(),
+            },
             _ => return Err(OrkaError::Validation(format!("invalid gvk: {}", gvk_key))),
         };
         // Find ApiResource via kubehub cache
-        let key = if gvk.group.is_empty() { format!("{}/{}", gvk.version, gvk.kind) } else { format!("{}/{}/{}", gvk.group, gvk.version, gvk.kind) };
-        let (ar, namespaced) = orka_kubehub::get_api_resource(&key).await.map_err(Self::map_err)?;
+        let key = if gvk.group.is_empty() {
+            format!("{}/{}", gvk.version, gvk.kind)
+        } else {
+            format!("{}/{}/{}", gvk.group, gvk.version, gvk.kind)
+        };
+        let (ar, namespaced) = orka_kubehub::get_api_resource(&key)
+            .await
+            .map_err(Self::map_err)?;
         let api: Api<DynamicObject> = if namespaced {
             match namespace {
                 Some(ns) => Api::namespaced_with(client.clone(), ns, &ar),
-                None => return Err(OrkaError::Validation("namespace required for namespaced kind".into())),
+                None => {
+                    return Err(OrkaError::Validation(
+                        "namespace required for namespaced kind".into(),
+                    ))
+                }
             }
-        } else { Api::all_with(client.clone(), &ar) };
-        let obj = api.get(name).await.map_err(|e| OrkaError::Internal(e.to_string()))?;
-        let uid_str = obj.metadata.uid.ok_or_else(|| OrkaError::Internal("object missing metadata.uid".into()))?;
-        let u = uuid::Uuid::parse_str(&uid_str).map_err(|e| OrkaError::Internal(format!("invalid uid: {}", e)))?;
+        } else {
+            Api::all_with(client.clone(), &ar)
+        };
+        let obj = api
+            .get(name)
+            .await
+            .map_err(|e| OrkaError::Internal(e.to_string()))?;
+        let uid_str = obj
+            .metadata
+            .uid
+            .ok_or_else(|| OrkaError::Internal("object missing metadata.uid".into()))?;
+        let u = uuid::Uuid::parse_str(&uid_str)
+            .map_err(|e| OrkaError::Internal(format!("invalid uid: {}", e)))?;
         let uid = *u.as_bytes();
         // Load from append-only log store (default)
-        let store = orka_persist::LogStore::open_default().map_err(|e| OrkaError::Internal(e.to_string()))?;
-        let rows = store.get_last(uid, limit).map_err(|e| OrkaError::Internal(e.to_string()))?;
+        let store = orka_persist::LogStore::open_default()
+            .map_err(|e| OrkaError::Internal(e.to_string()))?;
+        let rows = store
+            .get_last(uid, limit)
+            .map_err(|e| OrkaError::Internal(e.to_string()))?;
         info!(rows = rows.len(), took_ms = %t0.elapsed().as_millis(), "api: last_applied ok");
         Ok(rows)
     }
@@ -629,9 +834,17 @@ impl OrkaApi for InProcApi {
 // ----------------- Streaming primitives -----------------
 
 /// Cancellation handle that aborts the underlying task.
-pub struct CancelHandle { task: Option<tokio::task::JoinHandle<()>> }
+pub struct CancelHandle {
+    task: Option<tokio::task::JoinHandle<()>>,
+}
 
-impl CancelHandle { pub fn cancel(mut self) { if let Some(h) = self.task.take() { h.abort(); } } }
+impl CancelHandle {
+    pub fn cancel(mut self) {
+        if let Some(h) = self.task.take() {
+            h.abort();
+        }
+    }
+}
 
 impl std::fmt::Debug for CancelHandle {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -640,7 +853,10 @@ impl std::fmt::Debug for CancelHandle {
 }
 
 /// Generic stream handle used by API streaming endpoints.
-pub struct StreamHandle<T> { pub rx: tokio::sync::mpsc::Receiver<T>, pub cancel: CancelHandle }
+pub struct StreamHandle<T> {
+    pub rx: tokio::sync::mpsc::Receiver<T>,
+    pub cancel: CancelHandle,
+}
 
 /// Exec streaming handle exposed to frontends.
 pub struct ExecStreamHandle {
@@ -654,10 +870,14 @@ pub struct ExecStreamHandle {
 
 /// Lightweight facade over imperative ops, returning API-level stream handles
 /// and hiding ops-internal transport types.
-pub struct ApiOps { inner: std::sync::Arc<dyn OrkaOps> }
+pub struct ApiOps {
+    inner: std::sync::Arc<dyn OrkaOps>,
+}
 
 impl ApiOps {
-    pub fn new(inner: std::sync::Arc<dyn OrkaOps>) -> Self { Self { inner } }
+    pub fn new(inner: std::sync::Arc<dyn OrkaOps>) -> Self {
+        Self { inner }
+    }
 
     /// Stream pod logs and return strings via a bounded channel.
     pub async fn logs(
@@ -667,22 +887,42 @@ impl ApiOps {
         container: Option<&str>,
         opts: OpsLogOptions,
     ) -> OrkaResult<StreamHandle<String>> {
-        let cap = std::env::var("ORKA_OPS_QUEUE_CAP").ok().and_then(|s| s.parse().ok()).unwrap_or(1024);
+        let cap = std::env::var("ORKA_OPS_QUEUE_CAP")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(1024);
         let (tx, rx) = tokio::sync::mpsc::channel::<String>(cap);
         // Start underlying stream
-        let res = self.inner.logs(namespace, pod, container, opts).await.map_err(|e| OrkaError::Internal(e.to_string()))?;
+        let res = self
+            .inner
+            .logs(namespace, pod, container, opts)
+            .await
+            .map_err(|e| OrkaError::Internal(e.to_string()))?;
         // Guard that cancels underlying stream when the pump ends/aborts
-        struct OpsCancelGuard { inner: Option<OpsCancelHandle> }
-        impl Drop for OpsCancelGuard { fn drop(&mut self) { if let Some(c) = self.inner.take() { c.cancel(); } } }
+        struct OpsCancelGuard {
+            inner: Option<OpsCancelHandle>,
+        }
+        impl Drop for OpsCancelGuard {
+            fn drop(&mut self) {
+                if let Some(c) = self.inner.take() {
+                    c.cancel();
+                }
+            }
+        }
         let mut rx_ops = res.rx;
-        let guard = OpsCancelGuard { inner: Some(res.cancel) };
+        let guard = OpsCancelGuard {
+            inner: Some(res.cancel),
+        };
         let task = tokio::spawn(async move {
             let _g = guard; // ensure drop on task end/abort
             while let Some(chunk) = rx_ops.recv().await {
                 let _ = tx.try_send(chunk.line);
             }
         });
-        Ok(StreamHandle { rx, cancel: CancelHandle { task: Some(task) } })
+        Ok(StreamHandle {
+            rx,
+            cancel: CancelHandle { task: Some(task) },
+        })
     }
 
     /// Execute a command in a pod. For now this is a one-shot operation using
@@ -695,7 +935,10 @@ impl ApiOps {
         cmd: &[String],
         pty: bool,
     ) -> OrkaResult<()> {
-        self.inner.exec(namespace, pod, container, cmd, pty).await.map_err(|e| OrkaError::Internal(e.to_string()))
+        self.inner
+            .exec(namespace, pod, container, cmd, pty)
+            .await
+            .map_err(|e| OrkaError::Internal(e.to_string()))
     }
 
     /// Start an interactive exec session returning a duplex handle.
@@ -708,17 +951,30 @@ impl ApiOps {
         pty: bool,
     ) -> OrkaResult<ExecStreamHandle> {
         // Bridge ops-level duplex to API-level handle
-        let cap = std::env::var("ORKA_OPS_QUEUE_CAP").ok().and_then(|s| s.parse().ok()).unwrap_or(1024);
+        let cap = std::env::var("ORKA_OPS_QUEUE_CAP")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(1024);
         let (tx, rx) = tokio::sync::mpsc::channel::<orka_ops::ExecChunk>(cap);
         let res = self
             .inner
             .exec_stream(namespace, pod, container, cmd, pty)
             .await
             .map_err(|e| OrkaError::Internal(e.to_string()))?;
-        struct OpsCancelGuard { inner: Option<OpsCancelHandle> }
-        impl Drop for OpsCancelGuard { fn drop(&mut self) { if let Some(c) = self.inner.take() { c.cancel(); } } }
+        struct OpsCancelGuard {
+            inner: Option<OpsCancelHandle>,
+        }
+        impl Drop for OpsCancelGuard {
+            fn drop(&mut self) {
+                if let Some(c) = self.inner.take() {
+                    c.cancel();
+                }
+            }
+        }
         let mut rx_ops = res.rx;
-        let guard = OpsCancelGuard { inner: Some(res.cancel) };
+        let guard = OpsCancelGuard {
+            inner: Some(res.cancel),
+        };
         let input = res.stdin_tx;
         let resize = res.resize_tx;
         let task = tokio::spawn(async move {
@@ -727,7 +983,12 @@ impl ApiOps {
                 let _ = tx.try_send(chunk);
             }
         });
-        Ok(ExecStreamHandle { rx, input, resize, cancel: CancelHandle { task: Some(task) } })
+        Ok(ExecStreamHandle {
+            rx,
+            input,
+            resize,
+            cancel: CancelHandle { task: Some(task) },
+        })
     }
 
     /// Port-forward from local to a pod port. Returns API-level event stream.
@@ -744,10 +1005,20 @@ impl ApiOps {
             .port_forward(namespace, pod, local, remote)
             .await
             .map_err(|e| OrkaError::Internal(e.to_string()))?;
-        struct OpsCancelGuard { inner: Option<OpsCancelHandle> }
-        impl Drop for OpsCancelGuard { fn drop(&mut self) { if let Some(c) = self.inner.take() { c.cancel(); } } }
+        struct OpsCancelGuard {
+            inner: Option<OpsCancelHandle>,
+        }
+        impl Drop for OpsCancelGuard {
+            fn drop(&mut self) {
+                if let Some(c) = self.inner.take() {
+                    c.cancel();
+                }
+            }
+        }
         let mut rx_ops = res.rx;
-        let guard = OpsCancelGuard { inner: Some(res.cancel) };
+        let guard = OpsCancelGuard {
+            inner: Some(res.cancel),
+        };
         let task = tokio::spawn(async move {
             let _g = guard;
             while let Some(ev) = rx_ops.recv().await {
@@ -760,16 +1031,33 @@ impl ApiOps {
                 let _ = tx.send(mapped).await;
             }
         });
-        Ok(StreamHandle { rx, cancel: CancelHandle { task: Some(task) } })
+        Ok(StreamHandle {
+            rx,
+            cancel: CancelHandle { task: Some(task) },
+        })
     }
 
     /// Discover ops capabilities (RBAC + subresources).
-    pub async fn caps(&self, namespace: Option<&str>, scale_gvk: Option<&str>) -> OrkaResult<OpsCaps> {
-        self.inner.caps(namespace, scale_gvk).await.map_err(|e| OrkaError::Internal(e.to_string()))
+    pub async fn caps(
+        &self,
+        namespace: Option<&str>,
+        scale_gvk: Option<&str>,
+    ) -> OrkaResult<OpsCaps> {
+        self.inner
+            .caps(namespace, scale_gvk)
+            .await
+            .map_err(|e| OrkaError::Internal(e.to_string()))
     }
 
     /// Scale a workload to the specified replicas.
-    pub async fn scale(&self, gvk_key: &str, namespace: Option<&str>, name: &str, replicas: i32, use_subresource: bool) -> OrkaResult<()> {
+    pub async fn scale(
+        &self,
+        gvk_key: &str,
+        namespace: Option<&str>,
+        name: &str,
+        replicas: i32,
+        use_subresource: bool,
+    ) -> OrkaResult<()> {
         self.inner
             .scale(gvk_key, namespace, name, replicas, use_subresource)
             .await
@@ -777,7 +1065,12 @@ impl ApiOps {
     }
 
     /// Trigger a rollout restart for a workload.
-    pub async fn rollout_restart(&self, gvk_key: &str, namespace: Option<&str>, name: &str) -> OrkaResult<()> {
+    pub async fn rollout_restart(
+        &self,
+        gvk_key: &str,
+        namespace: Option<&str>,
+        name: &str,
+    ) -> OrkaResult<()> {
         self.inner
             .rollout_restart(gvk_key, namespace, name)
             .await
@@ -785,7 +1078,12 @@ impl ApiOps {
     }
 
     /// Delete a pod with optional grace period.
-    pub async fn delete_pod(&self, namespace: &str, pod: &str, grace_seconds: Option<i64>) -> OrkaResult<()> {
+    pub async fn delete_pod(
+        &self,
+        namespace: &str,
+        pod: &str,
+        grace_seconds: Option<i64>,
+    ) -> OrkaResult<()> {
         self.inner
             .delete_pod(namespace, pod, grace_seconds)
             .await
@@ -794,28 +1092,49 @@ impl ApiOps {
 
     /// Cordon or uncordon a node.
     pub async fn cordon(&self, node: &str, on: bool) -> OrkaResult<()> {
-        self.inner.cordon(node, on).await.map_err(|e| OrkaError::Internal(e.to_string()))
+        self.inner
+            .cordon(node, on)
+            .await
+            .map_err(|e| OrkaError::Internal(e.to_string()))
     }
 
     /// Drain a node (best-effort).
     pub async fn drain(&self, node: &str) -> OrkaResult<()> {
-        self.inner.drain(node).await.map_err(|e| OrkaError::Internal(e.to_string()))
+        self.inner
+            .drain(node)
+            .await
+            .map_err(|e| OrkaError::Internal(e.to_string()))
     }
 }
 
 /// Construct an ApiOps facade from an OrkaApi object.
-pub fn api_ops(api: &dyn OrkaApi) -> ApiOps { ApiOps::new(api.ops()) }
+pub fn api_ops(api: &dyn OrkaApi) -> ApiOps {
+    ApiOps::new(api.ops())
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub enum PortForwardEvent { Ready(String), Connected(String), Closed, Error(String) }
+pub enum PortForwardEvent {
+    Ready(String),
+    Connected(String),
+    Closed,
+    Error(String),
+}
 
 #[async_trait::async_trait]
 impl OrkaApi for MockApi {
-    async fn discover(&self) -> OrkaResult<Vec<ResourceKind>> { Ok(self.kinds.clone()) }
+    async fn discover(&self) -> OrkaResult<Vec<ResourceKind>> {
+        Ok(self.kinds.clone())
+    }
 
     async fn snapshot(&self, _selector: Selector) -> OrkaResult<SnapshotResponse> {
-        let snap = self.snapshot.clone().ok_or_else(|| OrkaError::NotFound("no snapshot".into()))?;
-        Ok(SnapshotResponse { data: snap, meta: ResponseMeta::default() })
+        let snap = self
+            .snapshot
+            .clone()
+            .ok_or_else(|| OrkaError::NotFound("no snapshot".into()))?;
+        Ok(SnapshotResponse {
+            data: snap,
+            meta: ResponseMeta::default(),
+        })
     }
 
     async fn search(
@@ -824,15 +1143,23 @@ impl OrkaApi for MockApi {
         _query: &str,
         _limit: usize,
     ) -> OrkaResult<SearchResponse> {
-        Ok(SearchResponse { hits: self.hits.clone(), debug: self.debug.clone(), meta: ResponseMeta::default() })
+        Ok(SearchResponse {
+            hits: self.hits.clone(),
+            debug: self.debug.clone(),
+            meta: ResponseMeta::default(),
+        })
     }
 
     async fn get_raw(&self, _reference: ResourceRef) -> OrkaResult<Vec<u8>> {
-        self.raw_obj.clone().ok_or_else(|| OrkaError::NotFound("no raw".into()))
+        self.raw_obj
+            .clone()
+            .ok_or_else(|| OrkaError::NotFound("no raw".into()))
     }
 
     async fn dry_run(&self, _yaml: &str) -> OrkaResult<orka_apply::DiffSummary> {
-        self.dry.clone().ok_or_else(|| OrkaError::Internal("no dry-run configured".into()))
+        self.dry
+            .clone()
+            .ok_or_else(|| OrkaError::Internal("no dry-run configured".into()))
     }
 
     async fn diff(
@@ -840,26 +1167,38 @@ impl OrkaApi for MockApi {
         _yaml: &str,
         _ns_override: Option<&str>,
     ) -> OrkaResult<(orka_apply::DiffSummary, Option<orka_apply::DiffSummary>)> {
-        self.diff_pair.clone().ok_or_else(|| OrkaError::NotFound("no diff configured".into()))
+        self.diff_pair
+            .clone()
+            .ok_or_else(|| OrkaError::NotFound("no diff configured".into()))
     }
 
     async fn apply(&self, _yaml: &str) -> OrkaResult<orka_apply::ApplyResult> {
-        self.apply.clone().ok_or_else(|| OrkaError::Internal("no apply configured".into()))
+        self.apply
+            .clone()
+            .ok_or_else(|| OrkaError::Internal("no apply configured".into()))
     }
 
-    async fn stats(&self) -> OrkaResult<Stats> { Ok(self.stats.clone()) }
+    async fn stats(&self) -> OrkaResult<Stats> {
+        Ok(self.stats.clone())
+    }
 
     async fn watch(&self, _selector: Selector) -> OrkaResult<StreamHandle<orka_core::Delta>> {
         use tokio::sync::mpsc;
         // Empty stream by default for the mock
         let (_tx, rx) = mpsc::channel(1);
-        Ok(StreamHandle { rx, cancel: CancelHandle { task: None } })
+        Ok(StreamHandle {
+            rx,
+            cancel: CancelHandle { task: None },
+        })
     }
 
     async fn watch_lite(&self, _selector: Selector) -> OrkaResult<StreamHandle<LiteEvent>> {
         use tokio::sync::mpsc;
         let (_tx, rx) = mpsc::channel(1);
-        Ok(StreamHandle { rx, cancel: CancelHandle { task: None } })
+        Ok(StreamHandle {
+            rx,
+            cancel: CancelHandle { task: None },
+        })
     }
 
     async fn schema(&self, gvk_key: &str) -> OrkaResult<Option<CrdSchema>> {

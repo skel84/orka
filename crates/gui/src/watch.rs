@@ -1,8 +1,8 @@
 #![forbid(unsafe_code)]
 
 use once_cell::sync::OnceCell;
-use tokio::sync::broadcast;
 use std::sync::Mutex;
+use tokio::sync::broadcast;
 
 use orka_api::{LiteEvent, OrkaApi, Selector};
 use orka_core::{LiteObj, Uid};
@@ -25,15 +25,26 @@ fn watch_hub() -> &'static WatchHub {
     })
 }
 
-pub(crate) async fn watch_hub_subscribe(api: std::sync::Arc<dyn OrkaApi>, sel: Selector) -> Result<broadcast::Receiver<LiteEvent>, String> {
-    let key = format!("{}|{}", gvk_label(&sel.gvk), sel.namespace.as_deref().unwrap_or(""));
+pub(crate) async fn watch_hub_subscribe(
+    api: std::sync::Arc<dyn OrkaApi>,
+    sel: Selector,
+) -> Result<broadcast::Receiver<LiteEvent>, String> {
+    let key = format!(
+        "{}|{}",
+        gvk_label(&sel.gvk),
+        sel.namespace.as_deref().unwrap_or("")
+    );
     // Fast path: existing
     if let Some(tx) = watch_hub().map.lock().unwrap().get(&key).cloned() {
         return Ok(tx.subscribe());
     }
     // Create sender and spawn underlying watcher task
     let (tx, rx) = broadcast::channel::<LiteEvent>(2048);
-    watch_hub().map.lock().unwrap().insert(key.clone(), tx.clone());
+    watch_hub()
+        .map
+        .lock()
+        .unwrap()
+        .insert(key.clone(), tx.clone());
     let key_for_task = key.clone();
     let handle = tokio::spawn(async move {
         match api.watch_lite(sel).await {
@@ -43,13 +54,17 @@ pub(crate) async fn watch_hub_subscribe(api: std::sync::Arc<dyn OrkaApi>, sel: S
                         Some(LiteEvent::Applied(lo)) => {
                             // Update cache then broadcast
                             let mut cache = watch_hub().cache.lock().unwrap();
-                            let entry = cache.entry(key_for_task.clone()).or_insert_with(|| std::collections::HashMap::new());
+                            let entry = cache
+                                .entry(key_for_task.clone())
+                                .or_insert_with(|| std::collections::HashMap::new());
                             entry.insert(lo.uid, lo.clone());
                             let _ = tx.send(LiteEvent::Applied(lo));
                         }
                         Some(LiteEvent::Deleted(lo)) => {
                             let mut cache = watch_hub().cache.lock().unwrap();
-                            if let Some(map) = cache.get_mut(&key_for_task) { map.remove(&lo.uid); }
+                            if let Some(map) = cache.get_mut(&key_for_task) {
+                                map.remove(&lo.uid);
+                            }
                             let _ = tx.send(LiteEvent::Deleted(lo));
                         }
                         None => break,
@@ -74,7 +89,9 @@ pub(crate) fn watch_hub_snapshot(gvk_ns_key: &str) -> Vec<LiteObj> {
 
 pub(crate) fn watch_hub_prime(gvk_ns_key: &str, items: Vec<LiteObj>) {
     let mut cache = watch_hub().cache.lock().unwrap();
-    let entry = cache.entry(gvk_ns_key.to_string()).or_insert_with(|| std::collections::HashMap::new());
+    let entry = cache
+        .entry(gvk_ns_key.to_string())
+        .or_insert_with(|| std::collections::HashMap::new());
     for it in items {
         entry.insert(it.uid, it);
     }
@@ -88,7 +105,9 @@ pub(crate) fn watch_hub_snapshot_all() -> Vec<(String, LiteObj)> {
     for (key, map) in cache.iter() {
         // Keys are in the form "<gvk_label>|<ns>"; split at '|'
         if let Some((gvk_key, _ns)) = key.split_once('|') {
-            for lo in map.values() { out.push((gvk_key.to_string(), lo.clone())); }
+            for lo in map.values() {
+                out.push((gvk_key.to_string(), lo.clone()));
+            }
         }
     }
     out

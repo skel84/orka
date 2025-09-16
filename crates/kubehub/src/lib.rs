@@ -16,18 +16,18 @@ use kube::{
     Client,
 };
 use once_cell::sync::Lazy;
+use once_cell::sync::Lazy as StdLazy;
 use orka_core::{Delta, DeltaKind};
 use smallvec::SmallVec;
 use std::collections::HashMap;
 use std::fs;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::RwLock;
+use std::sync::RwLock as StdRwLock;
 use tokio::sync::mpsc;
 use tokio::sync::OnceCell;
-use once_cell::sync::Lazy as StdLazy;
-use std::sync::RwLock as StdRwLock;
 use uuid::Uuid;
-use std::sync::atomic::{AtomicU64, Ordering};
 
 // Reuse a single kube Client across this crate to avoid repeated setup costs.
 static KUBE_CLIENT: OnceCell<Client> = OnceCell::const_new();
@@ -79,7 +79,10 @@ pub async fn set_context(context: Option<&str>) -> Result<()> {
         }
         // Allow a conservative charset to avoid surprising inputs
         // Alnum, dash, underscore, dot, at, and colon are common in k8s contexts
-        if !name.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '-'|'_'|'.'|'@'|':')) {
+        if !name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.' | '@' | ':'))
+        {
             return Err(anyhow!("invalid context name: unsupported characters"));
         }
         if name.len() > 128 {
@@ -90,7 +93,10 @@ pub async fn set_context(context: Option<&str>) -> Result<()> {
         if !known.iter().any(|c| c == name) {
             return Err(anyhow!("unknown context: {}", name));
         }
-        let opts = KubeConfigOptions { context: Some(name.to_string()), ..Default::default() };
+        let opts = KubeConfigOptions {
+            context: Some(name.to_string()),
+            ..Default::default()
+        };
         let cfg = kube::Config::from_kubeconfig(&opts).await?;
         let client = Client::try_from(cfg)?;
         *OVERRIDE_CLIENT.write().unwrap() = Some(client);
@@ -570,7 +576,11 @@ pub async fn list_lite(gvk_key: &str, namespace: Option<&str>) -> Result<Vec<ork
         let list = api.list(&params).await?;
         let page_ms = l0.elapsed().as_millis() as f64;
         for o in list.items.iter() {
-            if *MEASURE_TRAFFIC { if let Ok(b) = serde_json::to_vec(o) { TRAFFIC_SNAPSHOT_BYTES.fetch_add(b.len() as u64, Ordering::Relaxed); } }
+            if *MEASURE_TRAFFIC {
+                if let Ok(b) = serde_json::to_vec(o) {
+                    TRAFFIC_SNAPSHOT_BYTES.fetch_add(b.len() as u64, Ordering::Relaxed);
+                }
+            }
             let mut lo = lite_from_dynamic(o)?;
             if let Some(p) = projector.as_ref() {
                 let enabled = std::env::var("ORKA_LITE_PROJECT")
@@ -630,7 +640,11 @@ pub async fn list_lite_first_page(
     let projector = orka_core::columns::builtin_projector_for(&gvk.group, &gvk.version, &gvk.kind);
     let mut out: Vec<orka_core::LiteObj> = Vec::with_capacity(list.items.len());
     for o in list.items.iter() {
-        if *MEASURE_TRAFFIC { if let Ok(b) = serde_json::to_vec(o) { TRAFFIC_SNAPSHOT_BYTES.fetch_add(b.len() as u64, Ordering::Relaxed); } }
+        if *MEASURE_TRAFFIC {
+            if let Ok(b) = serde_json::to_vec(o) {
+                TRAFFIC_SNAPSHOT_BYTES.fetch_add(b.len() as u64, Ordering::Relaxed);
+            }
+        }
         let mut lo = lite_from_dynamic(o)?;
         if let Some(p) = projector.as_ref() {
             let enabled = std::env::var("ORKA_LITE_PROJECT")

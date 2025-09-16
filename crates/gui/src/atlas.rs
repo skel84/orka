@@ -23,7 +23,11 @@ impl OrkaGuiApp {
             if ui.small_button("+").on_hover_text("Zoom in").clicked() {
                 self.graph.atlas_zoom = (self.graph.atlas_zoom * 1.1).min(4.0);
             }
-            if ui.small_button("Reset").on_hover_text("Reset view").clicked() {
+            if ui
+                .small_button("Reset")
+                .on_hover_text("Reset view")
+                .clicked()
+            {
                 self.graph.atlas_zoom = 1.0;
                 self.graph.atlas_pan = egui::vec2(0.0, 0.0);
             }
@@ -99,9 +103,17 @@ impl OrkaGuiApp {
             }
             if resp.clicked() {
                 // Toggle selection of namespace; clicking selected clears filter
-                if self.selection.namespace == ns { self.selection.namespace.clear(); } else { self.selection.namespace = ns.clone(); }
+                if self.selection.namespace == ns {
+                    self.selection.namespace.clear();
+                } else {
+                    self.selection.namespace = ns.clone();
+                }
                 // Toggle expansion state
-                if self.graph.atlas_expanded_ns.contains(&ns) { self.graph.atlas_expanded_ns.remove(&ns); } else { self.graph.atlas_expanded_ns.insert(ns.clone()); }
+                if self.graph.atlas_expanded_ns.contains(&ns) {
+                    self.graph.atlas_expanded_ns.remove(&ns);
+                } else {
+                    self.graph.atlas_expanded_ns.insert(ns.clone());
+                }
             }
             // Label
             painter.text(
@@ -129,7 +141,9 @@ impl OrkaGuiApp {
                     let kr = 18.0 * z.clamp(0.5, 1.3);
                     // count cache
                     let key = (ns.clone(), (*klabel).to_string());
-                    let cnt = if let Some(c) = self.graph.atlas_counts.get(&key).copied() { c } else {
+                    let cnt = if let Some(c) = self.graph.atlas_counts.get(&key).copied() {
+                        c
+                    } else {
                         let items = watch_hub_snapshot(&format!("{}|{}", gvk, ns));
                         let c = items.len();
                         self.graph.atlas_counts.insert(key.clone(), c);
@@ -144,49 +158,89 @@ impl OrkaGuiApp {
                         _ => ui.visuals().hyperlink_color,
                     };
                     painter.circle_filled(kp, kr, color.gamma_multiply(0.9));
-                    painter.circle_stroke(kp, kr, egui::Stroke::new(2.0, ui.visuals().widgets.noninteractive.bg_stroke.color));
+                    painter.circle_stroke(
+                        kp,
+                        kr,
+                        egui::Stroke::new(2.0, ui.visuals().widgets.noninteractive.bg_stroke.color),
+                    );
                     // label with count
                     let text = format!("{} ({})", klabel, cnt);
-                    painter.text(kp + egui::vec2(0.0, 24.0), egui::Align2::CENTER_TOP, text, egui::TextStyle::Small.resolve(ui.style()), ui.visuals().strong_text_color());
+                    painter.text(
+                        kp + egui::vec2(0.0, 24.0),
+                        egui::Align2::CENTER_TOP,
+                        text,
+                        egui::TextStyle::Small.resolve(ui.style()),
+                        ui.visuals().strong_text_color(),
+                    );
                     // interaction for kind node
                     let id = ui.make_persistent_id(("atlas_kind", &ns, *klabel));
                     let hit = egui::Rect::from_center_size(kp, egui::vec2(120.0, 40.0));
                     let resp = ui.interact(hit, id, egui::Sense::click());
-                    if resp.hovered() { ui.output_mut(|o| o.cursor_icon = egui::CursorIcon::PointingHand); }
+                    if resp.hovered() {
+                        ui.output_mut(|o| o.cursor_icon = egui::CursorIcon::PointingHand);
+                    }
                     if resp.clicked() {
                         let kkey = (ns.clone(), (*klabel).to_string());
-                        if self.graph.atlas_expanded_kinds.contains(&kkey) { self.graph.atlas_expanded_kinds.remove(&kkey); } else { self.graph.atlas_expanded_kinds.insert(kkey.clone()); }
+                        if self.graph.atlas_expanded_kinds.contains(&kkey) {
+                            self.graph.atlas_expanded_kinds.remove(&kkey);
+                        } else {
+                            self.graph.atlas_expanded_kinds.insert(kkey.clone());
+                        }
                     }
 
                     // expanded items under kind (disabled in MVP)
                     let kkey = (ns.clone(), (*klabel).to_string());
                     if false && self.graph.atlas_expanded_kinds.contains(&kkey) {
-                        let list = if let Some(v) = self.graph.atlas_items.get(&kkey) { v.clone() } else {
+                        let list = if let Some(v) = self.graph.atlas_items.get(&kkey) {
+                            v.clone()
+                        } else {
                             let items = watch_hub_snapshot(&format!("{}|{}", gvk, ns));
-                            let mut names: Vec<String> = items.into_iter().map(|o| o.name).collect();
+                            let mut names: Vec<String> =
+                                items.into_iter().map(|o| o.name).collect();
                             names.sort();
                             self.graph.atlas_items.insert(kkey.clone(), names.clone());
                             names
                         };
                         let mut shown = 0usize;
                         for (j, name) in list.into_iter().take(TOP_N).enumerate() {
-                            let p2 = to_screen(egui::pos2(lp.x + dx, lp.y + dy + 34.0 + j as f32 * 20.0));
+                            let p2 = to_screen(egui::pos2(
+                                lp.x + dx,
+                                lp.y + dy + 34.0 + j as f32 * 20.0,
+                            ));
                             let rect = egui::Rect::from_center_size(p2, egui::vec2(160.0, 18.0));
                             painter.rect_filled(rect, 4.0, ui.visuals().widgets.inactive.bg_fill);
                             painter.rect_stroke(
                                 rect,
                                 4.0,
-                                egui::Stroke::new(1.0, ui.visuals().widgets.noninteractive.bg_stroke.color),
+                                egui::Stroke::new(
+                                    1.0,
+                                    ui.visuals().widgets.noninteractive.bg_stroke.color,
+                                ),
                                 egui::StrokeKind::Inside,
                             );
-                            painter.text(rect.center(), egui::Align2::CENTER_CENTER, name, egui::TextStyle::Small.resolve(ui.style()), ui.visuals().text_color());
+                            painter.text(
+                                rect.center(),
+                                egui::Align2::CENTER_CENTER,
+                                name,
+                                egui::TextStyle::Small.resolve(ui.style()),
+                                ui.visuals().text_color(),
+                            );
                             shown += 1;
                         }
                         if let Some(c) = self.graph.atlas_counts.get(&kkey) {
                             if *c > shown {
                                 let more = format!("+{} more", c - shown);
-                                let p3 = to_screen(egui::pos2(lp.x + dx, lp.y + dy + 34.0 + shown as f32 * 20.0));
-                                painter.text(p3, egui::Align2::CENTER_CENTER, more, egui::TextStyle::Small.resolve(ui.style()), ui.visuals().weak_text_color());
+                                let p3 = to_screen(egui::pos2(
+                                    lp.x + dx,
+                                    lp.y + dy + 34.0 + shown as f32 * 20.0,
+                                ));
+                                painter.text(
+                                    p3,
+                                    egui::Align2::CENTER_CENTER,
+                                    more,
+                                    egui::TextStyle::Small.resolve(ui.style()),
+                                    ui.visuals().weak_text_color(),
+                                );
                             }
                         }
                     }
@@ -201,13 +255,21 @@ impl OrkaGuiApp {
 
     /// Ensure the Atlas tab exists in the dock and focus it.
     pub(crate) fn open_atlas_tab(&mut self) {
-        if !self.atlas_enabled { self.toast("atlas disabled (ORKA_ATLAS=0)", crate::model::ToastKind::Warn); return; }
+        if !self.atlas_enabled {
+            self.toast(
+                "atlas disabled (ORKA_ATLAS=0)",
+                crate::model::ToastKind::Warn,
+            );
+            return;
+        }
         if let Some(ds) = self.dock.as_mut() {
             let tree = ds.main_surface_mut();
             if let Some((node, tab_index)) = tree.find_tab_from(|t| matches!(t, Tab::Atlas)) {
                 tree.set_focused_node(node);
                 tree.set_active_tab(node, tab_index);
-            } else if let Some((node, _)) = tree.find_tab_from(|t| matches!(t, Tab::Results | Tab::Details | Tab::DetailsFor(_))) {
+            } else if let Some((node, _)) = tree
+                .find_tab_from(|t| matches!(t, Tab::Results | Tab::Details | Tab::DetailsFor(_)))
+            {
                 tree.set_focused_node(node);
                 tree.push_to_focused_leaf(Tab::Atlas);
             } else {
@@ -229,25 +291,43 @@ impl OrkaGuiApp {
             self.watch.updates_tx = Some(tx);
             self.watch.updates_rx = Some(rx);
         }
-        if self.watch.ns_task.is_some() { return; }
+        if self.watch.ns_task.is_some() {
+            return;
+        }
         let ns_tx = self.watch.updates_tx.as_ref().unwrap().clone();
         let ns_api = self.api.clone();
         let handle = tokio::spawn(async move {
             let key_ns = "v1/Namespace|".to_string();
-            let ns_kind = ResourceKind { group: String::new(), version: "v1".into(), kind: "Namespace".into(), namespaced: false };
-            let sel = Selector { gvk: ns_kind, namespace: None };
+            let ns_kind = ResourceKind {
+                group: String::new(),
+                version: "v1".into(),
+                kind: "Namespace".into(),
+                namespaced: false,
+            };
+            let sel = Selector {
+                gvk: ns_kind,
+                namespace: None,
+            };
             match watch_hub_subscribe(ns_api.clone(), sel).await {
                 Ok(mut rx) => {
                     let mut last_sent: usize = 0;
                     let mut send_list = || {
-                        let mut list: Vec<String> = watch_hub_snapshot(&key_ns).into_iter().map(|o| o.name).collect();
+                        let mut list: Vec<String> = watch_hub_snapshot(&key_ns)
+                            .into_iter()
+                            .map(|o| o.name)
+                            .collect();
                         list.sort();
                         list.dedup();
                         let len = list.len();
-                        if len != last_sent { let _ = ns_tx.send(UiUpdate::Namespaces(list)); last_sent = len; }
+                        if len != last_sent {
+                            let _ = ns_tx.send(UiUpdate::Namespaces(list));
+                            last_sent = len;
+                        }
                     };
                     send_list();
-                    while let Ok(_) = rx.recv().await { send_list(); }
+                    while let Ok(_) = rx.recv().await {
+                        send_list();
+                    }
                 }
                 Err(_e) => { /* no-op; will retry when selection changes */ }
             }
