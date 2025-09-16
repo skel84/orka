@@ -1,0 +1,25 @@
+[package]
+name = "orka-app"
+version = "0.0.1"
+edition = "2021"
+license = "Apache-2.0"
+description = "Orka desktop app (eframe/egui)"
+
+[[bin]]
+name = "orka"
+path = "src/main.rs"
+
+[dependencies]
+orka_gui = { path = "../gui" }
+orka_api = { path = "../api" }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+tokio = { workspace = true }
+
+[package.metadata.bundle]
+name = "Orka"
+identifier = "io.skel84.orka"
+icon = ["assets/macos/orka.icns"]
+version = "0.0.1"
+category = "Developer Tool"
+osx_minimum_system_version = "10.13"

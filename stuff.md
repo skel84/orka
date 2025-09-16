@@ -8,9 +8,11 @@
 - there's no indication when the result is empty, the spinner keeps spinning
 - with a lot of logs the program becomes slow and then unresponsive
 
+- edit does not show anything
+- port forward is not working, and i want to be able to only pick actually forwardable ports
+
 # Features
 
 - clicking on a namespace in the results area should filter by namespace 
-- logs should be colorized with tailspin crate
 - in the results area, there should be a namespace dropdown selector, filterable and with multi checkbox for multiple namespaces
 - add yaml syntax highlight to `egui_code_editor`

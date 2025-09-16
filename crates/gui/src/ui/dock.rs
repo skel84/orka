@@ -8,7 +8,9 @@ use crate::{OrkaGuiApp, Tab};
 use orka_core::Uid;
 
 pub(crate) fn show_dock(app: &mut OrkaGuiApp, ui: &mut egui::Ui) {
-    struct Viewer<'a> { app: &'a mut OrkaGuiApp }
+    struct Viewer<'a> {
+        app: &'a mut OrkaGuiApp,
+    }
     impl dock::TabViewer for Viewer<'_> {
         type Tab = Tab;
         fn title(&mut self, tab: &mut Self::Tab) -> egui::WidgetText {
@@ -21,8 +23,12 @@ pub(crate) fn show_dock(app: &mut OrkaGuiApp, ui: &mut egui::Ui) {
                         if let Some(row) = self.app.results.rows.get(i) {
                             let ns = row.namespace.as_deref().unwrap_or("-");
                             format!("Details: {}/{}", ns, row.name).into()
-                        } else { "Details".into() }
-                    } else { "Details".into() }
+                        } else {
+                            "Details".into()
+                        }
+                    } else {
+                        "Details".into()
+                    }
                 }
             }
         }
@@ -56,13 +62,12 @@ pub(crate) fn show_dock(app: &mut OrkaGuiApp, ui: &mut egui::Ui) {
         // Sync selection to currently focused Details tab (if any)
         {
             let tree = ds.main_surface_mut();
-            if let Some((_rect, tab)) = tree.find_active_focused() {
-                if let Tab::DetailsFor(uid) = *tab {
-                    if app.details.selected != Some(uid) {
-                        if let Some(i) = app.results.index.get(&uid).copied() {
-                            if let Some(row) = app.results.rows.get(i).cloned() {
-                                app.select_row(row);
-                            }
+            if let Some((_rect, Tab::DetailsFor(uid_ref))) = tree.find_active_focused() {
+                let uid = *uid_ref;
+                if app.details.selected != Some(uid) {
+                    if let Some(i) = app.results.index.get(&uid).copied() {
+                        if let Some(row) = app.results.rows.get(i).cloned() {
+                            app.select_row(row);
                         }
                     }
                 }
@@ -79,22 +84,26 @@ impl OrkaGuiApp {
 
     pub(crate) fn ensure_details_tab_in(&mut self, ds: &mut dock::DockState<Tab>, uid: Uid) {
         let tree = ds.main_surface_mut();
-        if let Some((node, tab_index)) = tree.find_tab_from(|t| matches!(t, Tab::DetailsFor(id) if *id == uid)) {
+        if let Some((node, tab_index)) =
+            tree.find_tab_from(|t| matches!(t, Tab::DetailsFor(id) if *id == uid))
+        {
             tree.set_focused_node(node);
             tree.set_active_tab(node, tab_index);
+        } else if let Some((node, _)) =
+            tree.find_tab_from(|t| matches!(t, Tab::DetailsFor(_) | Tab::Details))
+        {
+            tree.set_focused_node(node);
+            tree.push_to_focused_leaf(Tab::DetailsFor(uid));
         } else {
-            if let Some((node, _)) = tree.find_tab_from(|t| matches!(t, Tab::DetailsFor(_) | Tab::Details)) {
-                tree.set_focused_node(node);
-                tree.push_to_focused_leaf(Tab::DetailsFor(uid));
-            } else {
-                tree.split_right(dock::NodeIndex::root(), 0.5, vec![Tab::DetailsFor(uid)]);
-            }
+            tree.split_right(dock::NodeIndex::root(), 0.5, vec![Tab::DetailsFor(uid)]);
         }
         self.note_opened_details_uid(uid, ds);
     }
 
     fn note_opened_details_uid(&mut self, uid: Uid, ds: &mut dock::DockState<Tab>) {
-        if let Some(pos) = self.details_tab_order.iter().position(|u| *u == uid) { self.details_tab_order.remove(pos); }
+        if let Some(pos) = self.details_tab_order.iter().position(|u| *u == uid) {
+            self.details_tab_order.remove(pos);
+        }
         self.details_tab_order.push_back(uid);
         while self.details_tab_order.len() > self.details_tabs_cap {
             if let Some(old) = self.details_tab_order.pop_front() {

@@ -2,10 +2,10 @@
 
 use eframe::egui;
 
+use crate::model::{DetachedDetailsWindow, DetachedDetailsWindowMeta, DetachedDetailsWindowState};
+use crate::model::{EditUi, ExecState, LogsState, ServiceLogsState};
 use crate::OrkaGuiApp;
 use orka_core::Uid;
-use crate::model::{EditUi, LogsState, ExecState, ServiceLogsState};
-use crate::model::{DetachedDetailsWindow, DetachedDetailsWindowMeta, DetachedDetailsWindowState};
 use std::time::Instant;
 
 pub(crate) fn render_detached(app: &mut OrkaGuiApp, ctx: &egui::Context) {
@@ -27,19 +27,25 @@ pub(crate) fn render_detached(app: &mut OrkaGuiApp, ctx: &egui::Context) {
                 if ctx.input(|i| i.viewport().close_requested()) {
                     if app.logs_owner == Some(id) {
                         if let Some(w) = app.detached.iter_mut().find(|w| w.meta.id == id) {
-                            if let Some(c) = w.state.logs.cancel.take() { c.cancel(); }
+                            if let Some(c) = w.state.logs.cancel.take() {
+                                c.cancel();
+                            }
                             app.logs_owner = None;
                         }
                     }
                     if app.exec_owner == Some(id) {
                         if let Some(w) = app.detached.iter_mut().find(|w| w.meta.id == id) {
-                            if let Some(c) = w.state.exec.cancel.take() { c.cancel(); }
+                            if let Some(c) = w.state.exec.cancel.take() {
+                                c.cancel();
+                            }
                             app.exec_owner = None;
                         }
                     }
                     if app.svc_logs_owner == Some(id) {
                         if let Some(w) = app.detached.iter_mut().find(|w| w.meta.id == id) {
-                            if let Some(c) = w.state.svc_logs.cancel.take() { c.cancel(); }
+                            if let Some(c) = w.state.svc_logs.cancel.take() {
+                                c.cancel();
+                            }
                             app.svc_logs_owner = None;
                         }
                     }
@@ -73,9 +79,18 @@ pub(crate) fn render_detached(app: &mut OrkaGuiApp, ctx: &egui::Context) {
                         app.details.selected = Some(uid);
                         app.details.active_tab = win_active_tab;
                         // Swap logs/exec/svc_logs state in
-                        let mut win_logs = { let w = &mut app.detached[idx]; std::mem::take(&mut w.state.logs) };
-                        let mut win_exec = { let w = &mut app.detached[idx]; std::mem::take(&mut w.state.exec) };
-                        let mut win_svc_logs = { let w = &mut app.detached[idx]; std::mem::take(&mut w.state.svc_logs) };
+                        let win_logs = {
+                            let w = &mut app.detached[idx];
+                            std::mem::take(&mut w.state.logs)
+                        };
+                        let win_exec = {
+                            let w = &mut app.detached[idx];
+                            std::mem::take(&mut w.state.exec)
+                        };
+                        let win_svc_logs = {
+                            let w = &mut app.detached[idx];
+                            std::mem::take(&mut w.state.svc_logs)
+                        };
                         let main_logs = std::mem::replace(&mut app.logs, win_logs);
                         let main_exec = std::mem::replace(&mut app.exec, win_exec);
                         let main_svc_logs = std::mem::replace(&mut app.svc_logs, win_svc_logs);
@@ -122,21 +137,42 @@ pub(crate) fn render_detached(app: &mut OrkaGuiApp, ctx: &egui::Context) {
     }
     let to_close = close_reqs.borrow().clone();
     if !to_close.is_empty() {
-        app.detached.retain(|w| !to_close.iter().any(|id| *id == w.meta.id));
+        app.detached.retain(|w| !to_close.contains(&w.meta.id));
     }
 }
 
 impl OrkaGuiApp {
     /// Open a detached OS window to show details for the given UID.
     pub(crate) fn open_detached_for(&mut self, ctx: &egui::Context, uid: orka_core::Uid) {
-        if self.detached.iter().any(|w| w.meta.uid == uid) { return; }
+        if self.detached.iter().any(|w| w.meta.uid == uid) {
+            return;
+        }
         let (ns, name) = if let Some(i) = self.results.index.get(&uid).copied() {
-            if let Some(row) = self.results.rows.get(i) { (row.namespace.clone(), row.name.clone()) } else { (None, String::from("")) }
-        } else { (None, String::from("")) };
-        let gvk = match self.current_selected_kind() { Some(k) => k.clone(), None => return };
-        let title = match &ns { Some(ns) => format!("Details: {}/{}", ns, name), None => format!("Details: {}", name) };
+            if let Some(row) = self.results.rows.get(i) {
+                (row.namespace.clone(), row.name.clone())
+            } else {
+                (None, String::from(""))
+            }
+        } else {
+            (None, String::from(""))
+        };
+        let gvk = match self.current_selected_kind() {
+            Some(k) => k.clone(),
+            None => return,
+        };
+        let title = match &ns {
+            Some(ns) => format!("Details: {}/{}", ns, name),
+            None => format!("Details: {}", name),
+        };
         let id = egui::ViewportId::from_hash_of(("orka_details", uid));
-        let meta = DetachedDetailsWindowMeta { id, uid, title, gvk: gvk.clone(), namespace: ns.clone(), name: name.clone() };
+        let meta = DetachedDetailsWindowMeta {
+            id,
+            uid,
+            title,
+            gvk: gvk.clone(),
+            namespace: ns.clone(),
+            name: name.clone(),
+        };
         let state = DetachedDetailsWindowState {
             buffer: String::new(),
             last_error: None,
@@ -149,71 +185,79 @@ impl OrkaGuiApp {
                 running: self.edit.running,
                 status: self.edit.status.clone(),
             },
-            logs: {
-                let mut l = LogsState::default();
-                l.follow = self.logs.follow;
-                l.grep = String::new();
-                l.backlog = std::collections::VecDeque::with_capacity(self.logs.backlog_cap.min(256));
-                l.backlog_cap = self.logs.backlog_cap;
-                l.dropped = 0;
-                l.recv = 0;
-                l.containers = self.logs.containers.clone();
-                l.container = self.logs.container.clone();
-                l.tail_lines = self.logs.tail_lines;
-                l.since_seconds = self.logs.since_seconds;
-                l.ring = std::collections::VecDeque::with_capacity(self.logs.ring_cap.min(256));
-                l.ring_cap = self.logs.ring_cap;
-                l.wrap = self.logs.wrap;
-                l.colorize = self.logs.colorize;
-                l.visible_follow_limit = self.logs.visible_follow_limit;
-                l.order_by_ts_when_paused = self.logs.order_by_ts_when_paused;
-                l.follow_pad_rows = self.logs.follow_pad_rows;
-                l.prefix_theme = self.logs.prefix_theme;
-                l.grep_cache = None;
-                l.grep_error = None;
-                l.v2 = self.logs.v2;
-                l
+            logs: LogsState {
+                running: false,
+                follow: self.logs.follow,
+                grep: String::new(),
+                backlog: std::collections::VecDeque::with_capacity(self.logs.backlog_cap.min(256)),
+                backlog_cap: self.logs.backlog_cap,
+                dropped: 0,
+                recv: 0,
+                containers: self.logs.containers.clone(),
+                container: self.logs.container.clone(),
+                tail_lines: self.logs.tail_lines,
+                since_seconds: self.logs.since_seconds,
+                task: None,
+                cancel: None,
+                ring: std::collections::VecDeque::with_capacity(self.logs.ring_cap.min(256)),
+                ring_cap: self.logs.ring_cap,
+                wrap: self.logs.wrap,
+                colorize: self.logs.colorize,
+                visible_follow_limit: self.logs.visible_follow_limit,
+                order_by_ts_when_paused: self.logs.order_by_ts_when_paused,
+                follow_pad_rows: self.logs.follow_pad_rows,
+                prefix_theme: self.logs.prefix_theme,
+                grep_cache: None,
+                grep_error: None,
+                v2: self.logs.v2,
             },
-            exec: {
-                let mut e = ExecState::default();
-                e.pty = self.exec.pty;
-                e.cmd = self.exec.cmd.clone();
-                e.container = self.exec.container.clone();
-                e.backlog = std::collections::VecDeque::with_capacity(self.exec.backlog_cap.min(256));
-                e.backlog_cap = self.exec.backlog_cap;
-                e.dropped = 0;
-                e.recv = 0;
-                e.stdin_buf = String::new();
-                e.last_cols = None;
-                e.last_rows = None;
-                e.term = None;
-                e.focused = false;
-                e.mode_oneshot = self.exec.mode_oneshot;
-                e.external_cmd = self.exec.external_cmd.clone();
-                e
+            exec: ExecState {
+                running: false,
+                pty: self.exec.pty,
+                cmd: self.exec.cmd.clone(),
+                container: self.exec.container.clone(),
+                backlog: std::collections::VecDeque::with_capacity(self.exec.backlog_cap.min(256)),
+                backlog_cap: self.exec.backlog_cap,
+                dropped: 0,
+                recv: 0,
+                stdin_buf: String::new(),
+                task: None,
+                cancel: None,
+                input: None,
+                resize: None,
+                last_cols: None,
+                last_rows: None,
+                term: None,
+                focused: false,
+                mode_oneshot: self.exec.mode_oneshot,
+                external_cmd: self.exec.external_cmd.clone(),
             },
-            svc_logs: {
-                let mut s = ServiceLogsState::default();
-                s.follow = self.svc_logs.follow;
-                s.grep = String::new();
-                s.grep_cache = None;
-                s.grep_error = None;
-                s.ring = std::collections::VecDeque::with_capacity(self.svc_logs.ring_cap.min(256));
-                s.ring_cap = self.svc_logs.ring_cap;
-                s.recv = 0;
-                s.dropped = 0;
-                s.tail_lines = self.svc_logs.tail_lines;
-                s.since_seconds = self.svc_logs.since_seconds;
-                s.visible_follow_limit = self.svc_logs.visible_follow_limit;
-                s.colorize = self.svc_logs.colorize;
-                s.order_by_ts_when_paused = self.svc_logs.order_by_ts_when_paused;
-                s.follow_pad_rows = self.svc_logs.follow_pad_rows;
-                s.v2 = self.svc_logs.v2;
-                s.prefix_theme = self.svc_logs.prefix_theme;
-                s
+            svc_logs: ServiceLogsState {
+                running: false,
+                follow: self.svc_logs.follow,
+                grep: String::new(),
+                grep_cache: None,
+                grep_error: None,
+                ring: std::collections::VecDeque::with_capacity(self.svc_logs.ring_cap.min(256)),
+                ring_cap: self.svc_logs.ring_cap,
+                recv: 0,
+                dropped: 0,
+                tail_lines: self.svc_logs.tail_lines,
+                since_seconds: self.svc_logs.since_seconds,
+                task: None,
+                cancel: None,
+                visible_follow_limit: self.svc_logs.visible_follow_limit,
+                colorize: self.svc_logs.colorize,
+                order_by_ts_when_paused: self.svc_logs.order_by_ts_when_paused,
+                follow_pad_rows: self.svc_logs.follow_pad_rows,
+                v2: self.svc_logs.v2,
+                prefix_theme: self.svc_logs.prefix_theme,
             },
         };
-        self.detached.push(DetachedDetailsWindow { meta: meta.clone(), state });
+        self.detached.push(DetachedDetailsWindow {
+            meta: meta.clone(),
+            state,
+        });
         ctx.request_repaint();
     }
 }

@@ -7,7 +7,12 @@ use regex::Regex;
 
 // Minimal ANSI SGR parsing for 0 (reset), 30–37 and 90–97 (foreground colors)
 // Returns a LayoutJob with segments colored accordingly.
-pub fn parse_line_to_job(line: &str, default_color: egui::Color32, colorize: bool) -> egui::text::LayoutJob {
+#[allow(dead_code)]
+pub fn parse_line_to_job(
+    line: &str,
+    default_color: egui::Color32,
+    colorize: bool,
+) -> egui::text::LayoutJob {
     parse_line_to_job_hl(line, default_color, colorize, None, egui::Color32::YELLOW)
 }
 
@@ -20,9 +25,11 @@ pub fn parse_line_to_job_hl(
 ) -> egui::text::LayoutJob {
     let mut job = egui::text::LayoutJob::default();
     // Always use monospace for logs
-    let mut fmt = egui::TextFormat::default();
-    fmt.font_id = egui::FontId::monospace(12.0);
-    fmt.color = default_color;
+    let fmt = egui::TextFormat {
+        font_id: egui::FontId::monospace(12.0),
+        color: default_color,
+        ..Default::default()
+    };
 
     let tailspin_on = colorize;
 
@@ -57,7 +64,9 @@ pub fn parse_line_to_job_hl(
         // Accumulate until next ESC or end
         let seg_start = i;
         while i < bytes.len() {
-            if bytes[i] == 0x1b { break; }
+            if bytes[i] == 0x1b {
+                break;
+            }
             i += 1;
         }
         let seg = &line[seg_start..i];
@@ -81,7 +90,8 @@ fn apply_sgr(seq: &str, fmt: &mut egui::TextFormat, default_color: egui::Color32
     for part in seq.split(';') {
         if let Ok(code) = part.parse::<i32>() {
             match code {
-                0 => { // reset
+                0 => {
+                    // reset
                     fmt.color = default_color;
                     fmt.italics = false;
                     fmt.underline = egui::Stroke::NONE;
@@ -145,8 +155,9 @@ fn append_tailspin_segment_with_hl(
             (?P<ts>\b\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:\d{2})\b)
             |
             (?P<num>\b\d+(?:\.\d+)?\b)
-            "
-        ).unwrap()
+            ",
+        )
+        .unwrap()
     });
     let mut idx = 0usize;
     // Collect tailspin-colored segments first
@@ -154,37 +165,40 @@ fn append_tailspin_segment_with_hl(
     while let Some(caps) = TS_RE.captures_at(seg, idx) {
         let m = caps.get(0).unwrap();
         if m.start() > idx {
-            pieces.push((std::borrow::Cow::from(&seg[idx..m.start()]), base_fmt.clone()));
+            pieces.push((
+                std::borrow::Cow::from(&seg[idx..m.start()]),
+                base_fmt.clone(),
+            ));
         }
         let mut fmt = base_fmt.clone();
         // Only override color if the base format is the default (avoid fighting ANSI colors)
         let can_override = base_fmt.color == default_color;
         if let Some(g) = caps.name("level") {
-            if g.start() == m.start() && g.end() == m.end() {
-                if can_override {
-                    let word = seg[m.start()..m.end()].to_ascii_lowercase();
-                    fmt.color = match word.as_str() {
-                        "error" => egui::Color32::from_rgb(0xE0, 0x40, 0x40),
-                        "warn" | "warning" => egui::Color32::from_rgb(0xE0, 0xB0, 0x40),
-                        "info" => egui::Color32::from_rgb(0x40, 0xA0, 0x40),
-                        "debug" => egui::Color32::from_rgb(0x50, 0x80, 0xD0),
-                        "trace" => egui::Color32::from_gray(180),
-                        _ => base_fmt.color,
-                    };
-                }
+            if g.start() == m.start() && g.end() == m.end() && can_override {
+                let word = seg[m.start()..m.end()].to_ascii_lowercase();
+                fmt.color = match word.as_str() {
+                    "error" => egui::Color32::from_rgb(0xE0, 0x40, 0x40),
+                    "warn" | "warning" => egui::Color32::from_rgb(0xE0, 0xB0, 0x40),
+                    "info" => egui::Color32::from_rgb(0x40, 0xA0, 0x40),
+                    "debug" => egui::Color32::from_rgb(0x50, 0x80, 0xD0),
+                    "trace" => egui::Color32::from_gray(180),
+                    _ => base_fmt.color,
+                };
             }
         } else if let Some(g) = caps.name("ts") {
-            if g.start() == m.start() && g.end() == m.end() {
-                if can_override { fmt.color = egui::Color32::from_gray(180); }
+            if g.start() == m.start() && g.end() == m.end() && can_override {
+                fmt.color = egui::Color32::from_gray(180);
             }
         } else if let Some(g) = caps.name("num") {
-            if g.start() == m.start() && g.end() == m.end() {
-                if can_override { fmt.color = egui::Color32::from_rgb(0x40, 0xC0, 0xC0); }
+            if g.start() == m.start() && g.end() == m.end() && can_override {
+                fmt.color = egui::Color32::from_rgb(0x40, 0xC0, 0xC0);
             }
         }
         pieces.push((std::borrow::Cow::from(m.as_str()), fmt));
         idx = m.end();
-        if idx >= seg.len() { break; }
+        if idx >= seg.len() {
+            break;
+        }
     }
     if idx < seg.len() {
         pieces.push((std::borrow::Cow::from(&seg[idx..]), base_fmt.clone()));
@@ -212,12 +226,17 @@ fn append_with_highlight(
     for m in re.find_iter(text) {
         let start = m.start();
         let end = m.end();
-        if start == end { continue; } // skip zero-width
+        if start == end {
+            continue;
+        } // skip zero-width
         if start > last {
             job.append(&text[last..start], 0.0, base_fmt.clone());
         }
         let mut fmt = base_fmt.clone();
-        fmt.underline = egui::Stroke { width: 1.5, color: hl_color };
+        fmt.underline = egui::Stroke {
+            width: 1.5,
+            color: hl_color,
+        };
         job.append(&text[start..end], 0.0, fmt);
         last = end;
     }

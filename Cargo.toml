@@ -11,6 +11,7 @@ members = [
     "crates/apply",
     "crates/ops",
     "crates/gui",
+    "crates/app",
 ]
 resolver = "2"
 

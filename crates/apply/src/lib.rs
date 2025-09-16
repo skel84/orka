@@ -3,12 +3,17 @@
 #![forbid(unsafe_code)]
 
 use anyhow::{anyhow, Context, Result};
-use kube::{api::{Api, Patch, PatchParams}, core::{DynamicObject, GroupVersionKind}, discovery::{Discovery, Scope}, Client};
+use kube::{
+    api::{Api, Patch, PatchParams},
+    core::{DynamicObject, GroupVersionKind},
+    discovery::{Discovery, Scope},
+    Client,
+};
 use metrics::{counter, histogram};
+use orka_persist::Store;
 use serde::{Deserialize, Serialize};
 use serde_json::Value as Json;
 use tracing::warn;
-use orka_persist::Store;
 use uuid::Uuid;
 
 fn max_yaml_bytes() -> usize {
@@ -28,18 +33,24 @@ fn max_yaml_nodes() -> usize {
 fn json_node_budget_exceeded(v: &Json, max: usize) -> bool {
     // Fast precheck: keep a running counter and bail early when exceeding max
     fn walk(v: &Json, cur: &mut usize, max: usize) {
-        if *cur >= max { return; }
+        if *cur >= max {
+            return;
+        }
         *cur += 1;
         match v {
             Json::Object(map) => {
                 for (_k, vv) in map.iter() {
-                    if *cur >= max { break; }
+                    if *cur >= max {
+                        break;
+                    }
                     walk(vv, cur, max);
                 }
             }
             Json::Array(arr) => {
                 for vv in arr.iter() {
-                    if *cur >= max { break; }
+                    if *cur >= max {
+                        break;
+                    }
                     walk(vv, cur, max);
                 }
             }
@@ -52,7 +63,11 @@ fn json_node_budget_exceeded(v: &Json, max: usize) -> bool {
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
-pub struct DiffSummary { pub adds: usize, pub updates: usize, pub removes: usize }
+pub struct DiffSummary {
+    pub adds: usize,
+    pub updates: usize,
+    pub removes: usize,
+}
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ApplyResult {
@@ -109,7 +124,13 @@ pub async fn edit_from_yaml(
             Ok(_) => {
                 histogram!("apply_latency_ms", t0.elapsed().as_secs_f64() * 1000.0);
                 counter!("apply_dry_ok", 1u64);
-                return Ok(ApplyResult { dry_run: true, applied: false, new_rv: None, warnings: vec![], summary });
+                return Ok(ApplyResult {
+                    dry_run: true,
+                    applied: false,
+                    new_rv: None,
+                    warnings: vec![],
+                    summary,
+                });
             }
             Err(e) => {
                 counter!("apply_err", 1u64);
@@ -123,7 +144,10 @@ pub async fn edit_from_yaml(
     if std::env::var("ORKA_DISABLE_APPLY_PREFLIGHT").is_err() {
         if let Some(prev_live) = &live_json {
             let prev_rv = prev_live
-                .get("metadata").and_then(|m| m.get("resourceVersion")).and_then(|v| v.as_str()).map(|s| s.to_string());
+                .get("metadata")
+                .and_then(|m| m.get("resourceVersion"))
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string());
             if let Some(prev_rv) = prev_rv {
                 if let Some(obj2) = api.get_opt(&name).await? {
                     let cur_rv = obj2.metadata.resource_version.clone().unwrap_or_default();
@@ -143,7 +167,10 @@ pub async fn edit_from_yaml(
     let pp = PatchParams::apply("orka");
     let obj = match api.patch(&name, &pp, &Patch::Apply(&json)).await {
         Ok(o) => o,
-        Err(e) => { counter!("apply_err", 1u64); return Err(anyhow!("server-side apply failed: {}", e)); }
+        Err(e) => {
+            counter!("apply_err", 1u64);
+            return Err(anyhow!("server-side apply failed: {}", e));
+        }
     };
     let new_rv = obj.metadata.resource_version.clone();
     histogram!("apply_latency_ms", t0.elapsed().as_secs_f64() * 1000.0);
@@ -156,22 +183,42 @@ pub async fn edit_from_yaml(
         .unwrap_or(false);
     let is_secret = gvk.group.is_empty() && gvk.kind == "Secret";
     if !disable_persist && !is_secret {
-        let uid = obj.metadata.uid.as_deref().ok_or_else(|| anyhow!("applied object missing metadata.uid"))?;
+        let uid = obj
+            .metadata
+            .uid
+            .as_deref()
+            .ok_or_else(|| anyhow!("applied object missing metadata.uid"))?;
         let uid_bin = parse_uid(uid)?;
         let rv = new_rv.clone().unwrap_or_default();
-        let la = orka_persist::LastApplied { uid: uid_bin, rv, ts: orka_persist::now_ts(), yaml_zstd: orka_persist::maybe_compress(yaml) };
+        let la = orka_persist::LastApplied {
+            uid: uid_bin,
+            rv,
+            ts: orka_persist::now_ts(),
+            yaml_zstd: orka_persist::maybe_compress(yaml),
+        };
         match orka_persist::LogStore::open_default() {
-            Ok(store) => { let _ = store.put_last(la); }
+            Ok(store) => {
+                let _ = store.put_last(la);
+            }
             Err(e) => warn!(error = %e, "persist open failed; skipping last-applied save"),
         }
     } else if is_secret {
         warn!("skipping last-applied persist for Secret kind");
     }
 
-    Ok(ApplyResult { dry_run: false, applied: true, new_rv, warnings: vec![], summary })
+    Ok(ApplyResult {
+        dry_run: false,
+        applied: true,
+        new_rv,
+        warnings: vec![],
+        summary,
+    })
 }
 
-pub async fn diff_from_yaml(yaml: &str, ns_override: Option<&str>) -> Result<(DiffSummary, Option<DiffSummary>)> {
+pub async fn diff_from_yaml(
+    yaml: &str,
+    ns_override: Option<&str>,
+) -> Result<(DiffSummary, Option<DiffSummary>)> {
     let (json, gvk, name, ns) = parse_yaml_for_target(yaml, ns_override)?;
     let client = orka_kubehub::get_kube_client().await?;
     let (ar, namespaced) = find_api_resource(client.clone(), &gvk).await?;
@@ -195,43 +242,102 @@ pub async fn diff_from_yaml(yaml: &str, ns_override: Option<&str>) -> Result<(Di
     let live_summary = diff_summary(&tgt_json, &live_json.clone().unwrap_or(Json::Null));
 
     // Diff against last-applied if present
-    let last_summary = if let Some(uid_str) = live_json.as_ref().and_then(|v| v.get("metadata")).and_then(|m| m.get("uid")).and_then(|s| s.as_str()) {
+    let last_summary = if let Some(uid_str) = live_json
+        .as_ref()
+        .and_then(|v| v.get("metadata"))
+        .and_then(|m| m.get("uid"))
+        .and_then(|s| s.as_str())
+    {
         if let Ok(store) = orka_persist::LogStore::open_default() {
             if let Ok(rows) = store.get_last(parse_uid(uid_str)?, Some(1)) {
-                if let Some(top) = rows.get(0) {
+                if let Some(top) = rows.first() {
                     let prev_yaml = orka_persist::maybe_decompress(&top.yaml_zstd);
-                    if let Ok(prev_val_yaml) = serde_yaml::from_str::<serde_yaml::Value>(&prev_yaml) {
+                    if let Ok(prev_val_yaml) = serde_yaml::from_str::<serde_yaml::Value>(&prev_yaml)
+                    {
                         let prev_json = serde_json::to_value(prev_val_yaml).unwrap_or(Json::Null);
                         let prev = strip_noisy(prev_json);
                         let sum = diff_summary(&tgt_json, &prev);
                         Some(sum)
-                    } else { None }
-                } else { None }
-            } else { None }
-        } else { None }
-    } else { None };
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                }
+            } else {
+                None
+            }
+        } else {
+            None
+        }
+    } else {
+        None
+    };
 
     Ok((live_summary, last_summary))
 }
 
-fn parse_yaml_for_target(yaml: &str, ns_override: Option<&str>) -> Result<(Json, GroupVersionKind, String, Option<String>)> {
+fn parse_yaml_for_target(
+    yaml: &str,
+    ns_override: Option<&str>,
+) -> Result<(Json, GroupVersionKind, String, Option<String>)> {
     if yaml.len() > max_yaml_bytes() {
-        return Err(anyhow!("YAML payload too large (>{} bytes)", max_yaml_bytes()));
+        return Err(anyhow!(
+            "YAML payload too large (>{} bytes)",
+            max_yaml_bytes()
+        ));
     }
     let val: serde_yaml::Value = serde_yaml::from_str(yaml).context("parsing YAML")?;
     let json = serde_json::to_value(val).context("converting YAML to JSON")?;
     if json_node_budget_exceeded(&json, max_yaml_nodes()) {
-        return Err(anyhow!("YAML document too complex (>{} nodes)", max_yaml_nodes()));
+        return Err(anyhow!(
+            "YAML document too complex (>{} nodes)",
+            max_yaml_nodes()
+        ));
     }
-    let api_version_s = json.get("apiVersion").and_then(|v| v.as_str()).ok_or_else(|| anyhow!("YAML missing apiVersion"))?.to_string();
-    let kind_s = json.get("kind").and_then(|v| v.as_str()).ok_or_else(|| anyhow!("YAML missing kind"))?.to_string();
-    let (group, version) = if let Some((g, v)) = api_version_s.split_once('/') { (g.to_string(), v.to_string()) } else { (String::new(), api_version_s) };
-    let name = json.get("metadata").and_then(|m| m.get("name")).and_then(|v| v.as_str()).ok_or_else(|| anyhow!("YAML missing metadata.name"))?.to_string();
-    let ns = ns_override.map(|s| s.to_string()).or_else(|| json.get("metadata").and_then(|m| m.get("namespace")).and_then(|v| v.as_str()).map(|s| s.to_string()));
-    Ok((json, GroupVersionKind { group, version, kind: kind_s }, name, ns))
+    let api_version_s = json
+        .get("apiVersion")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| anyhow!("YAML missing apiVersion"))?
+        .to_string();
+    let kind_s = json
+        .get("kind")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| anyhow!("YAML missing kind"))?
+        .to_string();
+    let (group, version) = if let Some((g, v)) = api_version_s.split_once('/') {
+        (g.to_string(), v.to_string())
+    } else {
+        (String::new(), api_version_s)
+    };
+    let name = json
+        .get("metadata")
+        .and_then(|m| m.get("name"))
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| anyhow!("YAML missing metadata.name"))?
+        .to_string();
+    let ns = ns_override.map(|s| s.to_string()).or_else(|| {
+        json.get("metadata")
+            .and_then(|m| m.get("namespace"))
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string())
+    });
+    Ok((
+        json,
+        GroupVersionKind {
+            group,
+            version,
+            kind: kind_s,
+        },
+        name,
+        ns,
+    ))
 }
 
-async fn find_api_resource(client: Client, gvk: &GroupVersionKind) -> Result<(kube::core::ApiResource, bool)> {
+async fn find_api_resource(
+    client: Client,
+    gvk: &GroupVersionKind,
+) -> Result<(kube::core::ApiResource, bool)> {
     let discovery = Discovery::new(client).run().await?;
     for group in discovery.groups() {
         for (ar, caps) in group.recommended_resources() {
@@ -241,7 +347,12 @@ async fn find_api_resource(client: Client, gvk: &GroupVersionKind) -> Result<(ku
             }
         }
     }
-    Err(anyhow!("GVK not found: {}/{}/{}", gvk.group, gvk.version, gvk.kind))
+    Err(anyhow!(
+        "GVK not found: {}/{}/{}",
+        gvk.group,
+        gvk.version,
+        gvk.kind
+    ))
 }
 
 fn strip_noisy(mut v: Json) -> Json {
@@ -254,15 +365,23 @@ fn strip_noisy(mut v: Json) -> Json {
         }
     }
     // Status is server-populated; ignore it during diffs
-    if let Some(obj) = v.as_object_mut() { obj.remove("status"); }
+    if let Some(obj) = v.as_object_mut() {
+        obj.remove("status");
+    }
     v
 }
 
 fn ensure_metadata(v: &mut Json, name: &str, ns: Option<&str>) {
-    let meta = v.as_object_mut().unwrap().entry("metadata").or_insert(Json::Object(serde_json::Map::new()));
+    let meta = v
+        .as_object_mut()
+        .unwrap()
+        .entry("metadata")
+        .or_insert(Json::Object(serde_json::Map::new()));
     if let Some(obj) = meta.as_object_mut() {
         obj.insert("name".into(), Json::String(name.to_string()));
-        if let Some(ns) = ns { obj.insert("namespace".into(), Json::String(ns.to_string())); }
+        if let Some(ns) = ns {
+            obj.insert("namespace".into(), Json::String(ns.to_string()));
+        }
     }
 }
 
@@ -273,29 +392,51 @@ pub fn diff_summary(target: &Json, base: &Json) -> DiffSummary {
             (V::Object(ao), V::Object(bo)) => {
                 for (k, av) in ao.iter() {
                     if let Some(bv) = bo.get(k) {
-                        if av == bv { continue; }
+                        if av == bv {
+                            continue;
+                        }
                         walk(av, bv, adds, ups, rems);
                     } else {
                         *adds += 1;
                     }
                 }
                 for (k, _bv) in bo.iter() {
-                    if !ao.contains_key(k) { *rems += 1; }
+                    if !ao.contains_key(k) {
+                        *rems += 1;
+                    }
                 }
             }
             (V::Array(aa), V::Array(bb)) => {
                 let min_len = aa.len().min(bb.len());
-                for i in 0..min_len { if aa[i] != bb[i] { *ups += 1; } }
-                if aa.len() > bb.len() { *adds += aa.len() - bb.len(); }
-                if bb.len() > aa.len() { *rems += bb.len() - aa.len(); }
+                for i in 0..min_len {
+                    if aa[i] != bb[i] {
+                        *ups += 1;
+                    }
+                }
+                if aa.len() > bb.len() {
+                    *adds += aa.len() - bb.len();
+                }
+                if bb.len() > aa.len() {
+                    *rems += bb.len() - aa.len();
+                }
             }
             // Scalars differ or type differs
-            (av, bv) => { if av != bv { *ups += 1; } }
+            (av, bv) => {
+                if av != bv {
+                    *ups += 1;
+                }
+            }
         }
     }
-    let mut adds = 0usize; let mut ups = 0usize; let mut rems = 0usize;
+    let mut adds = 0usize;
+    let mut ups = 0usize;
+    let mut rems = 0usize;
     walk(target, base, &mut adds, &mut ups, &mut rems);
-    DiffSummary { adds, updates: ups, removes: rems }
+    DiffSummary {
+        adds,
+        updates: ups,
+        removes: rems,
+    }
 }
 
 fn parse_uid(uid_str: &str) -> Result<[u8; 16]> {

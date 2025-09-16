@@ -1,10 +1,6 @@
-Of course. Here is a concrete plan to simplify the Orka project, directly inspired by antirez's philosophy of prioritizing simplicity, predictability, and pragmatism.
-
-***
-
 ## Plan: The Orka Simplification Initiative
 
-### Guiding Principles (The Antirez Doctrine)
+### Guiding Principles
 
 1.  **Less Is More:** Every line of code, every dependency, and every feature adds complexity. We will aggressively challenge complexity and remove anything that is not essential to the core mission.
 2.  **Predictable State Machine:** The system's core data flow must be simple and easy to reason about. We will favor linear, single-threaded-like logic over concurrent complexity wherever possible.

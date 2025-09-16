@@ -108,7 +108,7 @@ dependencies = [
  "accesskit_macos",
  "accesskit_unix",
  "accesskit_windows",
- "raw-window-handle",
+ "raw-window-handle 0.6.2",
  "winit",
 ]
 
@@ -1239,7 +1239,7 @@ dependencies = [
  "percent-encoding",
  "pollster 0.4.0",
  "profiling",
- "raw-window-handle",
+ "raw-window-handle 0.6.2",
  "static_assertions",
  "wasm-bindgen",
  "wasm-bindgen-futures",
@@ -1314,10 +1314,10 @@ dependencies = [
  "egui 0.32.2",
  "log",
  "profiling",
- "raw-window-handle",
+ "raw-window-handle 0.6.2",
  "smithay-clipboard",
  "web-time",
- "webbrowser",
+ "webbrowser 1.0.5",
  "winit",
 ]
 
@@ -1871,7 +1871,7 @@ dependencies = [
  "objc2-core-foundation",
  "objc2-foundation 0.3.1",
  "once_cell",
- "raw-window-handle",
+ "raw-window-handle 0.6.2",
  "wayland-sys",
  "windows-sys 0.52.0",
  "x11-dl",
@@ -1885,7 +1885,7 @@ checksum = "85edca7075f8fc728f28cb8fbb111a96c3b89e930574369e3e9c27eb75d3788f"
 dependencies = [
  "cfg_aliases",
  "glutin",
- "raw-window-handle",
+ "raw-window-handle 0.6.2",
  "winit",
 ]
 
@@ -3037,7 +3037,7 @@ dependencies = [
  "log",
  "ndk-sys 0.6.0+11769913",
  "num_enum",
- "raw-window-handle",
+ "raw-window-handle 0.6.2",
  "thiserror 1.0.69",
 ]
 
@@ -3669,6 +3669,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "orka-app"
+version = "0.0.1"
+dependencies = [
+ "orka_api",
+ "orka_gui",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
 name = "orka-apply"
 version = "0.1.0"
 dependencies = [
@@ -3840,6 +3851,7 @@ dependencies = [
  "tracing",
  "uuid",
  "vte",
+ "webbrowser 0.8.15",
 ]
 
 [[package]]
@@ -3880,7 +3892,6 @@ dependencies = [
  "orka-search",
  "orka-store",
  "orka_api",
- "orka_gui",
  "orka_ops",
  "regex",
  "serde",
@@ -4296,6 +4307,12 @@ dependencies = [
 
 [[package]]
 name = "raw-window-handle"
+version = "0.5.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f2ff9a1f06a88b01621b7ae906ef0211290d1c8a168a15542486a8f61c0833b9"
+
+[[package]]
+name = "raw-window-handle"
 version = "0.6.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "20675572f6f24e9e76ef639bc5552774ed45f1c30e2951e1e99c59888861c539"
@@ -4404,7 +4421,7 @@ dependencies = [
  "objc-foundation",
  "objc_id",
  "pollster 0.3.0",
- "raw-window-handle",
+ "raw-window-handle 0.6.2",
  "urlencoding",
  "wasm-bindgen",
  "wasm-bindgen-futures",
@@ -5855,6 +5872,23 @@ dependencies = [
 
 [[package]]
 name = "webbrowser"
+version = "0.8.15"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "db67ae75a9405634f5882791678772c94ff5f16a66535aae186e26aa0841fc8b"
+dependencies = [
+ "core-foundation 0.9.4",
+ "home",
+ "jni",
+ "log",
+ "ndk-context",
+ "objc",
+ "raw-window-handle 0.5.2",
+ "url",
+ "web-sys",
+]
+
+[[package]]
+name = "webbrowser"
 version = "1.0.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "aaf4f3c0ba838e82b4e5ccc4157003fb8c324ee24c058470ffb82820becbde98"
@@ -5892,7 +5926,7 @@ dependencies = [
  "parking_lot",
  "portable-atomic",
  "profiling",
- "raw-window-handle",
+ "raw-window-handle 0.6.2",
  "smallvec",
  "static_assertions",
  "wasm-bindgen",
@@ -5923,7 +5957,7 @@ dependencies = [
  "parking_lot",
  "portable-atomic",
  "profiling",
- "raw-window-handle",
+ "raw-window-handle 0.6.2",
  "rustc-hash 1.1.0",
  "smallvec",
  "thiserror 2.0.16",
@@ -5997,7 +6031,7 @@ dependencies = [
  "portable-atomic",
  "profiling",
  "range-alloc",
- "raw-window-handle",
+ "raw-window-handle 0.6.2",
  "renderdoc-sys",
  "smallvec",
  "thiserror 2.0.16",
@@ -6561,7 +6595,7 @@ dependencies = [
  "orbclient",
  "percent-encoding",
  "pin-project",
- "raw-window-handle",
+ "raw-window-handle 0.6.2",
  "redox_syscall 0.4.1",
  "rustix 0.38.44",
  "sctk-adwaita",

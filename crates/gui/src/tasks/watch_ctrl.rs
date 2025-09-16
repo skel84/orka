@@ -16,16 +16,23 @@ use orka_core::columns;
 impl OrkaGuiApp {
     // Start or refresh the active watch when selection (gvk or namespace) changes.
     pub(crate) fn ensure_watch_for_selection(&mut self) {
-        let Some(k) = self.current_selected_kind().cloned() else { return; };
-        if k.kind.is_empty() { return; }
+        let Some(k) = self.current_selected_kind().cloned() else {
+            return;
+        };
+        if k.kind.is_empty() {
+            return;
+        }
         let ns_opt = if k.namespaced && !self.selection.namespace.is_empty() {
             Some(self.selection.namespace.clone())
         } else {
             None
         };
         let key = gvk_label(&k);
-        let changed = self.watch.loaded_gvk_key.as_deref() != Some(&key) || self.watch.loaded_ns != ns_opt;
-        if !changed { return; }
+        let changed =
+            self.watch.loaded_gvk_key.as_deref() != Some(&key) || self.watch.loaded_ns != ns_opt;
+        if !changed {
+            return;
+        }
 
         // Clear search overlay on selection change
         self.search.hits.clear();
@@ -35,11 +42,14 @@ impl OrkaGuiApp {
         self.search.prev_text.clear();
         self.search.changed_at = None;
         self.search.preview_sel = None;
-        if let Some(stop) = self.search.stop.take() { let _ = stop.send(()); }
+        if let Some(stop) = self.search.stop.take() {
+            let _ = stop.send(());
+        }
         self.search.task = None;
 
         // compute active columns for this kind
-        self.results.active_cols = columns::builtin_columns_for(&k.group, &k.version, &k.kind, k.namespaced);
+        self.results.active_cols =
+            columns::builtin_columns_for(&k.group, &k.version, &k.kind, k.namespaced);
         // Cancel previous task if any
         if let Some(stop) = self.watch.stop.take() {
             info!("watch: stopping previous task");
@@ -57,26 +67,44 @@ impl OrkaGuiApp {
         let k_cloned = k.clone();
         let ns_cloned = ns_opt.clone();
         // Start/refresh namespaces watcher subscription (single handle)
-        if let Some(h) = self.watch.ns_task.take() { h.abort(); }
+        if let Some(h) = self.watch.ns_task.take() {
+            h.abort();
+        }
         {
             let ns_tx = tx.clone();
             let ns_api = self.api.clone();
             let handle = tokio::spawn(async move {
                 let key_ns = "v1/Namespace|".to_string();
-                let ns_kind = ResourceKind { group: String::new(), version: "v1".into(), kind: "Namespace".into(), namespaced: false };
-                let sel = Selector { gvk: ns_kind, namespace: None };
+                let ns_kind = ResourceKind {
+                    group: String::new(),
+                    version: "v1".into(),
+                    kind: "Namespace".into(),
+                    namespaced: false,
+                };
+                let sel = Selector {
+                    gvk: ns_kind,
+                    namespace: None,
+                };
                 match watch_hub_subscribe(ns_api.clone(), sel).await {
                     Ok(mut rx) => {
                         let mut last_sent: usize = 0;
                         let mut send_list = || {
-                            let mut list: Vec<String> = watch_hub_snapshot(&key_ns).into_iter().map(|o| o.name).collect();
+                            let mut list: Vec<String> = watch_hub_snapshot(&key_ns)
+                                .into_iter()
+                                .map(|o| o.name)
+                                .collect();
                             list.sort();
                             list.dedup();
                             let len = list.len();
-                            if len != last_sent { let _ = ns_tx.send(UiUpdate::Namespaces(list)); last_sent = len; }
+                            if len != last_sent {
+                                let _ = ns_tx.send(UiUpdate::Namespaces(list));
+                                last_sent = len;
+                            }
                         };
                         send_list();
-                        while let Ok(_) = rx.recv().await { send_list(); }
+                        while rx.recv().await.is_ok() {
+                            send_list();
+                        }
                     }
                     Err(_e) => { /* no-op; next selection will retry */ }
                 }
@@ -86,12 +114,19 @@ impl OrkaGuiApp {
         info!(gvk = %label, ns = %ns_cloned.as_deref().unwrap_or("(all)"), "watch: starting snapshot + watch");
         let task = tokio::spawn(async move {
             let load_t0 = Instant::now();
-            let sel = Selector { gvk: k_cloned, namespace: ns_cloned };
+            let sel = Selector {
+                gvk: k_cloned,
+                namespace: ns_cloned,
+            };
             // Instant rows: emit cached items from watch hub if available
-            let cache_key = format!("{}|{}", gvk_label(&sel.gvk), sel.namespace.as_deref().unwrap_or(""));
+            let cache_key = format!(
+                "{}|{}",
+                gvk_label(&sel.gvk),
+                sel.namespace.as_deref().unwrap_or("")
+            );
             let cached = watch_hub_snapshot(&cache_key);
             if !cached.is_empty() {
-                let _ = tx.send(UiUpdate::Snapshot(cached));
+                let _ = tx.send(UiUpdate::Snapshot(Box::new(cached)));
             }
             // Start (or attach to) a persistent watcher via WatchHub for faster perceived latency
             let watch_fut = async {
@@ -111,7 +146,9 @@ impl OrkaGuiApp {
                                                 info!(ttfe_ms = %ms, "metric: time_to_first_event_ms");
                                                 first_event = false;
                                             }
-                                            if tx.send(UiUpdate::Event(e)).is_err() { break; }
+                                            if tx.send(UiUpdate::Event(Box::new(e))).is_err() {
+                                                break;
+                                            }
                                         }
                                         Err(broadcast::error::RecvError::Lagged(_)) => { /* drop */ }
                                         Err(broadcast::error::RecvError::Closed) => break,
@@ -131,11 +168,20 @@ impl OrkaGuiApp {
             tokio::spawn(async move {
                 let t0 = Instant::now();
                 info!("snapshot: fast first page start");
-                let gvk_key = if fast_sel.gvk.group.is_empty() { format!("{}/{}", fast_sel.gvk.version, fast_sel.gvk.kind) } else { format!("{}/{}/{}", fast_sel.gvk.group, fast_sel.gvk.version, fast_sel.gvk.kind) };
-                match orka_kubehub::list_lite_first_page(&gvk_key, fast_sel.namespace.as_deref()).await {
+                let gvk_key = if fast_sel.gvk.group.is_empty() {
+                    format!("{}/{}", fast_sel.gvk.version, fast_sel.gvk.kind)
+                } else {
+                    format!(
+                        "{}/{}/{}",
+                        fast_sel.gvk.group, fast_sel.gvk.version, fast_sel.gvk.kind
+                    )
+                };
+                match orka_kubehub::list_lite_first_page(&gvk_key, fast_sel.namespace.as_deref())
+                    .await
+                {
                     Ok(items) => {
                         info!(items = items.len(), took_ms = %t0.elapsed().as_millis(), "snapshot: fast first page ok");
-                        let _ = fast_tx.send(UiUpdate::Snapshot(items));
+                        let _ = fast_tx.send(UiUpdate::Snapshot(Box::new(items)));
                     }
                     Err(e) => {
                         info!(error = %e, took_ms = %t0.elapsed().as_millis(), "snapshot: fast first page failed");
@@ -154,11 +200,14 @@ impl OrkaGuiApp {
                     Ok(resp) => {
                         info!(items = resp.data.items.len(), took_ms = %t0.elapsed().as_millis(), "snapshot: response ok");
                         let epoch = resp.data.epoch;
-                        let _ = snap_tx.send(UiUpdate::Snapshot(resp.data.items));
+                        let _ = snap_tx.send(UiUpdate::Snapshot(Box::new(resp.data.items)));
                         let _ = snap_tx.send(UiUpdate::Epoch(epoch));
                     }
                     Err(e) => {
-                        let _ = snap_tx.send(UiUpdate::Error(format!("snapshot({}) error: {}", snap_label, e)));
+                        let _ = snap_tx.send(UiUpdate::Error(format!(
+                            "snapshot({}) error: {}",
+                            snap_label, e
+                        )));
                         info!(error = %e, "snapshot: request failed");
                     }
                 }
