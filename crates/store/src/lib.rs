@@ -337,7 +337,7 @@ pub fn spawn_ingest_with_projector(
                         let drained = batch.len();
                         let dropped = coalescer.dropped();
                         let prev = std::mem::replace(&mut dropped_reported, dropped);
-                        if dropped > prev { counter!("coalescer_dropped", (dropped - prev) as u64); }
+                        if dropped > prev { counter!("coalescer_dropped", dropped - prev); }
                         let now = std::time::Instant::now();
                         for d in batch.iter() {
                             if let Some(t0) = arrivals.remove(&d.uid) {
