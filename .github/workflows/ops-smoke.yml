@@ -1,9 +1,8 @@
 name: ops-smoke
 
 on:
-  push:
-    branches: [ main ]
   pull_request:
+    branches: [ main ]
   workflow_dispatch:
 
 jobs:
@@ -34,4 +33,3 @@ jobs:
           RUSTFLAGS: -D warnings
         run: |
           bash scripts/kind-ops-smoke.sh
-
