@@ -67,58 +67,58 @@ jobs:
           path: Orka-${{ github.ref_name }}.zip
 
   # Optional signing & notarization (skipped unless secrets configured)
-  notarize-macos:
-    name: Notarize macOS App (optional)
-    needs: build-macos-app
-    runs-on: macos-latest
-    if: ${{ secrets.APPLE_ID && secrets.APPLE_TEAM_ID && (secrets.APPLE_APP_SPECIFIC_PASSWORD || (secrets.APPLE_KEY_ID && secrets.APPLE_ISSUER_ID && secrets.APPLE_PRIVATE_KEY)) && secrets.MACOS_CERT_P12 && secrets.MACOS_CERT_PASSWORD }}
-    steps:
-      - uses: actions/checkout@v4
-      - name: Download app artifact
-        uses: actions/download-artifact@v4
-        with:
-          name: Orka-${{ github.ref_name }}-macos-app.zip
-          path: dist
-      - name: Unzip app
-        run: unzip -q dist/Orka-${{ github.ref_name }}.zip -d dist
-      - name: Import signing cert
-        run: |
-          KEYCHAIN=build.keychain
-          security create-keychain -p temp "$KEYCHAIN"
-          security set-keychain-settings -lut 21600 "$KEYCHAIN"
-          security unlock-keychain -p temp "$KEYCHAIN"
-          echo -n "$MACOS_CERT_P12" | base64 --decode > cert.p12
-          security import cert.p12 -k "$KEYCHAIN" -P "$MACOS_CERT_PASSWORD" -T /usr/bin/codesign -T /usr/bin/security
-          security list-keychains -d user -s "$KEYCHAIN" $(security list-keychains -d user | tr -d '"')
-          security set-key-partition-list -S apple-tool:,apple: -s -k temp "$KEYCHAIN"
-        env:
-          MACOS_CERT_P12: ${{ secrets.MACOS_CERT_P12 }}
-          MACOS_CERT_PASSWORD: ${{ secrets.MACOS_CERT_PASSWORD }}
-      - name: Codesign app (hardened runtime)
-        run: |
-          codesign --deep --force --options runtime --sign "${{ secrets.MACOS_SIGNING_IDENTITY }}" dist/Orka.app
-          codesign --verify --deep --strict --verbose=2 dist/Orka.app
-      - name: Repack zip for notarization
-        run: |
-          ditto -c -k --sequesterRsrc --keepParent dist/Orka.app Orka-notarize.zip
-      - name: Notarize (notarytool)
-        run: |
-          if [[ -n "${{ secrets.APPLE_APP_SPECIFIC_PASSWORD }}" ]]; then
-            xcrun notarytool submit Orka-notarize.zip --apple-id "${{ secrets.APPLE_ID }}" --team-id "${{ secrets.APPLE_TEAM_ID }}" --password "${{ secrets.APPLE_APP_SPECIFIC_PASSWORD }}" --wait
-          else
-            # API key auth
-            echo "${{ secrets.APPLE_PRIVATE_KEY }}" > AuthKey.p8
-            xcrun notarytool submit Orka-notarize.zip --key AuthKey.p8 --key-id "${{ secrets.APPLE_KEY_ID }}" --issuer "${{ secrets.APPLE_ISSUER_ID }}" --team-id "${{ secrets.APPLE_TEAM_ID }}" --wait
-          fi
-      - name: Staple ticket
-        run: xcrun stapler staple dist/Orka.app
-      - name: Zip notarized app
-        run: ditto -c -k --sequesterRsrc --keepParent dist/Orka.app Orka-${{ github.ref_name }}-notarized.zip
-      - name: Upload notarized app
-        uses: actions/upload-artifact@v4
-        with:
-          name: Orka-${{ github.ref_name }}-macos-app-notarized.zip
-          path: Orka-${{ github.ref_name }}-notarized.zip
+  # notarize-macos:
+  #   name: Notarize macOS App (optional)
+  #   needs: build-macos-app
+  #   runs-on: macos-latest
+  #   if: ${{ secrets.APPLE_ID && secrets.APPLE_TEAM_ID && (secrets.APPLE_APP_SPECIFIC_PASSWORD || (secrets.APPLE_KEY_ID && secrets.APPLE_ISSUER_ID && secrets.APPLE_PRIVATE_KEY)) && secrets.MACOS_CERT_P12 && secrets.MACOS_CERT_PASSWORD }}
+  #   steps:
+  #     - uses: actions/checkout@v4
+  #     - name: Download app artifact
+  #       uses: actions/download-artifact@v4
+  #       with:
+  #         name: Orka-${{ github.ref_name }}-macos-app.zip
+  #         path: dist
+  #     - name: Unzip app
+  #       run: unzip -q dist/Orka-${{ github.ref_name }}.zip -d dist
+  #     - name: Import signing cert
+  #       run: |
+  #         KEYCHAIN=build.keychain
+  #         security create-keychain -p temp "$KEYCHAIN"
+  #         security set-keychain-settings -lut 21600 "$KEYCHAIN"
+  #         security unlock-keychain -p temp "$KEYCHAIN"
+  #         echo -n "$MACOS_CERT_P12" | base64 --decode > cert.p12
+  #         security import cert.p12 -k "$KEYCHAIN" -P "$MACOS_CERT_PASSWORD" -T /usr/bin/codesign -T /usr/bin/security
+  #         security list-keychains -d user -s "$KEYCHAIN" $(security list-keychains -d user | tr -d '"')
+  #         security set-key-partition-list -S apple-tool:,apple: -s -k temp "$KEYCHAIN"
+  #       env:
+  #         MACOS_CERT_P12: ${{ secrets.MACOS_CERT_P12 }}
+  #         MACOS_CERT_PASSWORD: ${{ secrets.MACOS_CERT_PASSWORD }}
+  #     - name: Codesign app (hardened runtime)
+  #       run: |
+  #         codesign --deep --force --options runtime --sign "${{ secrets.MACOS_SIGNING_IDENTITY }}" dist/Orka.app
+  #         codesign --verify --deep --strict --verbose=2 dist/Orka.app
+  #     - name: Repack zip for notarization
+  #       run: |
+  #         ditto -c -k --sequesterRsrc --keepParent dist/Orka.app Orka-notarize.zip
+  #     - name: Notarize (notarytool)
+  #       run: |
+  #         if [[ -n "${{ secrets.APPLE_APP_SPECIFIC_PASSWORD }}" ]]; then
+  #           xcrun notarytool submit Orka-notarize.zip --apple-id "${{ secrets.APPLE_ID }}" --team-id "${{ secrets.APPLE_TEAM_ID }}" --password "${{ secrets.APPLE_APP_SPECIFIC_PASSWORD }}" --wait
+  #         else
+  #           # API key auth
+  #           echo "${{ secrets.APPLE_PRIVATE_KEY }}" > AuthKey.p8
+  #           xcrun notarytool submit Orka-notarize.zip --key AuthKey.p8 --key-id "${{ secrets.APPLE_KEY_ID }}" --issuer "${{ secrets.APPLE_ISSUER_ID }}" --team-id "${{ secrets.APPLE_TEAM_ID }}" --wait
+  #         fi
+  #     - name: Staple ticket
+  #       run: xcrun stapler staple dist/Orka.app
+  #     - name: Zip notarized app
+  #       run: ditto -c -k --sequesterRsrc --keepParent dist/Orka.app Orka-${{ github.ref_name }}-notarized.zip
+  #     - name: Upload notarized app
+  #       uses: actions/upload-artifact@v4
+  #       with:
+  #         name: Orka-${{ github.ref_name }}-macos-app-notarized.zip
+  #         path: Orka-${{ github.ref_name }}-notarized.zip
 
   release:
     name: Create GitHub Release
