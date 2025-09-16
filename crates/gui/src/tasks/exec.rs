@@ -264,7 +264,11 @@ impl OrkaGuiApp {
                     .is_ok()
             }
         };
-        #[cfg(not(any(target_os = "macos", all(unix, not(target_os = "macos")), target_os = "windows")))]
+        #[cfg(not(any(
+            target_os = "macos",
+            all(unix, not(target_os = "macos")),
+            target_os = "windows"
+        )))]
         let launched = false;
         if !launched {
             self.last_error = Some(format!(
