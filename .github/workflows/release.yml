@@ -59,6 +59,11 @@ jobs:
         run: |
           cd crates/app
           cargo bundle --release
+      - name: Ad-hoc codesign app
+        run: |
+          APP=target/release/bundle/osx/Orka.app
+          codesign --force --deep --sign - "$APP"
+          codesign --verify --deep --verbose=2 "$APP"
       - name: Prepare app artifact
         run: |
           APP=target/release/bundle/osx/Orka.app
