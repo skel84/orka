@@ -392,6 +392,7 @@ pub struct SelectionState {
     pub selected_idx: Option<usize>,
     pub selected_kind: Option<ResourceKind>,
     pub namespace: String,
+    pub namespace_filter_query: String,
 }
 
 #[derive(Default)]

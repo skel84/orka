@@ -161,6 +161,7 @@ impl OrkaGuiApp {
                 selected_idx: None,
                 selected_kind: None,
                 namespace: String::new(),
+                namespace_filter_query: String::new(),
             },
             results: ResultsState {
                 rows: Vec::new(),

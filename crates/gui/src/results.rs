@@ -2,7 +2,7 @@
 
 use eframe::egui;
 use egui::ScrollArea;
-use egui_table::{CellInfo, Column, HeaderCellInfo, HeaderRow, Table, TableDelegate};
+use egui_table::{CellInfo, Column, HeaderCellInfo, HeaderRow, Table, TableDelegate, TableState};
 use orka_core::columns::ColumnKind;
 
 // render_age is used via app.display_cell_string for Age; no direct import here
@@ -48,6 +48,91 @@ impl OrkaGuiApp {
                     ui.selectable_value(&mut self.results.virtual_mode, VirtualMode::On, "Virtual");
                     ui.selectable_value(&mut self.results.virtual_mode, VirtualMode::Off, "Table");
                 });
+            if let Some(kind) = self.current_selected_kind() {
+                if kind.namespaced {
+                    ui.separator();
+                    ui.label("Namespace:");
+                    let combo_id = egui::Id::new("results_namespace_filter");
+                    let was_open = egui::ComboBox::is_open(ui.ctx(), combo_id);
+                    let prev_ns = self.selection.namespace.clone();
+                    let has_filter = !self.selection.namespace.is_empty();
+                    let selected_label = if has_filter {
+                        self.selection.namespace.clone()
+                    } else {
+                        "All namespaces".to_string()
+                    };
+                    let selected_text: egui::WidgetText = if has_filter {
+                        egui::RichText::new(selected_label.clone())
+                            .color(ui.visuals().warn_fg_color)
+                            .into()
+                    } else {
+                        selected_label.clone().into()
+                    };
+                    egui::ComboBox::from_id_salt("results_namespace_filter")
+                        .selected_text(selected_text)
+                        .width(200.0)
+                        .show_ui(ui, |ui| {
+                            let filter_active = !self.selection.namespace.is_empty();
+                            if !self.namespaces.is_empty() {
+                                let search = egui::TextEdit::singleline(
+                                    &mut self.selection.namespace_filter_query,
+                                )
+                                .hint_text("Search namespaces…")
+                                .desired_width(180.0);
+                                ui.add(search);
+                                ui.separator();
+                            }
+                            let filter = self.selection.namespace_filter_query.to_lowercase();
+                            if ui
+                                .selectable_label(
+                                    self.selection.namespace.is_empty(),
+                                    "All namespaces",
+                                )
+                                .clicked()
+                            {
+                                self.selection.namespace.clear();
+                                ui.close();
+                            }
+                            let mut shown = 0usize;
+                            for ns in &self.namespaces {
+                                if !filter.is_empty() && !ns.to_lowercase().contains(&filter) {
+                                    continue;
+                                }
+                                shown += 1;
+                                if ui
+                                    .selectable_label(self.selection.namespace == *ns, ns)
+                                    .clicked()
+                                {
+                                    self.selection.namespace = ns.clone();
+                                    ui.close();
+                                }
+                            }
+                            if self.namespaces.is_empty() {
+                                ui.label(
+                                    egui::RichText::new("Loading namespaces…").italics().weak(),
+                                );
+                            } else if shown == 0 {
+                                ui.label(egui::RichText::new("No matches").italics().weak());
+                            }
+                            if filter_active && ui.button("Clear selection").clicked() {
+                                self.selection.namespace.clear();
+                                ui.close();
+                            }
+                        });
+                    let now_open = egui::ComboBox::is_open(ui.ctx(), combo_id);
+                    if (was_open && !now_open) || prev_ns != self.selection.namespace {
+                        self.selection.namespace_filter_query.clear();
+                    }
+                    if has_filter
+                        && ui
+                            .small_button("×")
+                            .on_hover_text("Clear namespace filter")
+                            .clicked()
+                    {
+                        self.selection.namespace.clear();
+                    }
+                }
+            }
         });
         if self.results.rows.is_empty() {
             if self.last_error.is_none() && self.watch.task.is_some() {
@@ -73,6 +158,7 @@ impl OrkaGuiApp {
             }
         };
         if should_virtual {
+            self.sync_virtual_column_widths(ui);
             self.ui_results_virtual(ui, &filtered_ix);
             return;
         }
@@ -156,39 +242,63 @@ impl OrkaGuiApp {
 
     fn draw_results_header(&mut self, ui: &mut egui::Ui) {
         let row_h = 20.0;
-        let rect = ui.max_rect();
+        let col_specs = self.results.active_cols.clone();
+        if col_specs.is_empty() {
+            return;
+        }
+        let width_sum: f32 = col_specs.iter().map(|c| c.width).sum();
+        let row_width = width_sum.max(ui.available_width()).max(1.0);
+        let (rect, _) = ui.allocate_exact_size(egui::vec2(row_width, row_h), egui::Sense::hover());
+        let painter = ui.painter_at(rect);
         let bg = ui.visuals().widgets.inactive.bg_fill;
-        ui.painter().rect_filled(rect, 0.0, bg);
-        ui.horizontal(|ui| {
-            for (col_idx, spec) in self.results.active_cols.clone().into_iter().enumerate() {
-                let label = spec.label;
-                if label.is_empty() {
-                    continue;
-                }
-                let is_sorted = self.results.sort_col == Some(col_idx);
-                let mut text = label.to_string();
-                if is_sorted {
-                    text.push_str(if self.results.sort_asc {
-                        " ↑"
-                    } else {
-                        " ↓"
-                    });
-                }
-                let resp = ui.add_sized(
-                    [spec.width, row_h],
-                    egui::Button::new(egui::RichText::new(text).strong()).selected(is_sorted),
+        painter.rect_filled(rect, 0.0, bg);
+        let stroke = ui.visuals().widgets.noninteractive.bg_stroke;
+        let mut acc = rect.left();
+        for (i, spec) in col_specs.iter().enumerate() {
+            acc += spec.width;
+            if i + 1 != col_specs.len() && acc < rect.right() {
+                painter.line_segment(
+                    [egui::pos2(acc, rect.top()), egui::pos2(acc, rect.bottom())],
+                    stroke,
                 );
-                if resp.clicked() {
-                    if is_sorted {
-                        self.results.sort_asc = !self.results.sort_asc;
-                    } else {
-                        self.results.sort_col = Some(col_idx);
-                        self.results.sort_asc = true;
-                    }
-                    self.results.sort_dirty = true;
-                }
             }
-        });
+        }
+        let mut header_ui = ui.new_child(
+            egui::UiBuilder::new()
+                .id_salt("results_virtual_header")
+                .max_rect(rect)
+                .layout(egui::Layout::left_to_right(egui::Align::Center)),
+        );
+        header_ui.set_clip_rect(rect);
+        header_ui.spacing_mut().item_spacing.x = 0.0;
+        for (col_idx, spec) in col_specs.iter().cloned().enumerate() {
+            let label = spec.label;
+            if label.is_empty() {
+                continue;
+            }
+            let is_sorted = self.results.sort_col == Some(col_idx);
+            let mut text = label.to_string();
+            if is_sorted {
+                text.push_str(if self.results.sort_asc {
+                    " ↑"
+                } else {
+                    " ↓"
+                });
+            }
+            let resp = header_ui.add_sized(
+                [spec.width, row_h],
+                egui::Button::new(egui::RichText::new(text).strong()).selected(is_sorted),
+            );
+            if resp.clicked() {
+                if is_sorted {
+                    self.results.sort_asc = !self.results.sort_asc;
+                } else {
+                    self.results.sort_col = Some(col_idx);
+                    self.results.sort_asc = true;
+                }
+                self.results.sort_dirty = true;
+            }
+        }
     }
 
     fn ui_results_virtual(&mut self, ui: &mut egui::Ui, filtered_ix: &[usize]) {
@@ -197,35 +307,84 @@ impl OrkaGuiApp {
         ui.separator();
         let row_h = 18.0;
         let total = filtered_ix.len();
-        ScrollArea::vertical().show_rows(ui, row_h, total, |ui, row_range| {
-            for row_idx in row_range {
-                let idx = filtered_ix[row_idx];
-                if let Some(it) = self.results.rows.get(idx).cloned() {
-                    let is_sel = self.details.selected.map(|u| u == it.uid).unwrap_or(false);
-                    let is_hit = self.search.hits.contains_key(&it.uid);
-                    let rect = ui.max_rect();
-                    if is_sel {
-                        ui.painter().rect_filled(rect, 0.0, ui.visuals().selection.bg_fill);
-                    } else if row_idx % 2 == 0 {
-                        ui.painter().rect_filled(rect, 0.0, ui.visuals().faint_bg_color);
-                    }
-                    ui.horizontal(|ui| {
-                        for (col_idx, spec) in self.results.active_cols.clone().into_iter().enumerate() {
+        let col_specs = self.results.active_cols.clone();
+        let width_sum: f32 = col_specs.iter().map(|c| c.width).sum();
+        ScrollArea::vertical()
+            .id_salt("results_virtual_rows")
+            .auto_shrink([false, false])
+            .show_rows(ui, row_h, total, |ui, row_range| {
+                let row_width = width_sum
+                    .max(ui.available_width())
+                    .max(1.0);
+                for row_idx in row_range {
+                    let idx = filtered_ix[row_idx];
+                    if let Some(it) = self.results.rows.get(idx).cloned() {
+                        let is_sel =
+                            self.details.selected.map(|u| u == it.uid).unwrap_or(false);
+                        let is_hit = self.search.hits.contains_key(&it.uid);
+                        let (row_rect, _) = ui.allocate_exact_size(
+                            egui::vec2(row_width, row_h),
+                            egui::Sense::hover(),
+                        );
+                        let painter = ui.painter_at(row_rect);
+                        if is_sel {
+                            painter.rect_filled(row_rect, 0.0, ui.visuals().selection.bg_fill);
+                        } else if row_idx % 2 == 0 {
+                            painter.rect_filled(row_rect, 0.0, ui.visuals().faint_bg_color);
+                        }
+                        let stroke = ui.visuals().widgets.noninteractive.bg_stroke;
+                        let mut divider_x = row_rect.left();
+                        for (i, spec) in col_specs.iter().enumerate() {
+                            divider_x += spec.width;
+                            if i + 1 != col_specs.len() && divider_x < row_rect.right() {
+                                painter.line_segment(
+                                    [
+                                        egui::pos2(divider_x, row_rect.top()),
+                                        egui::pos2(divider_x, row_rect.bottom()),
+                                    ],
+                                    stroke,
+                                );
+                            }
+                        }
+                        let mut row_ui = ui.new_child(
+                            egui::UiBuilder::new()
+                                .id_salt(("results_virtual_row", row_idx))
+                                .max_rect(row_rect)
+                                .layout(egui::Layout::left_to_right(egui::Align::Center)),
+                        );
+                        row_ui.set_clip_rect(row_rect);
+                        row_ui.spacing_mut().item_spacing.x = 0.0;
+                        row_ui.set_min_height(row_h);
+                        for (col_idx, spec) in col_specs.iter().cloned().enumerate() {
                             let mut text = self.display_cell_string(&it, col_idx, &spec);
                             if is_hit && matches!(spec.kind, ColumnKind::Name) {
                                 text = format!("★ {}", text);
                             }
                             match spec.kind {
                                 ColumnKind::Name | ColumnKind::Namespace => {
-                                    let resp = ui.add_sized([spec.width, row_h], egui::Button::new(egui::RichText::new(text).monospace()).selected(is_sel));
-                                    if resp.clicked() { self.select_row(it.clone()); }
-                                    // Context menu on right-click
+                                    let button = egui::Button::new(
+                                        egui::RichText::new(text).monospace(),
+                                    )
+                                    .frame(false)
+                                    .fill(egui::Color32::TRANSPARENT)
+                                    .selected(is_sel);
+                                    let resp = row_ui.add_sized([spec.width, row_h], button);
+                                    if resp.clicked() {
+                                        self.select_row(it.clone());
+                                    }
                                     resp.context_menu(|ui| {
                                         if ui.button("Open Details").clicked() {
                                             self.select_row(it.clone());
                                             ui.close();
                                         }
-                                        let logs_enabled = self.selected_is_pod() && self.ops.caps.as_ref().map(|c| c.pods_log_get).unwrap_or(false);
+                                        let logs_enabled = self
+                                            .selected_is_pod()
+                                            && self
+                                                .ops
+                                                .caps
+                                                .as_ref()
+                                                .map(|c| c.pods_log_get)
+                                                .unwrap_or(false);
                                         if logs_enabled {
                                             if ui.button("Logs").clicked() {
                                                 self.select_row(it.clone());
@@ -233,10 +392,15 @@ impl OrkaGuiApp {
                                                 ui.close();
                                             }
                                         } else {
-                                            ui.add_enabled(false, egui::Button::new("Logs")).on_hover_text("Logs available for Pods only");
+                                            ui.add_enabled(false, egui::Button::new("Logs"))
+                                                .on_hover_text("Logs available for Pods only");
                                         }
-                                        // Workload ops: Rollout / Scale
-                                        let scalable = self.ops.caps.as_ref().and_then(|c| c.scale.as_ref()).is_some();
+                                        let scalable = self
+                                            .ops
+                                            .caps
+                                            .as_ref()
+                                            .and_then(|c| c.scale.as_ref())
+                                            .is_some();
                                         if scalable {
                                             if ui.button("Rollout Restart").clicked() {
                                                 tracing::info!(name = %it.name, ns = %it.namespace.as_deref().unwrap_or("-"), "ui: rollout restart click (row menu)");
@@ -251,14 +415,11 @@ impl OrkaGuiApp {
                                                 ui.close();
                                             }
                                         }
-                                        // Delete Pod (Pods only)
                                         if self.selected_is_pod()
                                             && ui.button("Delete…").clicked()
                                         {
                                             self.select_row(it.clone());
-                                            if let Some((ns, pod)) =
-                                                self.current_pod_selection()
-                                            {
+                                            if let Some((ns, pod)) = self.current_pod_selection() {
                                                 self.ops.confirm_delete = Some((ns, pod));
                                             }
                                             ui.close();
@@ -266,14 +427,33 @@ impl OrkaGuiApp {
                                     });
                                 }
                                 _ => {
-                                    ui.add_sized([spec.width, row_h], egui::Label::new(egui::RichText::new(text).monospace()));
+                                    row_ui.add_sized(
+                                        [spec.width, row_h],
+                                        egui::Label::new(egui::RichText::new(text).monospace()),
+                                    );
                                 }
                             }
                         }
-                    });
+                    }
+                }
+            });
+    }
+
+    fn sync_virtual_column_widths(&mut self, ui: &egui::Ui) {
+        if self.results.active_cols.is_empty() {
+            return;
+        }
+        let table_id = TableState::id(ui, egui::Id::new("results_table"));
+        if let Some(state) = TableState::load(ui.ctx(), table_id) {
+            for (idx, spec) in self.results.active_cols.iter_mut().enumerate() {
+                let col_id = egui::Id::new(idx);
+                if let Some(width) = state.col_widths.get(&col_id) {
+                    if width.is_finite() && *width > 0.0 {
+                        spec.width = *width;
+                    }
                 }
             }
-        });
+        }
     }
 }
 

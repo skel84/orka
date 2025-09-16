@@ -10,7 +10,7 @@
 
 - sometimes the results view remains filteres on a namespace and it's not clear why. i think a dropdown menu (maybe searchable and with checkboxes) to show current seletected namespace(s) would help
 
-- the Virtual table view is visually broken
+- the Virtual table view of the results is visually broken
   
 
 
