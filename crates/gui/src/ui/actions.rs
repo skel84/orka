@@ -168,10 +168,8 @@ pub(crate) fn ui_actions_bar(app: &mut OrkaGuiApp, ui: &mut egui::Ui) {
                     .and_then(|c| c.name.clone());
                 is_httpish(port, name.as_deref())
             };
-            if show_open {
-                if ui.button("Open in Browser").clicked() {
-                    app.open_pf_in_browser();
-                }
+            if show_open && ui.button("Open in Browser").clicked() {
+                app.open_pf_in_browser();
             }
         }
 
@@ -220,15 +218,14 @@ pub(crate) fn ui_actions_bar(app: &mut OrkaGuiApp, ui: &mut egui::Ui) {
         ui.separator();
 
         // Delete Pod (with confirm)
-        if pod_sel {
-            if ui
+        if pod_sel
+            && ui
                 .button("Delete")
                 .on_hover_text("Delete selected Pod")
                 .clicked()
-            {
-                if let Some((ns, pod)) = app.current_pod_selection() {
-                    app.ops.confirm_delete = Some((ns, pod));
-                }
+        {
+            if let Some((ns, pod)) = app.current_pod_selection() {
+                app.ops.confirm_delete = Some((ns, pod));
             }
         }
 

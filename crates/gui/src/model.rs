@@ -16,8 +16,8 @@ use tokio::task::JoinHandle;
 
 #[derive(Debug)]
 pub enum UiUpdate {
-    Snapshot(Vec<LiteObj>),
-    Event(LiteEvent),
+    Snapshot(Box<Vec<LiteObj>>),
+    Event(Box<LiteEvent>),
     Error(String),
     Detail {
         uid: Uid,
@@ -123,7 +123,7 @@ pub enum UiUpdate {
     // Atlas graph model for interactive rendering
     GraphModelReady {
         uid: Uid,
-        model: GraphModel,
+        model: Box<GraphModel>,
     },
 }
 
@@ -221,20 +221,15 @@ pub struct DetailsState {
     pub secret_revealed: std::collections::HashSet<String>,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Default, Clone, Copy, Debug, PartialEq, Eq)]
 pub enum DetailsPaneTab {
     Edit,
     Logs,
     SvcLogs,
     Exec,
+    #[default]
     Describe,
     Graph,
-}
-
-impl Default for DetailsPaneTab {
-    fn default() -> Self {
-        DetailsPaneTab::Describe
-    }
 }
 
 #[derive(Clone, Debug)]
@@ -335,18 +330,13 @@ pub struct ServiceLogsState {
     pub prefix_theme: PrefixTheme,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Default, Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PrefixTheme {
+    #[default]
     Bright,
     Basic,
     Gray,
     None,
-}
-
-impl Default for PrefixTheme {
-    fn default() -> Self {
-        PrefixTheme::Bright
-    }
 }
 
 #[derive(Clone)]
@@ -478,7 +468,6 @@ pub struct GraphState {
     // key = (namespace, kind)
     pub atlas_expanded_kinds: std::collections::HashSet<(String, String)>,
     pub atlas_counts: std::collections::HashMap<(String, String), usize>,
-    pub atlas_items: std::collections::HashMap<(String, String), Vec<String>>,
     // Details Atlas progressive disclosure per kind (simple global set)
     pub details_expanded_kinds: std::collections::HashSet<String>,
     // Pending open (kind, namespace, name) requested from Atlas click
@@ -546,16 +535,11 @@ pub struct StatsState {
 
 // --------- Atlas/Graph Model ---------
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Default, Clone, Copy, Debug, PartialEq, Eq)]
 pub enum GraphViewMode {
+    #[default]
     Classic,
     Atlas,
-}
-
-impl Default for GraphViewMode {
-    fn default() -> Self {
-        GraphViewMode::Classic
-    }
 }
 
 #[derive(Clone, Debug, Default)]

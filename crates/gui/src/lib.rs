@@ -33,6 +33,8 @@ pub use model::{LayoutState, PaletteItem, PaletteState, SearchExplain, UiUpdate,
 use util::{gvk_label, parse_gvk_key_to_kind};
 use watch::watch_hub_subscribe;
 
+type CachedDetail = (Arc<String>, Option<Vec<String>>, Instant);
+
 /// Entry point used by the CLI to launch the GUI.
 pub fn run_native(api: Arc<dyn OrkaApi>) -> eframe::Result<()> {
     let options = eframe::NativeOptions::default();
@@ -85,7 +87,7 @@ pub struct OrkaGuiApp {
     // Stats modal/state
     stats: StatsState,
     // Details cache (YAML + containers), TTL and cap
-    details_cache: HashMap<Uid, (Arc<String>, Option<Vec<String>>, Instant)>,
+    details_cache: HashMap<Uid, CachedDetail>,
     details_ttl_secs: u64,
     _details_cache_cap: usize,
     // Adaptive idle repaint cadence
@@ -133,7 +135,7 @@ impl OrkaGuiApp {
         // Kick off discovery asynchronously on the existing Tokio runtime.
         let (tx, rx) = mpsc::channel::<Result<Vec<ResourceKind>, String>>();
         let api_clone = api.clone();
-        let _ = tokio::spawn(async move {
+        tokio::spawn(async move {
             let t0 = Instant::now();
             let res = api_clone.discover().await.map_err(|e| e.to_string());
             match &res {
@@ -222,7 +224,6 @@ impl OrkaGuiApp {
                 atlas_expanded_ns: Default::default(),
                 atlas_expanded_kinds: Default::default(),
                 atlas_counts: Default::default(),
-                atlas_items: Default::default(),
                 details_expanded_kinds: Default::default(),
                 pending_open: None,
                 details_fit_for: None,
@@ -448,14 +449,8 @@ impl OrkaGuiApp {
                 show_log: true,
             },
             namespaces: Vec::new(),
-            contexts: match orka_kubehub::list_contexts() {
-                Ok(v) => v,
-                Err(_) => Vec::new(),
-            },
-            current_context: match orka_kubehub::current_context() {
-                Ok(v) => v,
-                Err(_) => None,
-            },
+            contexts: orka_kubehub::list_contexts().unwrap_or_default(),
+            current_context: orka_kubehub::current_context().unwrap_or_default(),
             ui_debounce: UiDebounce {
                 ms: std::env::var("ORKA_UI_DEBOUNCE_MS")
                     .ok()
@@ -613,7 +608,7 @@ impl OrkaGuiApp {
         self.watch.task = None;
         // Stop namespaces watcher if running
         if let Some(h) = self.watch.ns_task.take() {
-            let _ = h.abort();
+            h.abort();
         }
         // Reset watch hub and cached results
         crate::watch::watch_hub_reset();
@@ -634,7 +629,7 @@ impl OrkaGuiApp {
         // Restart discovery
         let (tx, rx) = std::sync::mpsc::channel::<Result<Vec<ResourceKind>, String>>();
         let api_clone = self.api.clone();
-        let _ = tokio::spawn(async move {
+        tokio::spawn(async move {
             let t0 = Instant::now();
             let res = api_clone.discover().await.map_err(|e| e.to_string());
             match &res {
@@ -726,7 +721,7 @@ impl OrkaGuiApp {
                         .unwrap_or_default()
                 };
                 // Use sort_by_key to compute keys once per element
-                self.results.rows.sort_by_key(|o| key_for(o));
+                self.results.rows.sort_by_key(key_for);
                 if !asc {
                     self.results.rows.reverse();
                 }

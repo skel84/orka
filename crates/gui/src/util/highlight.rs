@@ -9,9 +9,9 @@ use std::sync::Arc;
 use std::sync::Mutex;
 
 static SYNTAX_SET: Lazy<syntect::parsing::SyntaxSet> =
-    Lazy::new(|| syntect::parsing::SyntaxSet::load_defaults_newlines());
+    Lazy::new(syntect::parsing::SyntaxSet::load_defaults_newlines);
 static THEME_SET: Lazy<syntect::highlighting::ThemeSet> =
-    Lazy::new(|| syntect::highlighting::ThemeSet::load_defaults());
+    Lazy::new(syntect::highlighting::ThemeSet::load_defaults);
 
 // Very small memoization to avoid rebuilding on identical text/theme pairs
 static LRU: Lazy<Mutex<HashMap<u64, Arc<egui::Galley>>>> = Lazy::new(|| Mutex::new(HashMap::new()));

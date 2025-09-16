@@ -54,9 +54,7 @@ pub(crate) async fn watch_hub_subscribe(
                         Some(LiteEvent::Applied(lo)) => {
                             // Update cache then broadcast
                             let mut cache = watch_hub().cache.lock().unwrap();
-                            let entry = cache
-                                .entry(key_for_task.clone())
-                                .or_insert_with(|| std::collections::HashMap::new());
+                            let entry = cache.entry(key_for_task.clone()).or_default();
                             entry.insert(lo.uid, lo.clone());
                             let _ = tx.send(LiteEvent::Applied(lo));
                         }
@@ -89,9 +87,7 @@ pub(crate) fn watch_hub_snapshot(gvk_ns_key: &str) -> Vec<LiteObj> {
 
 pub(crate) fn watch_hub_prime(gvk_ns_key: &str, items: Vec<LiteObj>) {
     let mut cache = watch_hub().cache.lock().unwrap();
-    let entry = cache
-        .entry(gvk_ns_key.to_string())
-        .or_insert_with(|| std::collections::HashMap::new());
+    let entry = cache.entry(gvk_ns_key.to_string()).or_default();
     for it in items {
         entry.insert(it.uid, it);
     }
@@ -118,7 +114,7 @@ pub(crate) fn watch_hub_reset() {
     // Abort tasks
     let mut tasks = watch_hub().tasks.lock().unwrap();
     for (_k, h) in tasks.drain() {
-        let _ = h.abort();
+        h.abort();
     }
     // Clear senders and caches
     watch_hub().map.lock().unwrap().clear();

@@ -33,14 +33,13 @@ pub(crate) fn ui_topbar(app: &mut OrkaGuiApp, ctx: &egui::Context) {
             {
                 app.close_all_details_tabs();
             }
-            if app.atlas_enabled {
-                if ui
+            if app.atlas_enabled
+                && ui
                     .small_button("Open Atlas")
                     .on_hover_text("Open the global Atlas view")
                     .clicked()
-                {
-                    app.open_atlas_tab();
-                }
+            {
+                app.open_atlas_tab();
             }
             if !app.detached.is_empty() {
                 let label = format!("Reattach All ({})", app.detached.len());
@@ -132,19 +131,18 @@ pub(crate) fn ui_topbar(app: &mut OrkaGuiApp, ctx: &egui::Context) {
             if ui.button("Go").on_hover_text("Run search").clicked() {
                 app.start_search_task();
             }
-            if !app.search.query.is_empty() || !app.search.hits.is_empty() {
-                if ui
+            if (!app.search.query.is_empty() || !app.search.hits.is_empty())
+                && ui
                     .button("×")
                     .on_hover_text("Clear search overlay")
                     .clicked()
-                {
-                    app.search.query.clear();
-                    app.search.hits.clear();
-                    app.search.explain = None;
-                    app.search.partial = false;
-                    app.search.preview.clear();
-                    app.search.preview_sel = None;
-                }
+            {
+                app.search.query.clear();
+                app.search.hits.clear();
+                app.search.explain = None;
+                app.search.partial = false;
+                app.search.preview.clear();
+                app.search.preview_sel = None;
             }
             if app.search.task.is_some() {
                 ui.add(egui::Spinner::new());

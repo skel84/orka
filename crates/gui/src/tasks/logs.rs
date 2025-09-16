@@ -6,12 +6,8 @@ use tracing::info;
 
 impl OrkaGuiApp {
     pub(crate) fn current_pod_selection(&self) -> Option<(String, String)> {
-        let Some(uid) = self.details.selected else {
-            return None;
-        };
-        let Some(kind) = self.current_selected_kind() else {
-            return None;
-        };
+        let uid = self.details.selected?;
+        let kind = self.current_selected_kind()?;
         // Only pods are supported for logs for now
         if !(kind.group.is_empty() && kind.version == "v1" && kind.kind == "Pod") {
             return None;

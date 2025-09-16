@@ -102,7 +102,7 @@ impl OrkaGuiApp {
                             }
                         };
                         send_list();
-                        while let Ok(_) = rx.recv().await {
+                        while rx.recv().await.is_ok() {
                             send_list();
                         }
                     }
@@ -126,7 +126,7 @@ impl OrkaGuiApp {
             );
             let cached = watch_hub_snapshot(&cache_key);
             if !cached.is_empty() {
-                let _ = tx.send(UiUpdate::Snapshot(cached));
+                let _ = tx.send(UiUpdate::Snapshot(Box::new(cached)));
             }
             // Start (or attach to) a persistent watcher via WatchHub for faster perceived latency
             let watch_fut = async {
@@ -146,7 +146,9 @@ impl OrkaGuiApp {
                                                 info!(ttfe_ms = %ms, "metric: time_to_first_event_ms");
                                                 first_event = false;
                                             }
-                                            if tx.send(UiUpdate::Event(e)).is_err() { break; }
+                                            if tx.send(UiUpdate::Event(Box::new(e))).is_err() {
+                                                break;
+                                            }
                                         }
                                         Err(broadcast::error::RecvError::Lagged(_)) => { /* drop */ }
                                         Err(broadcast::error::RecvError::Closed) => break,
@@ -179,7 +181,7 @@ impl OrkaGuiApp {
                 {
                     Ok(items) => {
                         info!(items = items.len(), took_ms = %t0.elapsed().as_millis(), "snapshot: fast first page ok");
-                        let _ = fast_tx.send(UiUpdate::Snapshot(items));
+                        let _ = fast_tx.send(UiUpdate::Snapshot(Box::new(items)));
                     }
                     Err(e) => {
                         info!(error = %e, took_ms = %t0.elapsed().as_millis(), "snapshot: fast first page failed");
@@ -198,7 +200,7 @@ impl OrkaGuiApp {
                     Ok(resp) => {
                         info!(items = resp.data.items.len(), took_ms = %t0.elapsed().as_millis(), "snapshot: response ok");
                         let epoch = resp.data.epoch;
-                        let _ = snap_tx.send(UiUpdate::Snapshot(resp.data.items));
+                        let _ = snap_tx.send(UiUpdate::Snapshot(Box::new(resp.data.items)));
                         let _ = snap_tx.send(UiUpdate::Epoch(epoch));
                     }
                     Err(e) => {

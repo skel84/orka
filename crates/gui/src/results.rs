@@ -191,7 +191,7 @@ impl OrkaGuiApp {
         });
     }
 
-    fn ui_results_virtual(&mut self, ui: &mut egui::Ui, filtered_ix: &Vec<usize>) {
+    fn ui_results_virtual(&mut self, ui: &mut egui::Ui, filtered_ix: &[usize]) {
         // Header row (clickable for sorting)
         self.draw_results_header(ui);
         ui.separator();
@@ -252,14 +252,16 @@ impl OrkaGuiApp {
                                             }
                                         }
                                         // Delete Pod (Pods only)
-                                        if self.selected_is_pod() {
-                                            if ui.button("Delete…").clicked() {
-                                                self.select_row(it.clone());
-                                                if let Some((ns, pod)) = self.current_pod_selection() {
-                                                    self.ops.confirm_delete = Some((ns, pod));
-                                                }
-                                                ui.close();
+                                        if self.selected_is_pod()
+                                            && ui.button("Delete…").clicked()
+                                        {
+                                            self.select_row(it.clone());
+                                            if let Some((ns, pod)) =
+                                                self.current_pod_selection()
+                                            {
+                                                self.ops.confirm_delete = Some((ns, pod));
                                             }
+                                            ui.close();
                                         }
                                     });
                                 }
@@ -289,7 +291,7 @@ impl<'a> TableDelegate for ResultsDelegate<'a> {
             let rect = ui.max_rect();
             let bg = ui.visuals().widgets.inactive.bg_fill;
             ui.painter().rect_filled(rect, 0.0, bg);
-            let col_idx = cell.col_range.start as usize;
+            let col_idx = cell.col_range.start;
             let label = self
                 .app
                 .results
@@ -342,7 +344,7 @@ impl<'a> TableDelegate for ResultsDelegate<'a> {
                 ui.painter()
                     .rect_filled(rect, 0.0, ui.visuals().faint_bg_color);
             }
-            let col_idx = cell.col_nr as usize;
+            let col_idx = cell.col_nr;
             if let Some(spec) = self.app.results.active_cols.get(col_idx).cloned() {
                 let mut text = self.app.display_cell_string(&it, col_idx, &spec);
                 if is_hit && matches!(spec.kind, ColumnKind::Name) {
@@ -390,15 +392,13 @@ impl<'a> TableDelegate for ResultsDelegate<'a> {
                                 }
                             }
                             // Delete Pod (Pods only)
-                            if self.app.selected_is_pod() {
-                                if ui.button("Delete…").clicked() {
-                                    self.app.select_row(it.clone());
-                                    if let Some((ns, pod)) = self.app.current_pod_selection() {
-                                        self.app.ops.confirm_delete = Some((ns, pod));
-                                    }
-                                    ui.close();
-                                }
+                        if self.app.selected_is_pod() && ui.button("Delete…").clicked() {
+                            self.app.select_row(it.clone());
+                            if let Some((ns, pod)) = self.app.current_pod_selection() {
+                                self.app.ops.confirm_delete = Some((ns, pod));
                             }
+                            ui.close();
+                        }
                         });
                     }
                     _ => {

@@ -321,7 +321,7 @@ impl OrkaGuiApp {
                 let tx2 = tx_opt.clone();
                 joins.push(std::thread::spawn(move || {
                     let reader = BufReader::new(out);
-                    for line in reader.lines().flatten() {
+                    for line in reader.lines().map_while(Result::ok) {
                         if let Some(tx) = &tx2 {
                             let _ = tx.send(UiUpdate::ExecData(line));
                         }
@@ -332,7 +332,7 @@ impl OrkaGuiApp {
                 let tx2 = tx_opt.clone();
                 joins.push(std::thread::spawn(move || {
                     let reader = BufReader::new(err);
-                    for line in reader.lines().flatten() {
+                    for line in reader.lines().map_while(Result::ok) {
                         if let Some(tx) = &tx2 {
                             let _ = tx.send(UiUpdate::ExecData(line));
                         }

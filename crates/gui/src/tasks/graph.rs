@@ -79,13 +79,14 @@ impl OrkaGuiApp {
                                     Ok(s) => s,
                                     Err(e) => format!("graph: error building: {}", e),
                                 };
-                            let model =
-                                match build_graph_model(&api, &v, &gvk, ns_opt.as_deref()).await {
-                                    Ok(m) => m,
-                                    Err(_e) => GraphModel::default(),
-                                };
+                            let model = build_graph_model(&api, &v, &gvk, ns_opt.as_deref())
+                                .await
+                                .unwrap_or_default();
                             let _ = tx.send(UiUpdate::GraphReady { uid, text });
-                            let _ = tx.send(UiUpdate::GraphModelReady { uid, model });
+                            let _ = tx.send(UiUpdate::GraphModelReady {
+                                uid,
+                                model: Box::new(model),
+                            });
                         }
                         Err(_) => {
                             let text = String::from_utf8_lossy(&bytes).into_owned();
@@ -281,10 +282,9 @@ async fn build_graph_text(
                 items.sort();
                 let selector = items.join(",");
                 let ns_for = ns.map(|s| s.to_string());
-                let count = match count_pods_for_selector(ns_for.as_deref(), &selector).await {
-                    Ok(n) => n,
-                    Err(_) => 0,
-                };
+                let count = count_pods_for_selector(ns_for.as_deref(), &selector)
+                    .await
+                    .unwrap_or_default();
                 let _ = std::fmt::write(
                     &mut out,
                     format_args!(
@@ -513,10 +513,9 @@ async fn build_graph_model(
                 items.sort();
                 let selector = items.join(",");
                 let ns_for = ns.map(|s| s.to_string());
-                let count = match count_pods_for_selector(ns_for.as_deref(), &selector).await {
-                    Ok(n) => n,
-                    Err(_) => 0,
-                };
+                let count = count_pods_for_selector(ns_for.as_deref(), &selector)
+                    .await
+                    .unwrap_or_default();
                 let label = if selector.is_empty() {
                     "Pods".to_string()
                 } else {

@@ -22,6 +22,7 @@ pub(crate) fn process_updates(app: &mut OrkaGuiApp, ctx: &egui::Context) {
         while processed < 256 {
             match rx.try_recv() {
                 Ok(UiUpdate::Snapshot(items)) => {
+                    let items = *items;
                     let count = items.len();
                     if app.results.rows.is_empty() {
                         app.results.rows = items;
@@ -93,7 +94,7 @@ pub(crate) fn process_updates(app: &mut OrkaGuiApp, ctx: &egui::Context) {
                         }
                     }
                 }
-                Ok(UiUpdate::Event(ev)) => match ev {
+                Ok(UiUpdate::Event(ev)) => match *ev {
                     LiteEvent::Applied(lo) => {
                         let uid = lo.uid;
                         if let Some(idx) = app.results.index.get(&uid).copied() {
@@ -213,10 +214,10 @@ pub(crate) fn process_updates(app: &mut OrkaGuiApp, ctx: &egui::Context) {
                     app.logs.containers = list.clone();
                     if let Some(cur) = &app.logs.container {
                         if !app.logs.containers.iter().any(|c| c == cur) {
-                            app.logs.container = app.logs.containers.get(0).cloned();
+                            app.logs.container = app.logs.containers.first().cloned();
                         }
                     } else {
-                        app.logs.container = app.logs.containers.get(0).cloned();
+                        app.logs.container = app.logs.containers.first().cloned();
                     }
                     processed += 1;
                 }
@@ -566,29 +567,8 @@ pub(crate) fn process_updates(app: &mut OrkaGuiApp, ctx: &egui::Context) {
                                 }
                                 exec.backlog.push_back(s);
                             }
-                        } else {
+                        } else if app.exec.mode_oneshot {
                             // Fallback to main state if owner missing
-                            if app.exec.mode_oneshot {
-                                app.exec.recv += 1;
-                                if app.exec.backlog.len() >= app.exec.backlog_cap {
-                                    app.exec.backlog.pop_front();
-                                    app.exec.dropped += 1;
-                                }
-                                app.exec.backlog.push_back(s);
-                            } else {
-                                app.exec.recv += 1;
-                                if let Some(t) = app.exec.term.as_mut() {
-                                    t.feed_bytes(s.as_bytes());
-                                }
-                                if app.exec.backlog.len() >= app.exec.backlog_cap {
-                                    app.exec.backlog.pop_front();
-                                    app.exec.dropped += 1;
-                                }
-                                app.exec.backlog.push_back(s);
-                            }
-                        }
-                    } else {
-                        if app.exec.mode_oneshot {
                             app.exec.recv += 1;
                             if app.exec.backlog.len() >= app.exec.backlog_cap {
                                 app.exec.backlog.pop_front();
@@ -606,6 +586,23 @@ pub(crate) fn process_updates(app: &mut OrkaGuiApp, ctx: &egui::Context) {
                             }
                             app.exec.backlog.push_back(s);
                         }
+                    } else if app.exec.mode_oneshot {
+                        app.exec.recv += 1;
+                        if app.exec.backlog.len() >= app.exec.backlog_cap {
+                            app.exec.backlog.pop_front();
+                            app.exec.dropped += 1;
+                        }
+                        app.exec.backlog.push_back(s);
+                    } else {
+                        app.exec.recv += 1;
+                        if let Some(t) = app.exec.term.as_mut() {
+                            t.feed_bytes(s.as_bytes());
+                        }
+                        if app.exec.backlog.len() >= app.exec.backlog_cap {
+                            app.exec.backlog.pop_front();
+                            app.exec.dropped += 1;
+                        }
+                        app.exec.backlog.push_back(s);
                     }
                     processed += 1;
                 }
@@ -698,7 +695,7 @@ pub(crate) fn process_updates(app: &mut OrkaGuiApp, ctx: &egui::Context) {
                 }
                 Ok(UiUpdate::GraphModelReady { uid, model }) => {
                     if app.details.selected == Some(uid) {
-                        app.graph.model = Some(model);
+                        app.graph.model = Some(*model);
                         app.graph.error = None;
                         app.graph.running = false;
                         app.graph.uid = Some(uid);

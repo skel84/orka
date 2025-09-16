@@ -61,11 +61,9 @@ pub(crate) fn ui_palette(app: &mut OrkaGuiApp, ctx: &egui::Context) {
                 if ui.selectable_label(cached, "Cached").clicked() {
                     app.palette.mode_global = false;
                 }
-                if ui.selectable_label(!cached, "Global").clicked() {
-                    if !app.palette.mode_global {
-                        app.palette.mode_global = true;
-                        app.start_palette_global_prime();
-                    }
+                if ui.selectable_label(!cached, "Global").clicked() && !app.palette.mode_global {
+                    app.palette.mode_global = true;
+                    app.start_palette_global_prime();
                 }
             });
             ui.add_space(4.0);
@@ -335,13 +333,9 @@ impl OrkaGuiApp {
         let tx_opt = self.watch.updates_tx.clone();
         self.palette.prime_task = Some(tokio::spawn(async move {
             // Discover kinds if not provided
-            let kinds = if let Some(k) = kinds_opt {
-                k
-            } else {
-                match api.discover().await {
-                    Ok(v) => v,
-                    Err(_) => Vec::new(),
-                }
+            let kinds = match kinds_opt {
+                Some(k) => k,
+                None => api.discover().await.unwrap_or_default(),
             };
             for k in kinds.into_iter() {
                 // Prime fast first page to avoid heavy calls

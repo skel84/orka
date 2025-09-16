@@ -25,9 +25,11 @@ pub fn parse_line_to_job_hl(
 ) -> egui::text::LayoutJob {
     let mut job = egui::text::LayoutJob::default();
     // Always use monospace for logs
-    let mut fmt = egui::TextFormat::default();
-    fmt.font_id = egui::FontId::monospace(12.0);
-    fmt.color = default_color;
+    let fmt = egui::TextFormat {
+        font_id: egui::FontId::monospace(12.0),
+        color: default_color,
+        ..Default::default()
+    };
 
     let tailspin_on = colorize;
 
@@ -172,30 +174,24 @@ fn append_tailspin_segment_with_hl(
         // Only override color if the base format is the default (avoid fighting ANSI colors)
         let can_override = base_fmt.color == default_color;
         if let Some(g) = caps.name("level") {
-            if g.start() == m.start() && g.end() == m.end() {
-                if can_override {
-                    let word = seg[m.start()..m.end()].to_ascii_lowercase();
-                    fmt.color = match word.as_str() {
-                        "error" => egui::Color32::from_rgb(0xE0, 0x40, 0x40),
-                        "warn" | "warning" => egui::Color32::from_rgb(0xE0, 0xB0, 0x40),
-                        "info" => egui::Color32::from_rgb(0x40, 0xA0, 0x40),
-                        "debug" => egui::Color32::from_rgb(0x50, 0x80, 0xD0),
-                        "trace" => egui::Color32::from_gray(180),
-                        _ => base_fmt.color,
-                    };
-                }
+            if g.start() == m.start() && g.end() == m.end() && can_override {
+                let word = seg[m.start()..m.end()].to_ascii_lowercase();
+                fmt.color = match word.as_str() {
+                    "error" => egui::Color32::from_rgb(0xE0, 0x40, 0x40),
+                    "warn" | "warning" => egui::Color32::from_rgb(0xE0, 0xB0, 0x40),
+                    "info" => egui::Color32::from_rgb(0x40, 0xA0, 0x40),
+                    "debug" => egui::Color32::from_rgb(0x50, 0x80, 0xD0),
+                    "trace" => egui::Color32::from_gray(180),
+                    _ => base_fmt.color,
+                };
             }
         } else if let Some(g) = caps.name("ts") {
-            if g.start() == m.start() && g.end() == m.end() {
-                if can_override {
-                    fmt.color = egui::Color32::from_gray(180);
-                }
+            if g.start() == m.start() && g.end() == m.end() && can_override {
+                fmt.color = egui::Color32::from_gray(180);
             }
         } else if let Some(g) = caps.name("num") {
-            if g.start() == m.start() && g.end() == m.end() {
-                if can_override {
-                    fmt.color = egui::Color32::from_rgb(0x40, 0xC0, 0xC0);
-                }
+            if g.start() == m.start() && g.end() == m.end() && can_override {
+                fmt.color = egui::Color32::from_rgb(0x40, 0xC0, 0xC0);
             }
         }
         pieces.push((std::borrow::Cow::from(m.as_str()), fmt));

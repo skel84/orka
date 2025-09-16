@@ -62,13 +62,12 @@ pub(crate) fn show_dock(app: &mut OrkaGuiApp, ui: &mut egui::Ui) {
         // Sync selection to currently focused Details tab (if any)
         {
             let tree = ds.main_surface_mut();
-            if let Some((_rect, tab)) = tree.find_active_focused() {
-                if let Tab::DetailsFor(uid) = *tab {
-                    if app.details.selected != Some(uid) {
-                        if let Some(i) = app.results.index.get(&uid).copied() {
-                            if let Some(row) = app.results.rows.get(i).cloned() {
-                                app.select_row(row);
-                            }
+            if let Some((_rect, Tab::DetailsFor(uid_ref))) = tree.find_active_focused() {
+                let uid = *uid_ref;
+                if app.details.selected != Some(uid) {
+                    if let Some(i) = app.results.index.get(&uid).copied() {
+                        if let Some(row) = app.results.rows.get(i).cloned() {
+                            app.select_row(row);
                         }
                     }
                 }
@@ -90,15 +89,13 @@ impl OrkaGuiApp {
         {
             tree.set_focused_node(node);
             tree.set_active_tab(node, tab_index);
+        } else if let Some((node, _)) =
+            tree.find_tab_from(|t| matches!(t, Tab::DetailsFor(_) | Tab::Details))
+        {
+            tree.set_focused_node(node);
+            tree.push_to_focused_leaf(Tab::DetailsFor(uid));
         } else {
-            if let Some((node, _)) =
-                tree.find_tab_from(|t| matches!(t, Tab::DetailsFor(_) | Tab::Details))
-            {
-                tree.set_focused_node(node);
-                tree.push_to_focused_leaf(Tab::DetailsFor(uid));
-            } else {
-                tree.split_right(dock::NodeIndex::root(), 0.5, vec![Tab::DetailsFor(uid)]);
-            }
+            tree.split_right(dock::NodeIndex::root(), 0.5, vec![Tab::DetailsFor(uid)]);
         }
         self.note_opened_details_uid(uid, ds);
     }

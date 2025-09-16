@@ -10,7 +10,6 @@ impl OrkaGuiApp {
     /// and also as a fallback when optional graph renderer is enabled but not used.
     fn ui_atlas_global_basic(&mut self, ui: &mut egui::Ui) {
         use crate::watch::watch_hub_snapshot;
-        const TOP_N: usize = 8;
         // Ensure namespaces are available even if no Kind is selected yet
         if self.namespaces.is_empty() {
             self.ensure_namespaces_watch();
@@ -187,63 +186,6 @@ impl OrkaGuiApp {
                             self.graph.atlas_expanded_kinds.insert(kkey.clone());
                         }
                     }
-
-                    // expanded items under kind (disabled in MVP)
-                    let kkey = (ns.clone(), (*klabel).to_string());
-                    if false && self.graph.atlas_expanded_kinds.contains(&kkey) {
-                        let list = if let Some(v) = self.graph.atlas_items.get(&kkey) {
-                            v.clone()
-                        } else {
-                            let items = watch_hub_snapshot(&format!("{}|{}", gvk, ns));
-                            let mut names: Vec<String> =
-                                items.into_iter().map(|o| o.name).collect();
-                            names.sort();
-                            self.graph.atlas_items.insert(kkey.clone(), names.clone());
-                            names
-                        };
-                        let mut shown = 0usize;
-                        for (j, name) in list.into_iter().take(TOP_N).enumerate() {
-                            let p2 = to_screen(egui::pos2(
-                                lp.x + dx,
-                                lp.y + dy + 34.0 + j as f32 * 20.0,
-                            ));
-                            let rect = egui::Rect::from_center_size(p2, egui::vec2(160.0, 18.0));
-                            painter.rect_filled(rect, 4.0, ui.visuals().widgets.inactive.bg_fill);
-                            painter.rect_stroke(
-                                rect,
-                                4.0,
-                                egui::Stroke::new(
-                                    1.0,
-                                    ui.visuals().widgets.noninteractive.bg_stroke.color,
-                                ),
-                                egui::StrokeKind::Inside,
-                            );
-                            painter.text(
-                                rect.center(),
-                                egui::Align2::CENTER_CENTER,
-                                name,
-                                egui::TextStyle::Small.resolve(ui.style()),
-                                ui.visuals().text_color(),
-                            );
-                            shown += 1;
-                        }
-                        if let Some(c) = self.graph.atlas_counts.get(&kkey) {
-                            if *c > shown {
-                                let more = format!("+{} more", c - shown);
-                                let p3 = to_screen(egui::pos2(
-                                    lp.x + dx,
-                                    lp.y + dy + 34.0 + shown as f32 * 20.0,
-                                ));
-                                painter.text(
-                                    p3,
-                                    egui::Align2::CENTER_CENTER,
-                                    more,
-                                    egui::TextStyle::Small.resolve(ui.style()),
-                                    ui.visuals().weak_text_color(),
-                                );
-                            }
-                        }
-                    }
                 }
             }
         }
@@ -325,7 +267,7 @@ impl OrkaGuiApp {
                         }
                     };
                     send_list();
-                    while let Ok(_) = rx.recv().await {
+                    while rx.recv().await.is_ok() {
                         send_list();
                     }
                 }

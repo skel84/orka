@@ -6,12 +6,8 @@ use tracing::info;
 
 impl OrkaGuiApp {
     pub(crate) fn current_service_selection(&self) -> Option<(String, String)> {
-        let Some(uid) = self.details.selected else {
-            return None;
-        };
-        let Some(kind) = self.current_selected_kind() else {
-            return None;
-        };
+        let uid = self.details.selected?;
+        let kind = self.current_selected_kind()?;
         if !(kind.group.is_empty() && kind.version == "v1" && kind.kind == "Service") {
             return None;
         }

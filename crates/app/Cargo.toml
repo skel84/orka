@@ -2,7 +2,7 @@
 name = "orka-app"
 version = "0.0.1"
 edition = "2021"
-license = "MIT OR Apache-2.0"
+license = "Apache-2.0"
 description = "Orka desktop app (eframe/egui)"
 
 [[bin]]
@@ -18,7 +18,7 @@ tokio = { workspace = true }
 
 [package.metadata.bundle]
 name = "Orka"
-identifier = "io.skelops.orka"
+identifier = "io.skel84.orka"
 icon = ["assets/macos/orka.icns"]
 version = "0.0.1"
 category = "Developer Tool"

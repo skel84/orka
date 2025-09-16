@@ -81,10 +81,8 @@ impl OrkaGuiApp {
                                 if ui.button("Hide").on_hover_text("Hide value").clicked() {
                                     self.details.secret_revealed.remove(&entry.key);
                                 }
-                            } else {
-                                if ui.button("Reveal").on_hover_text("Reveal value").clicked() {
-                                    self.details.secret_revealed.insert(entry.key.clone());
-                                }
+                            } else if ui.button("Reveal").on_hover_text("Reveal value").clicked() {
+                                self.details.secret_revealed.insert(entry.key.clone());
                             }
                             if ui
                                 .button("Copy")
@@ -259,7 +257,7 @@ impl OrkaGuiApp {
                 .on_hover_text("Only show lines newer than N seconds; 0 disables")
                 .changed()
             {
-                self.logs.since_seconds = if since <= 0 { None } else { Some(since as i64) };
+                self.logs.since_seconds = if since <= 0 { None } else { Some(since) };
                 if self.logs.running {
                     self.start_logs_task();
                 }
@@ -272,7 +270,7 @@ impl OrkaGuiApp {
                 .on_hover_text("Tail last N lines; 0 disables")
                 .changed()
             {
-                self.logs.tail_lines = if tail <= 0 { None } else { Some(tail as i64) };
+                self.logs.tail_lines = if tail <= 0 { None } else { Some(tail) };
                 if self.logs.running {
                     self.start_logs_task();
                 }
@@ -284,7 +282,7 @@ impl OrkaGuiApp {
             } else {
                 let current =
                     self.logs.container.clone().unwrap_or_else(|| {
-                        self.logs.containers.get(0).cloned().unwrap_or_default()
+                        self.logs.containers.first().cloned().unwrap_or_default()
                     });
                 let mut selected = current.clone();
                 let mut changed_container = false;
@@ -354,10 +352,8 @@ impl OrkaGuiApp {
                 {
                     self.start_logs_task();
                 }
-            } else {
-                if ui.button("Stop").on_hover_text("Stop logs").clicked() {
-                    self.stop_logs_task();
-                }
+            } else if ui.button("Stop").on_hover_text("Stop logs").clicked() {
+                self.stop_logs_task();
             }
         });
         ui.add_space(4.0);
@@ -378,8 +374,8 @@ impl OrkaGuiApp {
 
         if !self.logs.follow && self.logs.order_by_ts_when_paused {
             indices.sort_by(|&a, &b| {
-                let ta = self.logs.ring.get(a).and_then(|p| p.timestamp.clone());
-                let tb = self.logs.ring.get(b).and_then(|p| p.timestamp.clone());
+                let ta = self.logs.ring.get(a).and_then(|p| p.timestamp);
+                let tb = self.logs.ring.get(b).and_then(|p| p.timestamp);
                 match (ta, tb) {
                     (Some(x), Some(y)) => x.cmp(&y),
                     (Some(_), None) => std::cmp::Ordering::Less,
@@ -456,22 +452,18 @@ impl OrkaGuiApp {
                             .send_viewport_cmd_to(id, egui::ViewportCommand::Close);
                         self.detached.retain(|w| w.meta.id != id);
                     }
-                } else {
-                    if ui
-                        .small_button("Detach to Window")
-                        .on_hover_text("Open this Details view in a separate OS window")
-                        .clicked()
-                    {
-                        let ctx = ui.ctx();
-                        self.open_detached_for(ctx, uid);
-                        // Queue closing the corresponding dock tab, if any
-                        self.dock_close_pending.push(uid);
-                    }
+                } else if ui
+                    .small_button("Detach to Window")
+                    .on_hover_text("Open this Details view in a separate OS window")
+                    .clicked()
+                {
+                    let ctx = ui.ctx();
+                    self.open_detached_for(ctx, uid);
+                    // Queue closing the corresponding dock tab, if any
+                    self.dock_close_pending.push(uid);
                 }
-            } else {
-                if ui.small_button("Detach to Window").clicked() {
-                    self.toast("details: select a row first", crate::model::ToastKind::Info);
-                }
+            } else if ui.small_button("Detach to Window").clicked() {
+                self.toast("details: select a row first", crate::model::ToastKind::Info);
             }
         });
         // Tab bar inside the Details pane (Edit | Logs | Svc Logs | Exec | Describe | Graph)
@@ -490,21 +482,19 @@ impl OrkaGuiApp {
             {
                 self.details.active_tab = DetailsPaneTab::Logs;
             }
-            if is_svc {
-                if ui
+            if is_svc
+                && ui
                     .selectable_label(matches!(tab, DetailsPaneTab::SvcLogs), "Svc Logs")
                     .clicked()
-                {
-                    self.details.active_tab = DetailsPaneTab::SvcLogs;
-                }
+            {
+                self.details.active_tab = DetailsPaneTab::SvcLogs;
             }
-            if self.selected_is_pod() {
-                if ui
+            if self.selected_is_pod()
+                && ui
                     .selectable_label(matches!(tab, DetailsPaneTab::Exec), "Exec")
                     .clicked()
-                {
-                    self.details.active_tab = DetailsPaneTab::Exec;
-                }
+            {
+                self.details.active_tab = DetailsPaneTab::Exec;
             }
             if ui
                 .selectable_label(matches!(tab, DetailsPaneTab::Describe), "Describe")
@@ -771,7 +761,7 @@ impl OrkaGuiApp {
                         consider.push(*p);
                     }
                 }
-                for (_k, pos) in &group_pos {
+                for pos in group_pos.values() {
                     consider.push(*pos);
                 }
                 for p in consider {
@@ -1034,7 +1024,7 @@ impl OrkaGuiApp {
             } else {
                 let current =
                     self.exec.container.clone().unwrap_or_else(|| {
-                        self.logs.containers.get(0).cloned().unwrap_or_default()
+                        self.logs.containers.first().cloned().unwrap_or_default()
                     });
                 let mut selected = current.clone();
                 let mut changed_container = false;
@@ -1062,15 +1052,11 @@ impl OrkaGuiApp {
                     if ui.button("Run").clicked() {
                         self.start_exec_oneshot_task();
                     }
-                } else {
-                    if ui.button("Start").clicked() {
-                        self.start_exec_task();
-                    }
+                } else if ui.button("Start").clicked() {
+                    self.start_exec_task();
                 }
-            } else {
-                if ui.button("Stop").clicked() {
-                    self.stop_exec_task();
-                }
+            } else if ui.button("Stop").clicked() {
+                self.stop_exec_task();
             }
         });
 
@@ -1285,7 +1271,7 @@ impl OrkaGuiApp {
                 .on_hover_text("Only show lines newer than N seconds; 0 disables")
                 .changed()
             {
-                self.svc_logs.since_seconds = if since <= 0 { None } else { Some(since as i64) };
+                self.svc_logs.since_seconds = if since <= 0 { None } else { Some(since) };
                 if self.svc_logs.running {
                     self.start_service_logs_task();
                 }
@@ -1298,7 +1284,7 @@ impl OrkaGuiApp {
                 .on_hover_text("Tail last N lines; 0 disables")
                 .changed()
             {
-                self.svc_logs.tail_lines = if tail <= 0 { None } else { Some(tail as i64) };
+                self.svc_logs.tail_lines = if tail <= 0 { None } else { Some(tail) };
                 if self.svc_logs.running {
                     self.start_service_logs_task();
                 }
@@ -1338,10 +1324,8 @@ impl OrkaGuiApp {
                 if ui.button("Start").clicked() {
                     self.start_service_logs_task();
                 }
-            } else {
-                if ui.button("Stop").clicked() {
-                    self.stop_service_logs_task();
-                }
+            } else if ui.button("Stop").clicked() {
+                self.stop_service_logs_task();
             }
         });
         ui.add_space(4.0);
@@ -1359,8 +1343,8 @@ impl OrkaGuiApp {
         };
         if !self.svc_logs.follow && self.svc_logs.order_by_ts_when_paused {
             indices.sort_by(|&a, &b| {
-                let ta = self.svc_logs.ring.get(a).and_then(|p| p.timestamp.clone());
-                let tb = self.svc_logs.ring.get(b).and_then(|p| p.timestamp.clone());
+                let ta = self.svc_logs.ring.get(a).and_then(|p| p.timestamp);
+                let tb = self.svc_logs.ring.get(b).and_then(|p| p.timestamp);
                 match (ta, tb) {
                     (Some(x), Some(y)) => x.cmp(&y),
                     (Some(_), None) => std::cmp::Ordering::Less,
@@ -1509,173 +1493,182 @@ impl OrkaGuiApp {
                         }
                         // Parse JSON (if possible) both for YAML rendering and for extracting pod containers
                         let p0 = Instant::now();
-                        let (text, containers, pod_ports, secret_entries): (
-                            String,
-                            Option<Vec<String>>,
-                            Option<Vec<crate::model::PfPort>>,
-                            Option<Vec<crate::model::SecretEntry>>,
-                        ) = match serde_json::from_slice::<serde_json::Value>(&bytes) {
-                            Ok(v) => {
-                                let parse_ms = p0.elapsed().as_millis() as f64;
-                                histogram!("details_json_parse_ms", parse_ms);
-                                // Extract pod containers if applicable
-                                let e0 = Instant::now();
-                                let mut names: Vec<String> = Vec::new();
-                                let mut ports: Vec<crate::model::PfPort> = Vec::new();
-                                if v.get("kind").and_then(|k| k.as_str()).unwrap_or("") == "Pod" {
-                                    if let Some(spec) = v.get("spec") {
-                                        if let Some(conts) =
-                                            spec.get("containers").and_then(|c| c.as_array())
-                                        {
-                                            for c in conts {
-                                                let cname = c
-                                                    .get("name")
-                                                    .and_then(|n| n.as_str())
-                                                    .map(|s| s.to_string());
-                                                if let Some(ref n) = cname {
-                                                    names.push(n.clone());
-                                                }
-                                                if let Some(ports_arr) =
-                                                    c.get("ports").and_then(|p| p.as_array())
-                                                {
-                                                    for p in ports_arr {
-                                                        let port = p
-                                                            .get("containerPort")
-                                                            .and_then(|x| x.as_i64())
-                                                            .unwrap_or(0);
-                                                        if port <= 0 || port > u16::MAX as i64 {
-                                                            continue;
-                                                        }
-                                                        let name = p
-                                                            .get("name")
-                                                            .and_then(|x| x.as_str())
-                                                            .map(|s| s.to_string());
-                                                        let proto = p
-                                                            .get("protocol")
-                                                            .and_then(|x| x.as_str())
-                                                            .map(|s| s.to_string());
-                                                        // Only TCP (or unspecified) is supported for port-forward
-                                                        if let Some(ref proto_s) = proto {
-                                                            if proto_s.to_ascii_uppercase() != "TCP"
-                                                            {
+                        let (text, containers, pod_ports, secret_entries) =
+                            match serde_json::from_slice::<serde_json::Value>(&bytes) {
+                                Ok(v) => {
+                                    let parse_ms = p0.elapsed().as_millis() as f64;
+                                    histogram!("details_json_parse_ms", parse_ms);
+                                    // Extract pod containers if applicable
+                                    let e0 = Instant::now();
+                                    let mut names: Vec<String> = Vec::new();
+                                    let mut ports: Vec<crate::model::PfPort> = Vec::new();
+                                    if v.get("kind").and_then(|k| k.as_str()).unwrap_or("") == "Pod"
+                                    {
+                                        if let Some(spec) = v.get("spec") {
+                                            if let Some(conts) =
+                                                spec.get("containers").and_then(|c| c.as_array())
+                                            {
+                                                for c in conts {
+                                                    let cname = c
+                                                        .get("name")
+                                                        .and_then(|n| n.as_str())
+                                                        .map(|s| s.to_string());
+                                                    if let Some(ref n) = cname {
+                                                        names.push(n.clone());
+                                                    }
+                                                    if let Some(ports_arr) =
+                                                        c.get("ports").and_then(|p| p.as_array())
+                                                    {
+                                                        for p in ports_arr {
+                                                            let port = p
+                                                                .get("containerPort")
+                                                                .and_then(|x| x.as_i64())
+                                                                .unwrap_or(0);
+                                                            if port <= 0 || port > u16::MAX as i64 {
                                                                 continue;
                                                             }
+                                                            let name = p
+                                                                .get("name")
+                                                                .and_then(|x| x.as_str())
+                                                                .map(|s| s.to_string());
+                                                            let proto = p
+                                                                .get("protocol")
+                                                                .and_then(|x| x.as_str())
+                                                                .map(|s| s.to_string());
+                                                            // Only TCP (or unspecified) is supported for port-forward
+                                                            if let Some(ref proto_s) = proto {
+                                                                if !proto_s
+                                                                    .eq_ignore_ascii_case("TCP")
+                                                                {
+                                                                    continue;
+                                                                }
+                                                            }
+                                                            ports.push(crate::model::PfPort {
+                                                                container: cname.clone(),
+                                                                port: port as u16,
+                                                                name,
+                                                                protocol: proto,
+                                                            });
                                                         }
-                                                        ports.push(crate::model::PfPort {
-                                                            container: cname.clone(),
-                                                            port: port as u16,
-                                                            name,
-                                                            protocol: proto,
-                                                        });
+                                                    }
+                                                }
+                                            }
+                                            if let Some(inits) = spec
+                                                .get("initContainers")
+                                                .and_then(|c| c.as_array())
+                                            {
+                                                for c in inits {
+                                                    if let Some(n) =
+                                                        c.get("name").and_then(|n| n.as_str())
+                                                    {
+                                                        names.push(n.to_string());
+                                                    }
+                                                }
+                                            }
+                                            if let Some(ephs) = spec
+                                                .get("ephemeralContainers")
+                                                .and_then(|c| c.as_array())
+                                            {
+                                                for c in ephs {
+                                                    if let Some(n) =
+                                                        c.get("name").and_then(|n| n.as_str())
+                                                    {
+                                                        names.push(n.to_string());
                                                     }
                                                 }
                                             }
                                         }
-                                        if let Some(inits) =
-                                            spec.get("initContainers").and_then(|c| c.as_array())
-                                        {
-                                            for c in inits {
-                                                if let Some(n) =
-                                                    c.get("name").and_then(|n| n.as_str())
-                                                {
-                                                    names.push(n.to_string());
-                                                }
-                                            }
-                                        }
-                                        if let Some(ephs) = spec
-                                            .get("ephemeralContainers")
-                                            .and_then(|c| c.as_array())
-                                        {
-                                            for c in ephs {
-                                                if let Some(n) =
-                                                    c.get("name").and_then(|n| n.as_str())
-                                                {
-                                                    names.push(n.to_string());
-                                                }
-                                            }
+                                    }
+                                    let extract_ms = e0.elapsed().as_millis() as f64;
+                                    histogram!("details_containers_extract_ms", extract_ms);
+                                    let mut uniq = std::collections::BTreeSet::new();
+                                    let dedup: Vec<String> = names
+                                        .into_iter()
+                                        .filter(|n| uniq.insert(n.clone()))
+                                        .collect();
+                                    // Dedup ports across containers by (port,name,protocol)
+                                    let mut seen = std::collections::BTreeSet::new();
+                                    let mut ports_dedup: Vec<crate::model::PfPort> = Vec::new();
+                                    for pp in ports.into_iter() {
+                                        let key = (
+                                            pp.port,
+                                            pp.name.clone().unwrap_or_default(),
+                                            pp.protocol.clone().unwrap_or_default(),
+                                        );
+                                        if seen.insert(key) {
+                                            ports_dedup.push(pp);
                                         }
                                     }
-                                }
-                                let extract_ms = e0.elapsed().as_millis() as f64;
-                                histogram!("details_containers_extract_ms", extract_ms);
-                                let mut uniq = std::collections::BTreeSet::new();
-                                let dedup: Vec<String> = names
-                                    .into_iter()
-                                    .filter(|n| uniq.insert(n.clone()))
-                                    .collect();
-                                // Dedup ports across containers by (port,name,protocol)
-                                let mut seen = std::collections::BTreeSet::new();
-                                let mut ports_dedup: Vec<crate::model::PfPort> = Vec::new();
-                                for pp in ports.into_iter() {
-                                    let key = (
-                                        pp.port,
-                                        pp.name.clone().unwrap_or_default(),
-                                        pp.protocol.clone().unwrap_or_default(),
+                                    // Redact Secret values and collect entries
+                                    let mut redacted = v.clone();
+                                    let mut sec_entries: Option<Vec<crate::model::SecretEntry>> =
+                                        None;
+                                    if v.get("kind").and_then(|k| k.as_str()) == Some("Secret") {
+                                        if let Some(map) = v.get("data").and_then(|d| d.as_object())
+                                        {
+                                            let mut items: Vec<crate::model::SecretEntry> =
+                                                Vec::new();
+                                            for (k, val) in map.iter() {
+                                                if let Some(b64) = val.as_str() {
+                                                    let bytes =
+                                                        base64::engine::general_purpose::STANDARD
+                                                            .decode(b64.as_bytes())
+                                                            .unwrap_or_default();
+                                                    let decoded = String::from_utf8(bytes).ok();
+                                                    items.push(crate::model::SecretEntry {
+                                                        key: k.clone(),
+                                                        decoded,
+                                                        b64: b64.to_string(),
+                                                    });
+                                                }
+                                            }
+                                            if let Some(rm) = redacted
+                                                .get_mut("data")
+                                                .and_then(|d| d.as_object_mut())
+                                            {
+                                                let keys: Vec<String> =
+                                                    rm.keys().cloned().collect();
+                                                for k in keys {
+                                                    rm.insert(
+                                                        k,
+                                                        serde_json::Value::String(
+                                                            "[REDACTED]".into(),
+                                                        ),
+                                                    );
+                                                }
+                                            }
+                                            sec_entries = Some(items);
+                                        }
+                                    }
+                                    let y0 = Instant::now();
+                                    let y = match serde_yaml::to_string(&redacted) {
+                                        Ok(y) => y,
+                                        Err(_) => String::from_utf8_lossy(&bytes).into_owned(),
+                                    };
+                                    let yaml_ms = y0.elapsed().as_millis() as f64;
+                                    histogram!("details_yaml_serialize_ms", yaml_ms);
+                                    info!(
+                                        parse_ms,
+                                        extract_ms, yaml_ms, "details: json→yaml timings"
                                     );
-                                    if seen.insert(key) {
-                                        ports_dedup.push(pp);
-                                    }
+                                    (
+                                        y,
+                                        if dedup.is_empty() { None } else { Some(dedup) },
+                                        if ports_dedup.is_empty() {
+                                            None
+                                        } else {
+                                            Some(ports_dedup)
+                                        },
+                                        sec_entries,
+                                    )
                                 }
-                                // Redact Secret values and collect entries
-                                let mut redacted = v.clone();
-                                let mut sec_entries: Option<Vec<crate::model::SecretEntry>> = None;
-                                if v.get("kind").and_then(|k| k.as_str()) == Some("Secret") {
-                                    if let Some(map) = v.get("data").and_then(|d| d.as_object()) {
-                                        let mut items: Vec<crate::model::SecretEntry> = Vec::new();
-                                        for (k, val) in map.iter() {
-                                            if let Some(b64) = val.as_str() {
-                                                let bytes =
-                                                    base64::engine::general_purpose::STANDARD
-                                                        .decode(b64.as_bytes())
-                                                        .unwrap_or_default();
-                                                let decoded = String::from_utf8(bytes).ok();
-                                                items.push(crate::model::SecretEntry {
-                                                    key: k.clone(),
-                                                    decoded,
-                                                    b64: b64.to_string(),
-                                                });
-                                            }
-                                        }
-                                        if let Some(rm) =
-                                            redacted.get_mut("data").and_then(|d| d.as_object_mut())
-                                        {
-                                            let keys: Vec<String> = rm.keys().cloned().collect();
-                                            for k in keys {
-                                                rm.insert(
-                                                    k,
-                                                    serde_json::Value::String("[REDACTED]".into()),
-                                                );
-                                            }
-                                        }
-                                        sec_entries = Some(items);
-                                    }
-                                }
-                                let y0 = Instant::now();
-                                let y = match serde_yaml::to_string(&redacted) {
-                                    Ok(y) => y,
-                                    Err(_) => String::from_utf8_lossy(&bytes).into_owned(),
-                                };
-                                let yaml_ms = y0.elapsed().as_millis() as f64;
-                                histogram!("details_yaml_serialize_ms", yaml_ms);
-                                info!(parse_ms, extract_ms, yaml_ms, "details: json→yaml timings");
-                                (
-                                    y,
-                                    if dedup.is_empty() { None } else { Some(dedup) },
-                                    if ports_dedup.is_empty() {
-                                        None
-                                    } else {
-                                        Some(ports_dedup)
-                                    },
-                                    sec_entries,
-                                )
-                            }
-                            Err(_) => (
-                                String::from_utf8_lossy(&bytes).into_owned(),
-                                None,
-                                None,
-                                None,
-                            ),
-                        };
+                                Err(_) => (
+                                    String::from_utf8_lossy(&bytes).into_owned(),
+                                    None,
+                                    None,
+                                    None,
+                                ),
+                            };
                         info!(size = bytes.len(), took_ms = %t0.elapsed().as_millis(), "details: fetch ok");
                         if let Some(tx) = tx_opt.as_ref() {
                             let _ = tx.send(UiUpdate::Detail {

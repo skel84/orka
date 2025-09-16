@@ -145,7 +145,7 @@ impl AnsiTerm {
         }
         self.grid.drain(0..count);
         self.grid
-            .extend(std::iter::repeat(Cell::default()).take(count));
+            .extend(std::iter::repeat_n(Cell::default(), count));
     }
     fn set_sgr(&mut self, params: &[i64]) {
         if params.is_empty() {
@@ -205,7 +205,7 @@ impl vte::Perform for AnsiTerm {
             .collect();
         match action {
             'H' | 'f' => {
-                let row = if nums.len() >= 1 && nums[0] > 0 {
+                let row = if !nums.is_empty() && nums[0] > 0 {
                     nums[0] as u16
                 } else {
                     1
