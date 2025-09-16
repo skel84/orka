@@ -378,7 +378,7 @@ pub async fn start_watcher(
                 .unwrap_or_default()
                 .subsec_nanos() as i64;
             let sign = if (now & 1) == 0 { 1 } else { -1 };
-            (now % (jitter as i64 + 1)) * sign
+            (now % (jitter + 1)) * sign
         } else {
             0
         };
@@ -774,7 +774,7 @@ pub async fn start_watcher_lite_with(
                 .unwrap_or_default()
                 .subsec_nanos() as i64;
             let sign = if (now & 1) == 0 { 1 } else { -1 };
-            (now % (jitter as i64 + 1)) * sign
+            (now % (jitter + 1)) * sign
         } else {
             0
         };
