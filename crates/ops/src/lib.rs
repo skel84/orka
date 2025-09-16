@@ -421,7 +421,7 @@ impl OrkaOps for KubeOps {
         let mut attached = api.exec(pod, cmd.to_vec(), &ap).await?;
 
         // TTY raw mode + resize support
-        let mut resize_task = None;
+        let mut resize_task: Option<tokio::task::JoinHandle<()>> = None;
         let _raw_guard = if pty {
             let _ = crossterm::terminal::enable_raw_mode();
             // Initial size and SIGWINCH updates

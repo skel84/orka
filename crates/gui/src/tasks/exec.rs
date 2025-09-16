@@ -117,9 +117,8 @@ impl OrkaGuiApp {
         args.push("--".to_string());
         args.extend(cmd.split_whitespace().map(|s| s.to_string()));
         let chosen = self.exec.external_cmd.trim().to_string();
-        let mut launched: bool;
         #[cfg(target_os = "macos")]
-        {
+        let launched = {
             use std::path::Path;
             let is_app_bundle = chosen.ends_with(".app") || chosen.contains(".app/");
             let ghostty_like = chosen.eq_ignore_ascii_case("ghostty")
@@ -131,7 +130,9 @@ impl OrkaGuiApp {
                 "printf '\\033]0;%s\\007' {}",
                 shell_escape::escape(window_title.as_str().into())
             );
-            if chosen.eq_ignore_ascii_case("iterm") || chosen.eq_ignore_ascii_case("iterm2") {
+            let mut launched = if chosen.eq_ignore_ascii_case("iterm")
+                || chosen.eq_ignore_ascii_case("iterm2")
+            {
                 // iTerm/iTerm2: new window and run two lines with newlines to ensure execution
                 let app1 = "iTerm2";
                 let app2 = "iTerm";
@@ -149,8 +150,9 @@ impl OrkaGuiApp {
                         applescript_escape(&cmd_str)
                     ),
                 ];
-                launched = run_osascript(&lines_it2);
-                if !launched {
+                if run_osascript(&lines_it2) {
+                    true
+                } else {
                     let lines_it = vec![
                         format!("tell application \"{}\" to create window with default profile", app2),
                         "delay 0.1".to_string(),
@@ -165,7 +167,7 @@ impl OrkaGuiApp {
                             applescript_escape(&cmd_str)
                         ),
                     ];
-                    launched = run_osascript(&lines_it);
+                    run_osascript(&lines_it)
                 }
             } else if chosen.eq_ignore_ascii_case("terminal") {
                 // Terminal: two do script calls to set title and run exec
@@ -179,7 +181,7 @@ impl OrkaGuiApp {
                         applescript_escape(&cmd_str)
                     ),
                 ];
-                launched = run_osascript(&lines);
+                run_osascript(&lines)
             } else if ghostty_like {
                 // Prefer Ghostty new window; try several invocation forms
                 // 1) ghostty CLI
@@ -188,28 +190,32 @@ impl OrkaGuiApp {
                     "--new-window --execute /bin/sh -- -lc {}",
                     shell_escape::escape(format!("{}; {}", title_cmd, cmd_str).into())
                 );
-                launched = std::process::Command::new("ghostty")
+                std::process::Command::new("ghostty")
                     .args(ghostty_title.split_whitespace())
-                    .spawn().is_ok()
+                    .spawn()
+                    .is_ok()
                     // 2) ghostty CLI with -- separator
                     || std::process::Command::new("ghostty")
                         .args(["--new-window", "--", "kubectl"]).args(&args)
-                        .spawn().is_ok()
+                        .spawn()
+                        .is_ok()
                     // 3) open -n -a Ghostty with args (forces new instance/window)
                     || std::process::Command::new("open")
                         .args(["-n", "-a", "Ghostty", "--args", "--new-window", "--execute", "/bin/sh", "--", "-lc"]) 
                         .arg(format!("{}; {}", title_cmd, cmd_str))
-                        .spawn().is_ok()
+                        .spawn()
+                        .is_ok()
                     // 4) open -n -a Ghostty with -- separator
                     || std::process::Command::new("open")
                         .args(["-n", "-a", "Ghostty", "--args", "--", "kubectl"]).args(&args)
-                        .spawn().is_ok();
+                        .spawn()
+                        .is_ok()
             } else if chosen.eq_ignore_ascii_case("alacritty") {
-                launched = std::process::Command::new("alacritty")
+                std::process::Command::new("alacritty")
                     .args(["-e", "kubectl"])
                     .args(&args)
                     .spawn()
-                    .is_ok();
+                    .is_ok()
             } else if is_app_bundle {
                 // Explicit app bundle path
                 let app_path = Path::new(&chosen);
@@ -219,44 +225,47 @@ impl OrkaGuiApp {
                     .arg(app_path)
                     .args(["--args", "--", "kubectl"])
                     .args(&args);
-                launched = cmd.spawn().is_ok();
+                cmd.spawn().is_ok()
             } else {
                 // Generic open -n -a AppName --args -- kubectl ... (new instance → new window)
                 let mut cmd = std::process::Command::new("open");
                 cmd.args(["-n", "-a", &chosen, "--args", "--", "kubectl"])
                     .args(&args);
-                launched = cmd.spawn().is_ok();
-            }
-        }
+                cmd.spawn().is_ok()
+            };
+            launched
+        };
         #[cfg(all(unix, not(target_os = "macos")))]
-        {
+        let launched = {
             let mut cmd = std::process::Command::new(&chosen);
             // Try conventional -e behavior; if it fails, try passing command as args
-            launched = cmd.args(["-e", "kubectl"]).args(&args).spawn().is_ok()
+            cmd.args(["-e", "kubectl"]).args(&args).spawn().is_ok()
                 || std::process::Command::new(&chosen)
                     .arg("--")
                     .arg("kubectl")
                     .args(&args)
                     .spawn()
-                    .is_ok();
-        }
+                    .is_ok()
+        };
         #[cfg(target_os = "windows")]
-        {
+        let launched = {
             // Use Windows Terminal if chosen, else fallbacks
             if chosen.eq_ignore_ascii_case("wt.exe") {
-                launched = std::process::Command::new("wt.exe")
+                std::process::Command::new("wt.exe")
                     .args(["nt", "kubectl"])
                     .args(&args)
                     .spawn()
-                    .is_ok();
+                    .is_ok()
             } else {
-                launched = std::process::Command::new(&chosen)
+                std::process::Command::new(&chosen)
                     .arg("kubectl")
                     .args(&args)
                     .spawn()
-                    .is_ok();
+                    .is_ok()
             }
-        }
+        };
+        #[cfg(not(any(target_os = "macos", all(unix, not(target_os = "macos")), target_os = "windows")))]
+        let launched = false;
         if !launched {
             self.last_error = Some(format!(
                 "exec: failed to launch external terminal: {}",
@@ -351,6 +360,7 @@ impl OrkaGuiApp {
     }
 }
 
+#[cfg(target_os = "macos")]
 fn args_to_cmd(bin: &str, args: &[String]) -> String {
     let mut s = String::new();
     s.push_str(bin);
