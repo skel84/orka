@@ -9,6 +9,12 @@ use crate::util::{gvk_label, parse_gvk_key_to_kind};
 use crate::watch::{watch_hub_prime, watch_hub_snapshot_all};
 use crate::{OrkaGuiApp, UiUpdate};
 
+#[derive(Clone, Copy)]
+pub(crate) enum PaletteOpenTarget {
+    Floating,
+    Detached,
+}
+
 pub(crate) fn ui_palette(app: &mut OrkaGuiApp, ctx: &egui::Context) {
     if !app.palette.open {
         return;
@@ -87,13 +93,17 @@ pub(crate) fn ui_palette(app: &mut OrkaGuiApp, ctx: &egui::Context) {
                     app.palette.sel = Some(if cur == 0 { len - 1 } else { cur - 1 });
                 }
             }
-            let enter = ui.input(|i| i.key_pressed(egui::Key::Enter));
+            let (enter, shift_enter) = ui.input(|i| {
+                let pressed = i.key_pressed(egui::Key::Enter);
+                (pressed, pressed && i.modifiers.shift)
+            });
             let esc = ui.input(|i| i.key_pressed(egui::Key::Escape));
             if esc {
                 app.palette.open = false;
             }
             let scroll_to_selected = app.palette.sel != prev_sel;
             let mut chosen: Option<PaletteItem> = None;
+            let mut target = PaletteOpenTarget::Floating;
             // Results list
             let font = egui::FontId::monospace(13.0);
             egui::ScrollArea::vertical()
@@ -168,11 +178,16 @@ pub(crate) fn ui_palette(app: &mut OrkaGuiApp, ctx: &egui::Context) {
                     .sel
                     .and_then(|i| app.palette.results.get(i).cloned())
                 {
+                    target = if shift_enter {
+                        PaletteOpenTarget::Detached
+                    } else {
+                        PaletteOpenTarget::Floating
+                    };
                     chosen = Some(sel);
                 }
             }
             if let Some(item) = chosen.take() {
-                app.open_palette_item(item);
+                app.open_palette_item(ctx, item, target);
                 app.palette.open = false;
             }
         });
@@ -304,20 +319,35 @@ impl OrkaGuiApp {
         self.palette.width_hint = est.clamp(520.0, 860.0);
     }
 
-    pub(crate) fn open_palette_item(&mut self, item: PaletteItem) {
+    pub(crate) fn open_palette_item(
+        &mut self,
+        ctx: &egui::Context,
+        item: PaletteItem,
+        target: PaletteOpenTarget,
+    ) {
+        let PaletteItem { gvk_key, obj, .. } = item;
+        let uid = obj.uid;
         // Resolve ResourceKind (with proper namespaced) from discovery list; fallback to parser
         let rk = self
             .discovery
             .kinds
             .iter()
-            .find(|k| gvk_label(k) == item.gvk_key)
+            .find(|k| gvk_label(k) == gvk_key)
             .cloned()
-            .unwrap_or_else(|| parse_gvk_key_to_kind(&item.gvk_key));
+            .unwrap_or_else(|| parse_gvk_key_to_kind(&gvk_key));
         self.selection.selected_kind = Some(rk);
         // Update namespace selector to the item's namespace if present
-        self.selection.namespace = item.obj.namespace.clone().unwrap_or_default();
-        // Open details directly
-        self.select_row(item.obj);
+        self.selection.namespace = obj.namespace.clone().unwrap_or_default();
+        // Drive selection state so the detached window renders the right resource
+        self.select_row(obj);
+        // Skip opening/focusing a dock tab; close any existing one for this UID
+        self.dock_pending.retain(|pending| *pending != uid);
+        self.dock_close_pending.push(uid);
+        // Spawn or focus a window for the selection
+        match target {
+            PaletteOpenTarget::Floating => self.open_floating_for(ctx, uid),
+            PaletteOpenTarget::Detached => self.open_detached_for(ctx, uid),
+        }
     }
 
     pub(crate) fn start_palette_global_prime(&mut self) {

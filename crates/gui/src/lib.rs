@@ -21,9 +21,9 @@ mod tasks;
 mod ui;
 mod util;
 mod watch;
-use model::DetachedDetailsWindow;
 use model::GraphState;
 use model::{DescribeState, DetailsPaneTab};
+use model::{DetachedDetailsWindow, FloatingDetailsWindow};
 use model::{
     DetailsState, DiscoveryState, EditState, ExecState, LogsState, OpsState, PrefixTheme,
     ResultsState, SearchState, SelectionState, ServiceLogsState, StatsState, UiDebounce,
@@ -97,6 +97,9 @@ pub struct OrkaGuiApp {
     last_activity: Option<Instant>,
     // Detached details windows
     detached: Vec<DetachedDetailsWindow>,
+    // Floating in-app detail windows
+    floating: Vec<FloatingDetailsWindow>,
+    floating_serial: u64,
     // Which window is currently being rendered (None => main pane)
     rendering_window_id: Option<egui::ViewportId>,
     // Ownership of streaming subsystems (route updates)
@@ -547,6 +550,8 @@ impl OrkaGuiApp {
                 .unwrap_or(1000),
             last_activity: None,
             detached: Vec::new(),
+            floating: Vec::new(),
+            floating_serial: 0,
             rendering_window_id: None,
             logs_owner: None,
             exec_owner: None,
@@ -844,6 +849,7 @@ impl eframe::App for OrkaGuiApp {
             crate::ui::dock::show_dock(self, ui);
         });
 
+        crate::ui::windows::render_floating(self, ctx);
         ui::palette::ui_palette(self, ctx);
         ui::stats::ui_stats_modal(self, ctx);
 

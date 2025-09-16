@@ -288,6 +288,11 @@ pub(crate) fn process_updates(app: &mut OrkaGuiApp, ctx: &egui::Context) {
                         if let Some(w) = app.detached.iter_mut().find(|w| w.meta.id == owner) {
                             w.state.logs.cancel = Some(cancel);
                             w.state.logs.running = true;
+                        } else if let Some(w) =
+                            app.floating.iter_mut().find(|w| w.viewport_id == owner)
+                        {
+                            w.state.logs.cancel = Some(cancel);
+                            w.state.logs.running = true;
                         } else {
                             // Fallback if window disappeared
                             app.logs.cancel = Some(cancel);
@@ -301,137 +306,10 @@ pub(crate) fn process_updates(app: &mut OrkaGuiApp, ctx: &egui::Context) {
                     ctx.request_repaint();
                 }
                 Ok(UiUpdate::LogLine(line)) => {
-                    // Route to owner window state if logs are owned by a detached window
-                    if let Some(owner) = app.logs_owner {
-                        if let Some(w) = app.detached.iter_mut().find(|w| w.meta.id == owner) {
-                            let st = &mut w.state.logs;
-                            st.recv += 1;
-                            if st.v2 {
-                                let color = ctx.style().visuals.text_color();
-                                let t0 = std::time::Instant::now();
-                                let hl = st.grep_cache.as_ref().map(|(_, r)| r);
-                                let hl_color = ctx.style().visuals.warn_fg_color;
-                                let job = crate::logs::parser::parse_line_to_job_hl(
-                                    &line,
-                                    color,
-                                    st.colorize,
-                                    hl,
-                                    hl_color,
-                                );
-                                let ts = crate::logs::parser::parse_timestamp_utc(&line);
-                                let _parse_ms = t0.elapsed().as_micros();
-                                let parsed = crate::model::ParsedLine {
-                                    raw: line,
-                                    job,
-                                    timestamp: ts,
-                                };
-                                if st.ring.len() >= st.ring_cap {
-                                    st.ring.pop_front();
-                                    st.dropped += 1;
-                                }
-                                st.ring.push_back(parsed);
-                            } else {
-                                if st.backlog.len() >= st.backlog_cap {
-                                    st.backlog.pop_front();
-                                    st.dropped += 1;
-                                }
-                                st.backlog.push_back(line);
-                            }
-                        } else {
-                            // Owner disappeared; fallback to main state
-                            app.logs.recv += 1;
-                            if app.logs.v2 {
-                                let color = ctx.style().visuals.text_color();
-                                let t0 = std::time::Instant::now();
-                                let hl = app.logs.grep_cache.as_ref().map(|(_, r)| r);
-                                let hl_color = ctx.style().visuals.warn_fg_color;
-                                let job = crate::logs::parser::parse_line_to_job_hl(
-                                    &line,
-                                    color,
-                                    app.logs.colorize,
-                                    hl,
-                                    hl_color,
-                                );
-                                let ts = crate::logs::parser::parse_timestamp_utc(&line);
-                                let _parse_ms = t0.elapsed().as_micros();
-                                let parsed = crate::model::ParsedLine {
-                                    raw: line,
-                                    job,
-                                    timestamp: ts,
-                                };
-                                if app.logs.ring.len() >= app.logs.ring_cap {
-                                    app.logs.ring.pop_front();
-                                    app.logs.dropped += 1;
-                                }
-                                app.logs.ring.push_back(parsed);
-                            } else {
-                                if app.logs.backlog.len() >= app.logs.backlog_cap {
-                                    app.logs.backlog.pop_front();
-                                    app.logs.dropped += 1;
-                                }
-                                app.logs.backlog.push_back(line);
-                            }
-                        }
-                    } else {
-                        // Main pane owns logs
-                        app.logs.recv += 1;
-                        if app.logs.v2 {
-                            let color = ctx.style().visuals.text_color();
-                            let t0 = std::time::Instant::now();
-                            let hl = app.logs.grep_cache.as_ref().map(|(_, r)| r);
-                            let hl_color = ctx.style().visuals.warn_fg_color;
-                            let job = crate::logs::parser::parse_line_to_job_hl(
-                                &line,
-                                color,
-                                app.logs.colorize,
-                                hl,
-                                hl_color,
-                            );
-                            let ts = crate::logs::parser::parse_timestamp_utc(&line);
-                            let _parse_ms = t0.elapsed().as_micros();
-                            let parsed = crate::model::ParsedLine {
-                                raw: line,
-                                job,
-                                timestamp: ts,
-                            };
-                            if app.logs.ring.len() >= app.logs.ring_cap {
-                                app.logs.ring.pop_front();
-                                app.logs.dropped += 1;
-                            }
-                            app.logs.ring.push_back(parsed);
-                        } else {
-                            if app.logs.backlog.len() >= app.logs.backlog_cap {
-                                app.logs.backlog.pop_front();
-                                app.logs.dropped += 1;
-                            }
-                            app.logs.backlog.push_back(line);
-                        }
-                    }
-                    processed += 1;
-                    ctx.request_repaint();
-                }
-                Ok(UiUpdate::LogError(s)) => {
-                    app.last_error = Some(s);
-                    processed += 1;
-                }
-                Ok(UiUpdate::SvcLogStarted) => {
-                    if let Some(owner) = app.svc_logs_owner {
-                        if let Some(w) = app.detached.iter_mut().find(|w| w.meta.id == owner) {
-                            w.state.svc_logs.running = true;
-                        } else {
-                            app.svc_logs.running = true;
-                        }
-                    } else {
-                        app.svc_logs.running = true;
-                    }
-                    processed += 1;
-                    ctx.request_repaint();
-                }
-                Ok(UiUpdate::SvcLogLine(line)) => {
-                    if let Some(owner) = app.svc_logs_owner {
-                        if let Some(w) = app.detached.iter_mut().find(|w| w.meta.id == owner) {
-                            let st = &mut w.state.svc_logs;
-                            st.recv += 1;
+                    let mut remaining = Some(line);
+                    let push_line = |st: &mut crate::model::LogsState, line: String| {
+                        st.recv += 1;
+                        if st.v2 {
                             let color = ctx.style().visuals.text_color();
                             let t0 = std::time::Instant::now();
                             let hl = st.grep_cache.as_ref().map(|(_, r)| r);
@@ -456,42 +334,65 @@ pub(crate) fn process_updates(app: &mut OrkaGuiApp, ctx: &egui::Context) {
                             }
                             st.ring.push_back(parsed);
                         } else {
-                            // Fallback to main state if owner missing
-                            app.svc_logs.recv += 1;
-                            let color = ctx.style().visuals.text_color();
-                            let t0 = std::time::Instant::now();
-                            let hl = app.svc_logs.grep_cache.as_ref().map(|(_, r)| r);
-                            let hl_color = ctx.style().visuals.warn_fg_color;
-                            let job = crate::logs::parser::parse_line_to_job_hl(
-                                &line,
-                                color,
-                                app.svc_logs.colorize,
-                                hl,
-                                hl_color,
-                            );
-                            let ts = crate::logs::parser::parse_timestamp_utc(&line);
-                            let _parse_ms = t0.elapsed().as_micros();
-                            let parsed = crate::model::ParsedLine {
-                                raw: line,
-                                job,
-                                timestamp: ts,
-                            };
-                            if app.svc_logs.ring.len() >= app.svc_logs.ring_cap {
-                                app.svc_logs.ring.pop_front();
-                                app.svc_logs.dropped += 1;
+                            if st.backlog.len() >= st.backlog_cap {
+                                st.backlog.pop_front();
+                                st.dropped += 1;
                             }
-                            app.svc_logs.ring.push_back(parsed);
+                            st.backlog.push_back(line);
+                        }
+                    };
+                    if let Some(owner) = app.logs_owner {
+                        if let Some(w) = app.detached.iter_mut().find(|w| w.meta.id == owner) {
+                            if let Some(line) = remaining.take() {
+                                push_line(&mut w.state.logs, line);
+                            }
+                        } else if let Some(w) =
+                            app.floating.iter_mut().find(|w| w.viewport_id == owner)
+                        {
+                            if let Some(line) = remaining.take() {
+                                push_line(&mut w.state.logs, line);
+                            }
+                        }
+                    }
+                    if let Some(line) = remaining.take() {
+                        push_line(&mut app.logs, line);
+                    }
+                    processed += 1;
+                    ctx.request_repaint();
+                }
+                Ok(UiUpdate::LogError(s)) => {
+                    app.last_error = Some(s);
+                    processed += 1;
+                }
+                Ok(UiUpdate::SvcLogStarted) => {
+                    if let Some(owner) = app.svc_logs_owner {
+                        if let Some(w) = app.detached.iter_mut().find(|w| w.meta.id == owner) {
+                            w.state.svc_logs.running = true;
+                        } else if let Some(w) =
+                            app.floating.iter_mut().find(|w| w.viewport_id == owner)
+                        {
+                            w.state.svc_logs.running = true;
+                        } else {
+                            app.svc_logs.running = true;
                         }
                     } else {
-                        app.svc_logs.recv += 1;
+                        app.svc_logs.running = true;
+                    }
+                    processed += 1;
+                    ctx.request_repaint();
+                }
+                Ok(UiUpdate::SvcLogLine(line)) => {
+                    let mut remaining = Some(line);
+                    let push_line = |st: &mut crate::model::ServiceLogsState, line: String| {
+                        st.recv += 1;
                         let color = ctx.style().visuals.text_color();
                         let t0 = std::time::Instant::now();
-                        let hl = app.svc_logs.grep_cache.as_ref().map(|(_, r)| r);
+                        let hl = st.grep_cache.as_ref().map(|(_, r)| r);
                         let hl_color = ctx.style().visuals.warn_fg_color;
                         let job = crate::logs::parser::parse_line_to_job_hl(
                             &line,
                             color,
-                            app.svc_logs.colorize,
+                            st.colorize,
                             hl,
                             hl_color,
                         );
@@ -502,11 +403,27 @@ pub(crate) fn process_updates(app: &mut OrkaGuiApp, ctx: &egui::Context) {
                             job,
                             timestamp: ts,
                         };
-                        if app.svc_logs.ring.len() >= app.svc_logs.ring_cap {
-                            app.svc_logs.ring.pop_front();
-                            app.svc_logs.dropped += 1;
+                        if st.ring.len() >= st.ring_cap {
+                            st.ring.pop_front();
+                            st.dropped += 1;
                         }
-                        app.svc_logs.ring.push_back(parsed);
+                        st.ring.push_back(parsed);
+                    };
+                    if let Some(owner) = app.svc_logs_owner {
+                        if let Some(w) = app.detached.iter_mut().find(|w| w.meta.id == owner) {
+                            if let Some(line) = remaining.take() {
+                                push_line(&mut w.state.svc_logs, line);
+                            }
+                        } else if let Some(w) =
+                            app.floating.iter_mut().find(|w| w.viewport_id == owner)
+                        {
+                            if let Some(line) = remaining.take() {
+                                push_line(&mut w.state.svc_logs, line);
+                            }
+                        }
+                    }
+                    if let Some(line) = remaining.take() {
+                        push_line(&mut app.svc_logs, line);
                     }
                     processed += 1;
                     ctx.request_repaint();
@@ -516,7 +433,19 @@ pub(crate) fn process_updates(app: &mut OrkaGuiApp, ctx: &egui::Context) {
                     processed += 1;
                 }
                 Ok(UiUpdate::SvcLogEnded) => {
-                    app.svc_logs.running = false;
+                    if let Some(owner) = app.svc_logs_owner.take() {
+                        if let Some(w) = app.detached.iter_mut().find(|w| w.meta.id == owner) {
+                            w.state.svc_logs.running = false;
+                        } else if let Some(w) =
+                            app.floating.iter_mut().find(|w| w.viewport_id == owner)
+                        {
+                            w.state.svc_logs.running = false;
+                        } else {
+                            app.svc_logs.running = false;
+                        }
+                    } else {
+                        app.svc_logs.running = false;
+                    }
                     processed += 1;
                 }
                 Ok(UiUpdate::ExecStarted {
@@ -526,6 +455,14 @@ pub(crate) fn process_updates(app: &mut OrkaGuiApp, ctx: &egui::Context) {
                 }) => {
                     if let Some(owner) = app.exec_owner {
                         if let Some(w) = app.detached.iter_mut().find(|w| w.meta.id == owner) {
+                            let exec = &mut w.state.exec;
+                            exec.cancel = Some(cancel);
+                            exec.input = Some(input);
+                            exec.resize = resize;
+                            exec.running = true;
+                        } else if let Some(w) =
+                            app.floating.iter_mut().find(|w| w.viewport_id == owner)
+                        {
                             let exec = &mut w.state.exec;
                             exec.cancel = Some(cancel);
                             exec.input = Some(input);
@@ -546,63 +483,46 @@ pub(crate) fn process_updates(app: &mut OrkaGuiApp, ctx: &egui::Context) {
                     processed += 1;
                 }
                 Ok(UiUpdate::ExecData(s)) => {
-                    if let Some(owner) = app.exec_owner {
-                        if let Some(w) = app.detached.iter_mut().find(|w| w.meta.id == owner) {
-                            let exec = &mut w.state.exec;
-                            if exec.mode_oneshot {
-                                exec.recv += 1;
-                                if exec.backlog.len() >= exec.backlog_cap {
-                                    exec.backlog.pop_front();
-                                    exec.dropped += 1;
-                                }
-                                exec.backlog.push_back(s);
-                            } else {
-                                exec.recv += 1;
-                                if let Some(t) = exec.term.as_mut() {
-                                    t.feed_bytes(s.as_bytes());
-                                }
-                                if exec.backlog.len() >= exec.backlog_cap {
-                                    exec.backlog.pop_front();
-                                    exec.dropped += 1;
-                                }
-                                exec.backlog.push_back(s);
+                    let mut payload = Some(s);
+                    let handle_exec = |exec: &mut crate::model::ExecState, data: String| {
+                        exec.recv += 1;
+                        if exec.mode_oneshot {
+                            if exec.backlog.len() >= exec.backlog_cap {
+                                exec.backlog.pop_front();
+                                exec.dropped += 1;
                             }
-                        } else if app.exec.mode_oneshot {
-                            // Fallback to main state if owner missing
-                            app.exec.recv += 1;
-                            if app.exec.backlog.len() >= app.exec.backlog_cap {
-                                app.exec.backlog.pop_front();
-                                app.exec.dropped += 1;
-                            }
-                            app.exec.backlog.push_back(s);
+                            exec.backlog.push_back(data);
                         } else {
-                            app.exec.recv += 1;
-                            if let Some(t) = app.exec.term.as_mut() {
-                                t.feed_bytes(s.as_bytes());
+                            if let Some(t) = exec.term.as_mut() {
+                                t.feed_bytes(data.as_bytes());
                             }
-                            if app.exec.backlog.len() >= app.exec.backlog_cap {
-                                app.exec.backlog.pop_front();
-                                app.exec.dropped += 1;
+                            if exec.backlog.len() >= exec.backlog_cap {
+                                exec.backlog.pop_front();
+                                exec.dropped += 1;
                             }
-                            app.exec.backlog.push_back(s);
+                            exec.backlog.push_back(data);
                         }
-                    } else if app.exec.mode_oneshot {
-                        app.exec.recv += 1;
-                        if app.exec.backlog.len() >= app.exec.backlog_cap {
-                            app.exec.backlog.pop_front();
-                            app.exec.dropped += 1;
+                    };
+                    if let Some(owner) = app.exec_owner {
+                        if let Some(exec) = app
+                            .detached
+                            .iter_mut()
+                            .find(|w| w.meta.id == owner)
+                            .map(|w| &mut w.state.exec)
+                            .or_else(|| {
+                                app.floating
+                                    .iter_mut()
+                                    .find(|w| w.viewport_id == owner)
+                                    .map(|w| &mut w.state.exec)
+                            })
+                        {
+                            if let Some(data) = payload.take() {
+                                handle_exec(exec, data);
+                            }
                         }
-                        app.exec.backlog.push_back(s);
-                    } else {
-                        app.exec.recv += 1;
-                        if let Some(t) = app.exec.term.as_mut() {
-                            t.feed_bytes(s.as_bytes());
-                        }
-                        if app.exec.backlog.len() >= app.exec.backlog_cap {
-                            app.exec.backlog.pop_front();
-                            app.exec.dropped += 1;
-                        }
-                        app.exec.backlog.push_back(s);
+                    }
+                    if let Some(data) = payload.take() {
+                        handle_exec(&mut app.exec, data);
                     }
                     processed += 1;
                 }
@@ -610,6 +530,15 @@ pub(crate) fn process_updates(app: &mut OrkaGuiApp, ctx: &egui::Context) {
                     app.last_error = Some(err.clone());
                     if let Some(owner) = app.exec_owner {
                         if let Some(w) = app.detached.iter_mut().find(|w| w.meta.id == owner) {
+                            let exec = &mut w.state.exec;
+                            exec.running = false;
+                            exec.task = None;
+                            exec.cancel = None;
+                            exec.input = None;
+                            exec.resize = None;
+                        } else if let Some(w) =
+                            app.floating.iter_mut().find(|w| w.viewport_id == owner)
+                        {
                             let exec = &mut w.state.exec;
                             exec.running = false;
                             exec.task = None;
@@ -637,6 +566,16 @@ pub(crate) fn process_updates(app: &mut OrkaGuiApp, ctx: &egui::Context) {
                             exec.input = None;
                             exec.resize = None;
                             exec.focused = false;
+                        } else if let Some(w) =
+                            app.floating.iter_mut().find(|w| w.viewport_id == owner)
+                        {
+                            let exec = &mut w.state.exec;
+                            exec.running = false;
+                            exec.task = None;
+                            exec.cancel = None;
+                            exec.input = None;
+                            exec.resize = None;
+                            exec.focused = false;
                         }
                     } else {
                         app.exec.running = false;
@@ -652,6 +591,12 @@ pub(crate) fn process_updates(app: &mut OrkaGuiApp, ctx: &egui::Context) {
                 Ok(UiUpdate::LogEnded) => {
                     if let Some(owner) = app.logs_owner.take() {
                         if let Some(w) = app.detached.iter_mut().find(|w| w.meta.id == owner) {
+                            w.state.logs.running = false;
+                            w.state.logs.task = None;
+                            w.state.logs.cancel = None;
+                        } else if let Some(w) =
+                            app.floating.iter_mut().find(|w| w.viewport_id == owner)
+                        {
                             w.state.logs.running = false;
                             w.state.logs.task = None;
                             w.state.logs.cancel = None;
