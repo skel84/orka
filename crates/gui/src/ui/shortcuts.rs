@@ -6,13 +6,14 @@ use crate::model::ToastKind;
 use crate::OrkaGuiApp;
 
 pub(crate) fn handle_global_shortcuts(app: &mut OrkaGuiApp, ctx: &egui::Context) {
+    let typing = ctx.wants_keyboard_input();
     // Focus search (F)
-    if ctx.input(|i| i.key_pressed(egui::Key::F)) {
+    if !typing && ctx.input(|i| i.key_pressed(egui::Key::F)) {
         app.search.need_focus = true;
     }
 
     // Toggle Logs (L)
-    if ctx.input(|i| i.key_pressed(egui::Key::L)) {
+    if !typing && ctx.input(|i| i.key_pressed(egui::Key::L)) {
         let can_logs = app.selected_is_pod()
             && app
                 .ops
@@ -33,7 +34,7 @@ pub(crate) fn handle_global_shortcuts(app: &mut OrkaGuiApp, ctx: &egui::Context)
     }
 
     // Exec (E)
-    if ctx.input(|i| i.key_pressed(egui::Key::E)) {
+    if !typing && ctx.input(|i| i.key_pressed(egui::Key::E)) {
         let can_exec = app.selected_is_pod()
             && app
                 .ops
