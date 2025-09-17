@@ -392,6 +392,7 @@ pub struct SelectionState {
     pub selected_idx: Option<usize>,
     pub selected_kind: Option<ResourceKind>,
     pub namespace: String,
+    pub namespace_filter_query: String,
 }
 
 #[derive(Default)]
@@ -428,6 +429,20 @@ pub struct DetachedDetailsWindowState {
 
 pub struct DetachedDetailsWindow {
     pub meta: DetachedDetailsWindowMeta,
+    pub state: DetachedDetailsWindowState,
+}
+
+pub struct FloatingDetailsWindow {
+    pub id: egui::Id,
+    pub viewport_id: egui::ViewportId,
+    pub uid: Uid,
+    pub title: String,
+    pub state: DetachedDetailsWindowState,
+    pub just_opened: bool,
+}
+
+pub struct DockedDetailsTab {
+    pub viewport_id: egui::ViewportId,
     pub state: DetachedDetailsWindowState,
 }
 

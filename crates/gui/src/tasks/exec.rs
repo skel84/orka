@@ -130,7 +130,7 @@ impl OrkaGuiApp {
                 "printf '\\033]0;%s\\007' {}",
                 shell_escape::escape(window_title.as_str().into())
             );
-            let mut launched = if chosen.eq_ignore_ascii_case("iterm")
+            let launched = if chosen.eq_ignore_ascii_case("iterm")
                 || chosen.eq_ignore_ascii_case("iterm2")
             {
                 // iTerm/iTerm2: new window and run two lines with newlines to ensure execution

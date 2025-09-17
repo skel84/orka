@@ -15,6 +15,30 @@ use crate::model::{GraphNodeRole, GraphViewMode};
 use crate::util::gvk_label;
 
 impl OrkaGuiApp {
+    fn refresh_logs_layout(&mut self, ctx: &egui::Context) {
+        let color = ctx.style().visuals.text_color();
+        let hl_color = ctx.style().visuals.warn_fg_color;
+        let highlight = self.logs.grep_cache.as_ref().map(|(_, re)| re);
+        let colorize = self.logs.colorize;
+        for entry in self.logs.ring.iter_mut() {
+            entry.job = crate::logs::parser::parse_line_to_job_hl(
+                &entry.raw, color, colorize, highlight, hl_color,
+            );
+        }
+    }
+
+    fn refresh_svc_logs_layout(&mut self, ctx: &egui::Context) {
+        let color = ctx.style().visuals.text_color();
+        let hl_color = ctx.style().visuals.warn_fg_color;
+        let highlight = self.svc_logs.grep_cache.as_ref().map(|(_, re)| re);
+        let colorize = self.svc_logs.colorize;
+        for entry in self.svc_logs.ring.iter_mut() {
+            entry.job = crate::logs::parser::parse_line_to_job_hl(
+                &entry.raw, color, colorize, highlight, hl_color,
+            );
+        }
+    }
+
     fn ui_edit(&mut self, ui: &mut egui::Ui) {
         // Toolbar
         ui.horizontal(|ui| {
@@ -208,6 +232,7 @@ impl OrkaGuiApp {
         }
         // Show logs content directly without a collapsing header
         // Controls
+        let mut colorize_changed = false;
         ui.horizontal(|ui| {
             ui.checkbox(&mut self.logs.follow, "Follow");
             ui.separator();
@@ -215,7 +240,10 @@ impl OrkaGuiApp {
             ui.checkbox(&mut self.logs.wrap, "");
             ui.separator();
             ui.label("Colorize:");
-            ui.checkbox(&mut self.logs.colorize, "");
+            let resp = ui.checkbox(&mut self.logs.colorize, "");
+            if resp.changed() {
+                colorize_changed = true;
+            }
             // Prefix theme mapping
             ui.separator();
             ui.label("Prefix:");
@@ -314,6 +342,7 @@ impl OrkaGuiApp {
             }
         });
         ui.horizontal(|ui| {
+            let mut refresh_needed = colorize_changed;
             ui.label("Grep:");
             let resp = ui.add(egui::TextEdit::singleline(&mut self.logs.grep).desired_width(200.0));
             if resp.changed() {
@@ -329,6 +358,7 @@ impl OrkaGuiApp {
                     self.logs.grep_cache = None;
                     self.logs.grep_error = Some("invalid regex".into());
                 }
+                refresh_needed = true;
             }
             if let Some(err) = &self.logs.grep_error {
                 ui.colored_label(ui.visuals().warn_fg_color, err);
@@ -354,6 +384,9 @@ impl OrkaGuiApp {
                 }
             } else if ui.button("Stop").on_hover_text("Stop logs").clicked() {
                 self.stop_logs_task();
+            }
+            if refresh_needed {
+                self.refresh_logs_layout(ui.ctx());
             }
         });
         ui.add_space(4.0);
@@ -1291,6 +1324,7 @@ impl OrkaGuiApp {
             }
         });
         ui.horizontal(|ui| {
+            let mut refresh_needed = false;
             ui.label("Grep:");
             let resp =
                 ui.add(egui::TextEdit::singleline(&mut self.svc_logs.grep).desired_width(200.0));
@@ -1306,6 +1340,7 @@ impl OrkaGuiApp {
                     self.svc_logs.grep_cache = None;
                     self.svc_logs.grep_error = Some("invalid regex".into());
                 }
+                refresh_needed = true;
             }
             if let Some(err) = &self.svc_logs.grep_error {
                 ui.colored_label(ui.visuals().warn_fg_color, err);
@@ -1326,6 +1361,9 @@ impl OrkaGuiApp {
                 }
             } else if ui.button("Stop").clicked() {
                 self.stop_service_logs_task();
+            }
+            if refresh_needed {
+                self.refresh_svc_logs_layout(ui.ctx());
             }
         });
         ui.add_space(4.0);
@@ -1395,7 +1433,17 @@ impl OrkaGuiApp {
 
     pub(crate) fn select_row(&mut self, it: LiteObj) {
         info!(uid = ?it.uid, name = %it.name, ns = %it.namespace.as_deref().unwrap_or("-"), "details: selecting row");
+        let restart_logs = self.logs.running;
         let uid = it.uid;
+        let kind = self
+            .current_selected_kind()
+            .cloned()
+            .or_else(|| self.details_known.get(&uid).map(|(k, _)| k.clone()));
+        let Some(kind) = kind else {
+            return;
+        };
+        self.selection.selected_kind = Some(kind.clone());
+        self.details_known.insert(uid, (kind.clone(), it.clone()));
         self.details.selected = Some(uid);
         self.details.selected_at = Some(Instant::now());
         self.details.buffer.clear();
@@ -1411,6 +1459,17 @@ impl OrkaGuiApp {
         // Clear pod-specific logs metadata on selection change
         self.logs.containers.clear();
         self.logs.container = None;
+        if restart_logs && self.selected_is_pod() {
+            // Restart streaming automatically for the newly selected Pod
+            self.start_logs_task();
+        } else {
+            // Stop any previous stream and clear buffers so stale lines aren't shown
+            self.stop_logs_task();
+            self.logs.backlog.clear();
+            self.logs.ring.clear();
+            self.logs.dropped = 0;
+            self.logs.recv = 0;
+        }
         // cancel previous detail task if any
         if let Some(stop) = self.details.stop.take() {
             info!("details: cancelling previous task");
@@ -1447,9 +1506,6 @@ impl OrkaGuiApp {
         }
 
         // need current kind (support both curated index selection and direct GVK selection)
-        let Some(kind) = self.current_selected_kind().cloned() else {
-            return;
-        };
         // build reference
         let reference = ResourceRef {
             cluster: None,

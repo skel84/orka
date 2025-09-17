@@ -21,9 +21,9 @@ mod tasks;
 mod ui;
 mod util;
 mod watch;
-use model::DetachedDetailsWindow;
 use model::GraphState;
 use model::{DescribeState, DetailsPaneTab};
+use model::{DetachedDetailsWindow, DockedDetailsTab, FloatingDetailsWindow};
 use model::{
     DetailsState, DiscoveryState, EditState, ExecState, LogsState, OpsState, PrefixTheme,
     ResultsState, SearchState, SelectionState, ServiceLogsState, StatsState, UiDebounce,
@@ -67,6 +67,7 @@ pub struct OrkaGuiApp {
     dock_pending: Vec<Uid>,
     details_tab_order: VecDeque<Uid>,
     details_tabs_cap: usize,
+    details_known: HashMap<Uid, (ResourceKind, LiteObj)>,
     // layout visibility
     layout: LayoutState,
     // cached namespaces for dropdown
@@ -97,6 +98,10 @@ pub struct OrkaGuiApp {
     last_activity: Option<Instant>,
     // Detached details windows
     detached: Vec<DetachedDetailsWindow>,
+    // Floating in-app detail windows
+    floating: Vec<FloatingDetailsWindow>,
+    floating_serial: u64,
+    docked_tabs: HashMap<Uid, DockedDetailsTab>,
     // Which window is currently being rendered (None => main pane)
     rendering_window_id: Option<egui::ViewportId>,
     // Ownership of streaming subsystems (route updates)
@@ -161,6 +166,7 @@ impl OrkaGuiApp {
                 selected_idx: None,
                 selected_kind: None,
                 namespace: String::new(),
+                namespace_filter_query: String::new(),
             },
             results: ResultsState {
                 rows: Vec::new(),
@@ -444,6 +450,7 @@ impl OrkaGuiApp {
                 .ok()
                 .and_then(|s| s.parse::<usize>().ok())
                 .unwrap_or(8),
+            details_known: HashMap::new(),
             layout: LayoutState {
                 show_nav: true,
                 show_log: true,
@@ -546,6 +553,9 @@ impl OrkaGuiApp {
                 .unwrap_or(1000),
             last_activity: None,
             detached: Vec::new(),
+            floating: Vec::new(),
+            floating_serial: 0,
+            docked_tabs: HashMap::new(),
             rendering_window_id: None,
             logs_owner: None,
             exec_owner: None,
@@ -843,6 +853,7 @@ impl eframe::App for OrkaGuiApp {
             crate::ui::dock::show_dock(self, ui);
         });
 
+        crate::ui::windows::render_floating(self, ctx);
         ui::palette::ui_palette(self, ctx);
         ui::stats::ui_stats_modal(self, ctx);
 

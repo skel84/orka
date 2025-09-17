@@ -2,11 +2,125 @@
 
 use eframe::egui;
 
-use crate::model::{DetachedDetailsWindow, DetachedDetailsWindowMeta, DetachedDetailsWindowState};
+use crate::model::{
+    DetachedDetailsWindow, DetachedDetailsWindowMeta, DetachedDetailsWindowState,
+    FloatingDetailsWindow,
+};
 use crate::model::{EditUi, ExecState, LogsState, ServiceLogsState};
 use crate::OrkaGuiApp;
 use orka_core::Uid;
 use std::time::Instant;
+
+pub(crate) fn render_floating(app: &mut OrkaGuiApp, ctx: &egui::Context) {
+    let mut idx = 0;
+    while idx < app.floating.len() {
+        let (window_id, viewport_id, uid, title, just_opened) = {
+            let w = &app.floating[idx];
+            (w.id, w.viewport_id, w.uid, w.title.clone(), w.just_opened)
+        };
+        if just_opened {
+            ctx.memory_mut(|mem| mem.request_focus(window_id));
+        }
+        let mut open = true;
+        egui::Window::new(title)
+            .id(window_id)
+            .default_size([980.0, 720.0])
+            .resizable(true)
+            .collapsible(false)
+            .open(&mut open)
+            .order(egui::Order::Foreground)
+            .show(ctx, |ui| {
+                let (mut win_active_tab, mut win_edit) = {
+                    let w = &app.floating[idx];
+                    (w.state.active_tab, w.state.edit_ui.clone())
+                };
+                let main_edit = EditUi {
+                    buffer: app.edit.buffer.clone(),
+                    original: app.edit.original.clone(),
+                    dirty: app.edit.dirty,
+                    running: app.edit.running,
+                    status: app.edit.status.clone(),
+                };
+                let prev_selected = app.details.selected;
+                let prev_active_tab = app.details.active_tab;
+                app.details.selected = Some(uid);
+                app.details.active_tab = win_active_tab;
+                let win_logs = {
+                    let w = &mut app.floating[idx];
+                    std::mem::take(&mut w.state.logs)
+                };
+                let win_exec = {
+                    let w = &mut app.floating[idx];
+                    std::mem::take(&mut w.state.exec)
+                };
+                let win_svc_logs = {
+                    let w = &mut app.floating[idx];
+                    std::mem::take(&mut w.state.svc_logs)
+                };
+                let main_logs = std::mem::replace(&mut app.logs, win_logs);
+                let main_exec = std::mem::replace(&mut app.exec, win_exec);
+                let main_svc_logs = std::mem::replace(&mut app.svc_logs, win_svc_logs);
+                app.edit.buffer = win_edit.buffer.clone();
+                app.edit.original = win_edit.original.clone();
+                app.edit.dirty = win_edit.dirty;
+                app.edit.running = win_edit.running;
+                app.edit.status = win_edit.status.clone();
+                let prev_render = app.rendering_window_id;
+                app.rendering_window_id = Some(viewport_id);
+                app.ui_details(ui);
+                app.rendering_window_id = prev_render;
+                win_active_tab = app.details.active_tab;
+                win_edit = EditUi {
+                    buffer: app.edit.buffer.clone(),
+                    original: app.edit.original.clone(),
+                    dirty: app.edit.dirty,
+                    running: app.edit.running,
+                    status: app.edit.status.clone(),
+                };
+                let win_logs_new = std::mem::replace(&mut app.logs, main_logs);
+                let win_exec_new = std::mem::replace(&mut app.exec, main_exec);
+                let win_svc_logs_new = std::mem::replace(&mut app.svc_logs, main_svc_logs);
+                app.details.active_tab = prev_active_tab;
+                app.details.selected = prev_selected;
+                app.edit.buffer = main_edit.buffer;
+                app.edit.original = main_edit.original;
+                app.edit.dirty = main_edit.dirty;
+                app.edit.running = main_edit.running;
+                app.edit.status = main_edit.status;
+                if let Some(w) = app.floating.get_mut(idx) {
+                    w.state.active_tab = win_active_tab;
+                    w.state.edit_ui = win_edit;
+                    w.state.logs = win_logs_new;
+                    w.state.exec = win_exec_new;
+                    w.state.svc_logs = win_svc_logs_new;
+                    w.just_opened = false;
+                }
+            });
+        if !open {
+            let removed = app.floating.remove(idx);
+            if app.logs_owner == Some(removed.viewport_id) {
+                if let Some(c) = removed.state.logs.cancel {
+                    c.cancel();
+                }
+                app.logs_owner = None;
+            }
+            if app.exec_owner == Some(removed.viewport_id) {
+                if let Some(c) = removed.state.exec.cancel {
+                    c.cancel();
+                }
+                app.exec_owner = None;
+            }
+            if app.svc_logs_owner == Some(removed.viewport_id) {
+                if let Some(c) = removed.state.svc_logs.cancel {
+                    c.cancel();
+                }
+                app.svc_logs_owner = None;
+            }
+            continue;
+        }
+        idx += 1;
+    }
+}
 
 pub(crate) fn render_detached(app: &mut OrkaGuiApp, ctx: &egui::Context) {
     let windows: Vec<(egui::ViewportId, String, Uid)> = app
@@ -142,38 +256,8 @@ pub(crate) fn render_detached(app: &mut OrkaGuiApp, ctx: &egui::Context) {
 }
 
 impl OrkaGuiApp {
-    /// Open a detached OS window to show details for the given UID.
-    pub(crate) fn open_detached_for(&mut self, ctx: &egui::Context, uid: orka_core::Uid) {
-        if self.detached.iter().any(|w| w.meta.uid == uid) {
-            return;
-        }
-        let (ns, name) = if let Some(i) = self.results.index.get(&uid).copied() {
-            if let Some(row) = self.results.rows.get(i) {
-                (row.namespace.clone(), row.name.clone())
-            } else {
-                (None, String::from(""))
-            }
-        } else {
-            (None, String::from(""))
-        };
-        let gvk = match self.current_selected_kind() {
-            Some(k) => k.clone(),
-            None => return,
-        };
-        let title = match &ns {
-            Some(ns) => format!("Details: {}/{}", ns, name),
-            None => format!("Details: {}", name),
-        };
-        let id = egui::ViewportId::from_hash_of(("orka_details", uid));
-        let meta = DetachedDetailsWindowMeta {
-            id,
-            uid,
-            title,
-            gvk: gvk.clone(),
-            namespace: ns.clone(),
-            name: name.clone(),
-        };
-        let state = DetachedDetailsWindowState {
+    pub(crate) fn make_details_window_state(&self) -> DetachedDetailsWindowState {
+        DetachedDetailsWindowState {
             buffer: String::new(),
             last_error: None,
             opened_at: Instant::now(),
@@ -253,11 +337,85 @@ impl OrkaGuiApp {
                 v2: self.svc_logs.v2,
                 prefix_theme: self.svc_logs.prefix_theme,
             },
+        }
+    }
+    pub(crate) fn open_floating_for(&mut self, ctx: &egui::Context, uid: orka_core::Uid) {
+        if let Some(existing) = self.floating.iter_mut().find(|w| w.uid == uid) {
+            existing.just_opened = true;
+            ctx.memory_mut(|mem| mem.request_focus(existing.id));
+            ctx.request_repaint();
+            return;
+        }
+        let serial = self.floating_serial;
+        self.floating_serial = self.floating_serial.wrapping_add(1);
+        let window_id = egui::Id::new(("orka_floating", uid, serial));
+        let viewport_id = egui::ViewportId::from_hash_of(("orka_floating", uid, serial));
+        let (ns, name) = if let Some(i) = self.results.index.get(&uid).copied() {
+            if let Some(row) = self.results.rows.get(i) {
+                (row.namespace.clone(), row.name.clone())
+            } else {
+                (None, String::from(""))
+            }
+        } else {
+            (None, String::from(""))
         };
+        if self.current_selected_kind().is_none() {
+            return;
+        }
+        let title = match &ns {
+            Some(ns) => format!("Details: {}/{}", ns, name),
+            None => format!("Details: {}", name),
+        };
+        let state = self.make_details_window_state();
+        self.floating.push(FloatingDetailsWindow {
+            id: window_id,
+            viewport_id,
+            uid,
+            title,
+            state,
+            just_opened: true,
+        });
+        ctx.request_repaint();
+    }
+
+    /// Open a detached OS window to show details for the given UID.
+    pub(crate) fn open_detached_for(&mut self, ctx: &egui::Context, uid: orka_core::Uid) {
+        if let Some(existing) = self.detached.iter().find(|w| w.meta.uid == uid) {
+            ctx.send_viewport_cmd_to(existing.meta.id, egui::ViewportCommand::Focus);
+            return;
+        }
+        let (ns, name) = if let Some(i) = self.results.index.get(&uid).copied() {
+            if let Some(row) = self.results.rows.get(i) {
+                (row.namespace.clone(), row.name.clone())
+            } else {
+                (None, String::from(""))
+            }
+        } else {
+            (None, String::from(""))
+        };
+        let gvk = match self.current_selected_kind() {
+            Some(k) => k.clone(),
+            None => return,
+        };
+        let title = match &ns {
+            Some(ns) => format!("Details: {}/{}", ns, name),
+            None => format!("Details: {}", name),
+        };
+        let id = egui::ViewportId::from_hash_of(("orka_details", uid));
+        let meta = DetachedDetailsWindowMeta {
+            id,
+            uid,
+            title,
+            gvk: gvk.clone(),
+            namespace: ns.clone(),
+            name: name.clone(),
+        };
+        let state = self.make_details_window_state();
         self.detached.push(DetachedDetailsWindow {
             meta: meta.clone(),
             state,
         });
+        ctx.send_viewport_cmd_to(id, egui::ViewportCommand::Focus);
         ctx.request_repaint();
     }
 }
