@@ -131,18 +131,15 @@ impl OrkaGuiApp {
 
     pub(crate) fn ui_details_for_tab(&mut self, ui: &mut egui::Ui, uid: Uid) {
         let viewport_id = Self::docked_viewport_id(uid);
-        let mut tab = self
-            .docked_tabs
-            .remove(&uid)
-            .unwrap_or_else(|| crate::model::DockedDetailsTab {
-                viewport_id,
-                state: self.make_details_window_state(),
-            });
+        let mut tab =
+            self.docked_tabs
+                .remove(&uid)
+                .unwrap_or_else(|| crate::model::DockedDetailsTab {
+                    viewport_id,
+                    state: self.make_details_window_state(),
+                });
         tab.viewport_id = viewport_id;
-        let (mut active_tab, mut edit_ui) = (
-            tab.state.active_tab,
-            tab.state.edit_ui.clone(),
-        );
+        let (mut active_tab, mut edit_ui) = (tab.state.active_tab, tab.state.edit_ui.clone());
         let primary_containers = self.logs.containers.clone();
         let primary_selected = self.logs.container.clone();
         let main_edit = crate::model::EditUi {

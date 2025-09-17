@@ -23,7 +23,7 @@ mod util;
 mod watch;
 use model::GraphState;
 use model::{DescribeState, DetailsPaneTab};
-use model::{DockedDetailsTab, DetachedDetailsWindow, FloatingDetailsWindow};
+use model::{DetachedDetailsWindow, DockedDetailsTab, FloatingDetailsWindow};
 use model::{
     DetailsState, DiscoveryState, EditState, ExecState, LogsState, OpsState, PrefixTheme,
     ResultsState, SearchState, SelectionState, ServiceLogsState, StatsState, UiDebounce,
