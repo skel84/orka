@@ -67,6 +67,7 @@ pub struct OrkaGuiApp {
     dock_pending: Vec<Uid>,
     details_tab_order: VecDeque<Uid>,
     details_tabs_cap: usize,
+    details_known: HashMap<Uid, (ResourceKind, LiteObj)>,
     // layout visibility
     layout: LayoutState,
     // cached namespaces for dropdown
@@ -448,6 +449,7 @@ impl OrkaGuiApp {
                 .ok()
                 .and_then(|s| s.parse::<usize>().ok())
                 .unwrap_or(8),
+            details_known: HashMap::new(),
             layout: LayoutState {
                 show_nav: true,
                 show_log: true,

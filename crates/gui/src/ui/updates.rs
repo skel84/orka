@@ -7,8 +7,8 @@ use tracing::info;
 
 use crate::model::ToastKind;
 use crate::{OrkaGuiApp, UiUpdate};
-use orka_api::{LiteEvent, PortForwardEvent};
-use orka_core::Uid;
+use orka_api::{LiteEvent, PortForwardEvent, ResourceKind};
+use orka_core::{LiteObj, Uid};
 use std::time::Instant;
 
 pub(crate) fn process_updates(app: &mut OrkaGuiApp, ctx: &egui::Context) {
@@ -70,6 +70,19 @@ pub(crate) fn process_updates(app: &mut OrkaGuiApp, ctx: &egui::Context) {
                     app.results.sort_dirty = true;
                     processed += 1;
                     saw_batch = true;
+                    let mut refreshed: Vec<(Uid, ResourceKind, LiteObj)> = Vec::new();
+                    for uid in app.details_known.keys().copied() {
+                        if let Some((kind, _)) = app.details_known.get(&uid).cloned() {
+                            if let Some(idx) = app.results.index.get(&uid).copied() {
+                                if let Some(row) = app.results.rows.get(idx).cloned() {
+                                    refreshed.push((uid, kind, row));
+                                }
+                            }
+                        }
+                    }
+                    for (uid, kind, row) in refreshed.into_iter() {
+                        app.details_known.insert(uid, (kind, row));
+                    }
                     // If Atlas requested a pending open by (kind, ns, name), try to select it now
                     if let Some((rk, ns, name)) = app.graph.pending_open.clone() {
                         if let Some(cur) = app.current_selected_kind().cloned() {
@@ -152,6 +165,13 @@ pub(crate) fn process_updates(app: &mut OrkaGuiApp, ctx: &egui::Context) {
                                 .insert(uid, app.build_display_row(&lo));
                             app.results.rows.push(lo);
                         }
+                        if let Some((kind, _)) = app.details_known.get(&uid).cloned() {
+                            if let Some(idx) = app.results.index.get(&uid).copied() {
+                                if let Some(row) = app.results.rows.get(idx).cloned() {
+                                    app.details_known.insert(uid, (kind, row));
+                                }
+                            }
+                        }
                         processed += 1;
                     }
                     LiteEvent::Deleted(lo) => {
@@ -166,6 +186,7 @@ pub(crate) fn process_updates(app: &mut OrkaGuiApp, ctx: &egui::Context) {
                                 app.results.display_cache.remove(&uid);
                             }
                         }
+                        app.details_known.remove(&uid);
                         processed += 1;
                     }
                 },

@@ -58,6 +58,8 @@ pub(crate) fn show_dock(app: &mut OrkaGuiApp, ui: &mut egui::Ui) {
                 let surface = dock::SurfaceIndex::main();
                 let _ = ds.remove_tab((surface, node, tab_index));
             }
+            app.details_tab_order.retain(|u| *u != close_uid);
+            app.details_known.remove(&close_uid);
         }
         // Sync selection to currently focused Details tab (if any)
         {
@@ -65,10 +67,15 @@ pub(crate) fn show_dock(app: &mut OrkaGuiApp, ui: &mut egui::Ui) {
             if let Some((_rect, Tab::DetailsFor(uid_ref))) = tree.find_active_focused() {
                 let uid = *uid_ref;
                 if app.details.selected != Some(uid) {
-                    if let Some(i) = app.results.index.get(&uid).copied() {
-                        if let Some(row) = app.results.rows.get(i).cloned() {
-                            app.select_row(row);
-                        }
+                    let row = app
+                        .results
+                        .index
+                        .get(&uid)
+                        .and_then(|i| app.results.rows.get(*i))
+                        .cloned()
+                        .or_else(|| app.details_known.get(&uid).map(|(_, obj)| obj.clone()));
+                    if let Some(row) = row {
+                        app.select_row(row);
                     }
                 }
             }
@@ -111,6 +118,7 @@ impl OrkaGuiApp {
                     let surface = dock::SurfaceIndex::main();
                     let _ = ds.remove_tab((surface, node, tab_index));
                 }
+                self.details_known.remove(&old);
             }
         }
     }
@@ -120,5 +128,6 @@ impl OrkaGuiApp {
             ds.retain_tabs(|tab| !matches!(tab, Tab::Details | Tab::DetailsFor(_)));
         }
         self.details_tab_order.clear();
+        self.details_known.clear();
     }
 }

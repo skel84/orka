@@ -1435,6 +1435,15 @@ impl OrkaGuiApp {
         info!(uid = ?it.uid, name = %it.name, ns = %it.namespace.as_deref().unwrap_or("-"), "details: selecting row");
         let restart_logs = self.logs.running;
         let uid = it.uid;
+        let kind = self
+            .current_selected_kind()
+            .cloned()
+            .or_else(|| self.details_known.get(&uid).map(|(k, _)| k.clone()));
+        let Some(kind) = kind else {
+            return;
+        };
+        self.selection.selected_kind = Some(kind.clone());
+        self.details_known.insert(uid, (kind.clone(), it.clone()));
         self.details.selected = Some(uid);
         self.details.selected_at = Some(Instant::now());
         self.details.buffer.clear();
@@ -1497,9 +1506,6 @@ impl OrkaGuiApp {
         }
 
         // need current kind (support both curated index selection and direct GVK selection)
-        let Some(kind) = self.current_selected_kind().cloned() else {
-            return;
-        };
         // build reference
         let reference = ResourceRef {
             cluster: None,
