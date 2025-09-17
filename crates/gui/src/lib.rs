@@ -23,7 +23,7 @@ mod util;
 mod watch;
 use model::GraphState;
 use model::{DescribeState, DetailsPaneTab};
-use model::{DetachedDetailsWindow, FloatingDetailsWindow};
+use model::{DockedDetailsTab, DetachedDetailsWindow, FloatingDetailsWindow};
 use model::{
     DetailsState, DiscoveryState, EditState, ExecState, LogsState, OpsState, PrefixTheme,
     ResultsState, SearchState, SelectionState, ServiceLogsState, StatsState, UiDebounce,
@@ -101,6 +101,7 @@ pub struct OrkaGuiApp {
     // Floating in-app detail windows
     floating: Vec<FloatingDetailsWindow>,
     floating_serial: u64,
+    docked_tabs: HashMap<Uid, DockedDetailsTab>,
     // Which window is currently being rendered (None => main pane)
     rendering_window_id: Option<egui::ViewportId>,
     // Ownership of streaming subsystems (route updates)
@@ -554,6 +555,7 @@ impl OrkaGuiApp {
             detached: Vec::new(),
             floating: Vec::new(),
             floating_serial: 0,
+            docked_tabs: HashMap::new(),
             rendering_window_id: None,
             logs_owner: None,
             exec_owner: None,

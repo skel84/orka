@@ -256,34 +256,8 @@ pub(crate) fn render_detached(app: &mut OrkaGuiApp, ctx: &egui::Context) {
 }
 
 impl OrkaGuiApp {
-    pub(crate) fn open_floating_for(&mut self, ctx: &egui::Context, uid: orka_core::Uid) {
-        if let Some(existing) = self.floating.iter_mut().find(|w| w.uid == uid) {
-            existing.just_opened = true;
-            ctx.memory_mut(|mem| mem.request_focus(existing.id));
-            ctx.request_repaint();
-            return;
-        }
-        let serial = self.floating_serial;
-        self.floating_serial = self.floating_serial.wrapping_add(1);
-        let window_id = egui::Id::new(("orka_floating", uid, serial));
-        let viewport_id = egui::ViewportId::from_hash_of(("orka_floating", uid, serial));
-        let (ns, name) = if let Some(i) = self.results.index.get(&uid).copied() {
-            if let Some(row) = self.results.rows.get(i) {
-                (row.namespace.clone(), row.name.clone())
-            } else {
-                (None, String::from(""))
-            }
-        } else {
-            (None, String::from(""))
-        };
-        if self.current_selected_kind().is_none() {
-            return;
-        }
-        let title = match &ns {
-            Some(ns) => format!("Details: {}/{}", ns, name),
-            None => format!("Details: {}", name),
-        };
-        let state = DetachedDetailsWindowState {
+    pub(crate) fn make_details_window_state(&self) -> DetachedDetailsWindowState {
+        DetachedDetailsWindowState {
             buffer: String::new(),
             last_error: None,
             opened_at: Instant::now(),
@@ -363,7 +337,36 @@ impl OrkaGuiApp {
                 v2: self.svc_logs.v2,
                 prefix_theme: self.svc_logs.prefix_theme,
             },
+        }
+    }
+    pub(crate) fn open_floating_for(&mut self, ctx: &egui::Context, uid: orka_core::Uid) {
+        if let Some(existing) = self.floating.iter_mut().find(|w| w.uid == uid) {
+            existing.just_opened = true;
+            ctx.memory_mut(|mem| mem.request_focus(existing.id));
+            ctx.request_repaint();
+            return;
+        }
+        let serial = self.floating_serial;
+        self.floating_serial = self.floating_serial.wrapping_add(1);
+        let window_id = egui::Id::new(("orka_floating", uid, serial));
+        let viewport_id = egui::ViewportId::from_hash_of(("orka_floating", uid, serial));
+        let (ns, name) = if let Some(i) = self.results.index.get(&uid).copied() {
+            if let Some(row) = self.results.rows.get(i) {
+                (row.namespace.clone(), row.name.clone())
+            } else {
+                (None, String::from(""))
+            }
+        } else {
+            (None, String::from(""))
         };
+        if self.current_selected_kind().is_none() {
+            return;
+        }
+        let title = match &ns {
+            Some(ns) => format!("Details: {}/{}", ns, name),
+            None => format!("Details: {}", name),
+        };
+        let state = self.make_details_window_state();
         self.floating.push(FloatingDetailsWindow {
             id: window_id,
             viewport_id,
@@ -407,87 +410,7 @@ impl OrkaGuiApp {
             namespace: ns.clone(),
             name: name.clone(),
         };
-        let state = DetachedDetailsWindowState {
-            buffer: String::new(),
-            last_error: None,
-            opened_at: Instant::now(),
-            active_tab: self.details.active_tab,
-            edit_ui: EditUi {
-                buffer: self.edit.buffer.clone(),
-                original: self.edit.original.clone(),
-                dirty: self.edit.dirty,
-                running: self.edit.running,
-                status: self.edit.status.clone(),
-            },
-            logs: LogsState {
-                running: false,
-                follow: self.logs.follow,
-                grep: String::new(),
-                backlog: std::collections::VecDeque::with_capacity(self.logs.backlog_cap.min(256)),
-                backlog_cap: self.logs.backlog_cap,
-                dropped: 0,
-                recv: 0,
-                containers: self.logs.containers.clone(),
-                container: self.logs.container.clone(),
-                tail_lines: self.logs.tail_lines,
-                since_seconds: self.logs.since_seconds,
-                task: None,
-                cancel: None,
-                ring: std::collections::VecDeque::with_capacity(self.logs.ring_cap.min(256)),
-                ring_cap: self.logs.ring_cap,
-                wrap: self.logs.wrap,
-                colorize: self.logs.colorize,
-                visible_follow_limit: self.logs.visible_follow_limit,
-                order_by_ts_when_paused: self.logs.order_by_ts_when_paused,
-                follow_pad_rows: self.logs.follow_pad_rows,
-                prefix_theme: self.logs.prefix_theme,
-                grep_cache: None,
-                grep_error: None,
-                v2: self.logs.v2,
-            },
-            exec: ExecState {
-                running: false,
-                pty: self.exec.pty,
-                cmd: self.exec.cmd.clone(),
-                container: self.exec.container.clone(),
-                backlog: std::collections::VecDeque::with_capacity(self.exec.backlog_cap.min(256)),
-                backlog_cap: self.exec.backlog_cap,
-                dropped: 0,
-                recv: 0,
-                stdin_buf: String::new(),
-                task: None,
-                cancel: None,
-                input: None,
-                resize: None,
-                last_cols: None,
-                last_rows: None,
-                term: None,
-                focused: false,
-                mode_oneshot: self.exec.mode_oneshot,
-                external_cmd: self.exec.external_cmd.clone(),
-            },
-            svc_logs: ServiceLogsState {
-                running: false,
-                follow: self.svc_logs.follow,
-                grep: String::new(),
-                grep_cache: None,
-                grep_error: None,
-                ring: std::collections::VecDeque::with_capacity(self.svc_logs.ring_cap.min(256)),
-                ring_cap: self.svc_logs.ring_cap,
-                recv: 0,
-                dropped: 0,
-                tail_lines: self.svc_logs.tail_lines,
-                since_seconds: self.svc_logs.since_seconds,
-                task: None,
-                cancel: None,
-                visible_follow_limit: self.svc_logs.visible_follow_limit,
-                colorize: self.svc_logs.colorize,
-                order_by_ts_when_paused: self.svc_logs.order_by_ts_when_paused,
-                follow_pad_rows: self.svc_logs.follow_pad_rows,
-                v2: self.svc_logs.v2,
-                prefix_theme: self.svc_logs.prefix_theme,
-            },
-        };
+        let state = self.make_details_window_state();
         self.detached.push(DetachedDetailsWindow {
             meta: meta.clone(),
             state,

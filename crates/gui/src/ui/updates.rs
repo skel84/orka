@@ -314,6 +314,13 @@ pub(crate) fn process_updates(app: &mut OrkaGuiApp, ctx: &egui::Context) {
                         {
                             w.state.logs.cancel = Some(cancel);
                             w.state.logs.running = true;
+                        } else if let Some(tab) = app
+                            .docked_tabs
+                            .values_mut()
+                            .find(|tab| tab.viewport_id == owner)
+                        {
+                            tab.state.logs.cancel = Some(cancel);
+                            tab.state.logs.running = true;
                         } else {
                             // Fallback if window disappeared
                             app.logs.cancel = Some(cancel);
@@ -373,6 +380,14 @@ pub(crate) fn process_updates(app: &mut OrkaGuiApp, ctx: &egui::Context) {
                             if let Some(line) = remaining.take() {
                                 push_line(&mut w.state.logs, line);
                             }
+                        } else if let Some(tab) = app
+                            .docked_tabs
+                            .values_mut()
+                            .find(|tab| tab.viewport_id == owner)
+                        {
+                            if let Some(line) = remaining.take() {
+                                push_line(&mut tab.state.logs, line);
+                            }
                         }
                     }
                     if let Some(line) = remaining.take() {
@@ -393,6 +408,12 @@ pub(crate) fn process_updates(app: &mut OrkaGuiApp, ctx: &egui::Context) {
                             app.floating.iter_mut().find(|w| w.viewport_id == owner)
                         {
                             w.state.svc_logs.running = true;
+                        } else if let Some(tab) = app
+                            .docked_tabs
+                            .values_mut()
+                            .find(|tab| tab.viewport_id == owner)
+                        {
+                            tab.state.svc_logs.running = true;
                         } else {
                             app.svc_logs.running = true;
                         }
@@ -441,6 +462,14 @@ pub(crate) fn process_updates(app: &mut OrkaGuiApp, ctx: &egui::Context) {
                             if let Some(line) = remaining.take() {
                                 push_line(&mut w.state.svc_logs, line);
                             }
+                        } else if let Some(tab) = app
+                            .docked_tabs
+                            .values_mut()
+                            .find(|tab| tab.viewport_id == owner)
+                        {
+                            if let Some(line) = remaining.take() {
+                                push_line(&mut tab.state.svc_logs, line);
+                            }
                         }
                     }
                     if let Some(line) = remaining.take() {
@@ -461,6 +490,12 @@ pub(crate) fn process_updates(app: &mut OrkaGuiApp, ctx: &egui::Context) {
                             app.floating.iter_mut().find(|w| w.viewport_id == owner)
                         {
                             w.state.svc_logs.running = false;
+                        } else if let Some(tab) = app
+                            .docked_tabs
+                            .values_mut()
+                            .find(|tab| tab.viewport_id == owner)
+                        {
+                            tab.state.svc_logs.running = false;
                         } else {
                             app.svc_logs.running = false;
                         }
@@ -475,16 +510,24 @@ pub(crate) fn process_updates(app: &mut OrkaGuiApp, ctx: &egui::Context) {
                     resize,
                 }) => {
                     if let Some(owner) = app.exec_owner {
-                        if let Some(w) = app.detached.iter_mut().find(|w| w.meta.id == owner) {
-                            let exec = &mut w.state.exec;
-                            exec.cancel = Some(cancel);
-                            exec.input = Some(input);
-                            exec.resize = resize;
-                            exec.running = true;
-                        } else if let Some(w) =
-                            app.floating.iter_mut().find(|w| w.viewport_id == owner)
+                        if let Some(exec) = app
+                            .detached
+                            .iter_mut()
+                            .find(|w| w.meta.id == owner)
+                            .map(|w| &mut w.state.exec)
+                            .or_else(|| {
+                                app.floating
+                                    .iter_mut()
+                                    .find(|w| w.viewport_id == owner)
+                                    .map(|w| &mut w.state.exec)
+                            })
+                            .or_else(|| {
+                                app.docked_tabs
+                                    .values_mut()
+                                    .find(|tab| tab.viewport_id == owner)
+                                    .map(|tab| &mut tab.state.exec)
+                            })
                         {
-                            let exec = &mut w.state.exec;
                             exec.cancel = Some(cancel);
                             exec.input = Some(input);
                             exec.resize = resize;
@@ -536,6 +579,12 @@ pub(crate) fn process_updates(app: &mut OrkaGuiApp, ctx: &egui::Context) {
                                     .find(|w| w.viewport_id == owner)
                                     .map(|w| &mut w.state.exec)
                             })
+                            .or_else(|| {
+                                app.docked_tabs
+                                    .values_mut()
+                                    .find(|tab| tab.viewport_id == owner)
+                                    .map(|tab| &mut tab.state.exec)
+                            })
                         {
                             if let Some(data) = payload.take() {
                                 handle_exec(exec, data);
@@ -561,6 +610,17 @@ pub(crate) fn process_updates(app: &mut OrkaGuiApp, ctx: &egui::Context) {
                             app.floating.iter_mut().find(|w| w.viewport_id == owner)
                         {
                             let exec = &mut w.state.exec;
+                            exec.running = false;
+                            exec.task = None;
+                            exec.cancel = None;
+                            exec.input = None;
+                            exec.resize = None;
+                        } else if let Some(tab) = app
+                            .docked_tabs
+                            .values_mut()
+                            .find(|tab| tab.viewport_id == owner)
+                        {
+                            let exec = &mut tab.state.exec;
                             exec.running = false;
                             exec.task = None;
                             exec.cancel = None;
@@ -597,6 +657,18 @@ pub(crate) fn process_updates(app: &mut OrkaGuiApp, ctx: &egui::Context) {
                             exec.input = None;
                             exec.resize = None;
                             exec.focused = false;
+                        } else if let Some(tab) = app
+                            .docked_tabs
+                            .values_mut()
+                            .find(|tab| tab.viewport_id == owner)
+                        {
+                            let exec = &mut tab.state.exec;
+                            exec.running = false;
+                            exec.task = None;
+                            exec.cancel = None;
+                            exec.input = None;
+                            exec.resize = None;
+                            exec.focused = false;
                         }
                     } else {
                         app.exec.running = false;
@@ -621,6 +693,14 @@ pub(crate) fn process_updates(app: &mut OrkaGuiApp, ctx: &egui::Context) {
                             w.state.logs.running = false;
                             w.state.logs.task = None;
                             w.state.logs.cancel = None;
+                        } else if let Some(tab) = app
+                            .docked_tabs
+                            .values_mut()
+                            .find(|tab| tab.viewport_id == owner)
+                        {
+                            tab.state.logs.running = false;
+                            tab.state.logs.task = None;
+                            tab.state.logs.cancel = None;
                         }
                     } else {
                         app.logs.running = false;

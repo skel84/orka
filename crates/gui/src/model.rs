@@ -441,6 +441,11 @@ pub struct FloatingDetailsWindow {
     pub just_opened: bool,
 }
 
+pub struct DockedDetailsTab {
+    pub viewport_id: egui::ViewportId,
+    pub state: DetachedDetailsWindowState,
+}
+
 #[derive(Default, Clone)]
 pub struct EditUi {
     pub buffer: String,
